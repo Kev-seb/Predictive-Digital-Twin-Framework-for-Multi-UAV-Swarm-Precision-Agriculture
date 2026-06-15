@@ -1050,15 +1050,15 @@ with tabs[0]:
 
         with c1:
             st.markdown("**False Color CIR** (NIR→R, Red→G, Green→B)")
-            st.image(ms_image.false_color_cir(), width="stretch")
+            st.image(ms_image.false_color_cir(), use_container_width=True)
 
         with c2:
             st.markdown("**False Color — Vegetation Stress**")
-            st.image(ms_image.false_color_vegetation(), width="stretch")
+            st.image(ms_image.false_color_vegetation(), use_container_width=True)
 
         with c3:
             st.markdown("**False Color — Red Edge Emphasis**")
-            st.image(ms_image.false_color_redge_emphasis(), width="stretch")
+            st.image(ms_image.false_color_redge_emphasis(), use_container_width=True)
 
         # Quick stats
         st.subheader("Quick Index Summary")
@@ -1111,7 +1111,7 @@ with tabs[1]:
         col1, col2 = st.columns([2, 1])
         with col1:
             fig = plot_index_heatmap(arr, f"{index_choice} Heatmap", cmap, vmin, vmax)
-            st.image(fig_to_bytes(fig), width="stretch")
+            st.image(fig_to_bytes(fig), use_container_width=True)
 
         with col2:
             st.subheader(f"{index_choice} Statistics")
@@ -1129,7 +1129,7 @@ with tabs[1]:
             ax.set_ylabel("Pixel Count")
             ax.set_title(f"{index_choice} Distribution")
             fig_hist.tight_layout()
-            st.image(fig_to_bytes(fig_hist), width="stretch")
+            st.image(fig_to_bytes(fig_hist), use_container_width=True)
 
         # Scientific Comparison and Interpretation
         st.subheader("Scientific Threshold Comparison & Interpretation")
@@ -1190,14 +1190,14 @@ with tabs[2]:
         col1, col2, col3 = st.columns(3)
         with col1:
             st.subheader("False Color CIR")
-            st.image(base_rgb, width="stretch")
+            st.image(base_rgb, use_container_width=True)
         with col2:
             st.subheader("Stress Segmentation Overlay")
-            st.image(overlay, width="stretch")
+            st.image(overlay, use_container_width=True)
         with col3:
             st.subheader("Stress Score Heatmap")
             stress_rgb = colormap_array(idx["stress_score"], "RdYlGn_r", 0, 1)
-            st.image(stress_rgb, width="stretch")
+            st.image(stress_rgb, use_container_width=True)
 
         # Class legend + area stats & physical thresholds
         st.subheader("Segmentation Class Distribution & Stress Level Diagnostics")
@@ -1292,9 +1292,9 @@ with tabs[2]:
                     
                     col_cam1, col_cam2 = st.columns(2)
                     with col_cam1:
-                        st.image(rgb_preview, caption="Standard Field Preview (RGB)", width="stretch")
+                        st.image(rgb_preview, caption="Standard Field Preview (RGB)", use_container_width=True)
                     with col_cam2:
-                        st.image(overlay_cam, caption=f"Grad-CAM Attribution Overlay for: {CLASS_LABELS[target_class]}", width="stretch")
+                        st.image(overlay_cam, caption=f"Grad-CAM Attribution Overlay for: {CLASS_LABELS[target_class]}", use_container_width=True)
                     
                     st.success(
                         "Saliency attribution map successfully generated. "
@@ -1459,7 +1459,7 @@ with tabs[3]:
         "Stress Mean": stress_means,
         "N Images":    [temporal[s]["n"] for s in stages],
     })
-    st.dataframe(df.set_index("Stage"), width="stretch")
+    st.dataframe(df.set_index("Stage"), use_container_width=True)
 
     # Plots
     c1, c2 = st.columns(2)
@@ -1476,7 +1476,7 @@ with tabs[3]:
         ax.set_ylabel("Index Value"); ax.set_title("Vegetation Index Progression")
         ax.legend(); ax.grid(alpha=0.3)
         fig.tight_layout()
-        st.image(fig_to_bytes(fig), width="stretch")
+        st.image(fig_to_bytes(fig), use_container_width=True)
         plt.close(fig)
 
     with c2:
@@ -1491,7 +1491,7 @@ with tabs[3]:
         ax.set_title("Stress Progression Across Growth Stages")
         ax.set_ylim(0, 0.8); ax.grid(axis="y", alpha=0.3)
         fig.tight_layout()
-        st.image(fig_to_bytes(fig), width="stretch")
+        st.image(fig_to_bytes(fig), use_container_width=True)
         plt.close(fig)
 
     # Change detection
@@ -1585,7 +1585,7 @@ with tabs[4]:
         col1, col2 = st.columns([1.5, 1])
         with col1:
             st.subheader("Management Zone Map")
-            st.image(zone_map_rgb, width="stretch")
+            st.image(zone_map_rgb, use_container_width=True)
 
         with col2:
             st.subheader("Zone Statistics")
@@ -1595,7 +1595,7 @@ with tabs[4]:
                 "NDVI Mean": f"{z.ndvi_mean:.3f}",
                 "Stress Mean": f"{z.stress_mean:.3f}",
             } for z in zones])
-            st.dataframe(zone_df, width="stretch", hide_index=True)
+            st.dataframe(zone_df, use_container_width=True, hide_index=True)
 
         # Prescription map
         st.subheader("Precision Agriculture Prescription & Threshold Assessment")
@@ -1621,7 +1621,7 @@ with tabs[4]:
         st.subheader(f"Field Grid Analysis ({grid_size}×{grid_size})")
         grid = compute_grid_statistics(ndvi, stress_score, grid_size, grid_size)
         fig = plot_grid_heatmap(grid, f"Mean NDVI per Grid Cell ({grid_size}×{grid_size})")
-        st.image(fig_to_bytes(fig), width="stretch")
+        st.image(fig_to_bytes(fig), use_container_width=True)
 
         # Stress regions
         st.subheader("Spatial Stress Region Detection")
@@ -1634,7 +1634,7 @@ with tabs[4]:
                 "Stress Score": f"{r.stress_mean:.3f}",
                 "Centroid (y,x)": f"({r.centroid_yx[0]:.0f}, {r.centroid_yx[1]:.0f})",
             } for r in regions])
-            st.dataframe(region_df, width="stretch", hide_index=True)
+            st.dataframe(region_df, use_container_width=True, hide_index=True)
         else:
             st.info("No significant stress regions detected at current threshold.")
 
@@ -1849,7 +1849,7 @@ with tabs[5]:
                 axes[1].set_title("Daily Precipitation (mm)"); axes[1].grid(axis="y", alpha=0.3)
 
                 fig.tight_layout()
-                st.image(fig_to_bytes(fig), width="stretch")
+                st.image(fig_to_bytes(fig), use_container_width=True)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -2218,14 +2218,14 @@ with tabs[6]:
                 m_col1, m_col2 = st.columns(2)
                 with m_col1:
                     fig_ndvi = plot_index_heatmap(day_maps["ndvi"], f"Predicted NDVI (Day {playback_day})", "RdYlGn", -1.0, 1.0)
-                    st.image(fig_to_bytes(fig_ndvi), width="stretch")
+                    st.image(fig_to_bytes(fig_ndvi), use_container_width=True)
                     fig_soil = plot_index_heatmap(day_maps["moisture"], f"Soil Moisture Grid (Day {playback_day})", "Blues", 0.0, 1.0)
-                st.image(fig_to_bytes(fig_soil), width="stretch")
+                st.image(fig_to_bytes(fig_soil), use_container_width=True)
                 with m_col2:
                     fig_n = plot_index_heatmap(day_maps["nitrogen"], f"Soil Nitrogen Grid (Day {playback_day})", "YlOrBr", 0.0, 1.0)
-                    st.image(fig_to_bytes(fig_n), width="stretch")
+                    st.image(fig_to_bytes(fig_n), use_container_width=True)
                     fig_fung = plot_index_heatmap(day_maps["fungus"], f"Fungal Load Grid (Day {playback_day})", "Purples", 0.0, 1.0)
-                    st.image(fig_to_bytes(fig_fung), width="stretch")
+                    st.image(fig_to_bytes(fig_fung), use_container_width=True)
 
                 # Fungal propagation vectors & boundaries
                 if "fungus_urgency" in day_maps:
@@ -2241,14 +2241,14 @@ with tabs[6]:
                             velocity_y=day_maps["fungus_direction"][1] * day_maps["fungus_velocity"] if "fungus_direction" in day_maps else np.zeros_like(day_maps["fungus_urgency"]),
                             title=f"Treatment Urgency & Outbreak Expansion Vectors (Day {playback_day})"
                         )
-                        st.image(fig_to_bytes(fig_urg), width="stretch")
+                        st.image(fig_to_bytes(fig_urg), use_container_width=True)
                     with ep_col2:
                         fig_bound = plot_boundaries_contours(
                             pathogen=day_maps["fungus"],
                             boundaries=day_maps["fungus_boundaries"] if "fungus_boundaries" in day_maps else np.zeros_like(day_maps["fungus"]),
                             title=f"Contagion Progression & Probabilistic Boundaries (Day {playback_day})"
                         )
-                        st.image(fig_to_bytes(fig_bound), width="stretch")
+                        st.image(fig_to_bytes(fig_bound), use_container_width=True)
 
                     # Epidemiological Scorecard Metrics
                     st.write("#### Epidemiological Forecast Scorecard")
@@ -2388,7 +2388,7 @@ with tabs[6]:
                     0.0, 
                     max(1.0, float(yield_map.max()))
                 )
-                st.image(fig_to_bytes(fig_y), width="stretch")
+                st.image(fig_to_bytes(fig_y), use_container_width=True)
                 st.caption("Grain yield map modeling nitrogen/chlorophyll efficiency & stress penalty factor.")
             with map_col2:
                 fig_b = plot_index_heatmap(
@@ -2398,7 +2398,7 @@ with tabs[6]:
                     0.0, 
                     max(1.0, float(biomass_map.max()))
                 )
-                st.image(fig_to_bytes(fig_b), width="stretch")
+                st.image(fig_to_bytes(fig_b), use_container_width=True)
                 st.caption("Total accumulated vegetative biomass (dry matter) before crop senescence.")
                 
             # Limiting Factors & Recommendations
@@ -2653,7 +2653,7 @@ with tabs[7]:
                     "Priority": act.priority,
                     "Feasibility": act.feasibility
                 })
-            st.dataframe(pd.DataFrame(action_rows), width="stretch", hide_index=True)
+            st.dataframe(pd.DataFrame(action_rows), use_container_width=True, hide_index=True)
             
             # 7-day schedule calendar
             st.subheader("Optimal 7-Day Intervention Schedule")
@@ -2739,8 +2739,8 @@ with tabs[8]:
             
             st.markdown("**Simulated Overlapping Captures:**")
             sub_col1, sub_col2 = st.columns(2)
-            sub_col1.image(img_left, caption="UAV Capture 1 (Left)", width="stretch")
-            sub_col2.image(img_right, caption="UAV Capture 2 (Right)", width="stretch")
+            sub_col1.image(img_left, caption="UAV Capture 1 (Left)", use_container_width=True)
+            sub_col2.image(img_right, caption="UAV Capture 2 (Right)", use_container_width=True)
             
             if st.button("Run Orthomosaic Stitcher", key="btn_stitch"):
                 with st.spinner("Finding keypoint matches & calculating homography matrix..."):
@@ -2763,8 +2763,8 @@ with tabs[8]:
                         stitched, _ = recon.stitch_images([img_left, img_right])
                         
                         st.success(f"Stitching successful! Found {len(matches)} valid keypoint match vectors.")
-                        st.image(match_img, caption="Keypoint Registration Vectors (ORB Matcher)", width="stretch")
-                        st.image(stitched, caption="Unified Orthomosaic Stitched Output (Feather Blended)", width="stretch")
+                        st.image(match_img, caption="Keypoint Registration Vectors (ORB Matcher)", use_container_width=True)
+                        st.image(stitched, caption="Unified Orthomosaic Stitched Output (Feather Blended)", use_container_width=True)
                     except Exception as e:
                         st.error(f"Image stitching failed: {e}")
                     
@@ -6125,7 +6125,7 @@ This report is generated by an AI decision support system. All values are model-
                 data=report_md,
                 file_name=f"crop_stress_report_{crop_stage}_{pd.Timestamp.now().strftime('%Y%m%d')}.md",
                 mime="text/markdown",
-                width="stretch"
+                use_container_width=True
             )
         with col_dl2:
             st.download_button(
@@ -6133,7 +6133,7 @@ This report is generated by an AI decision support system. All values are model-
                 data=pdf_bytes,
                 file_name=f"crop_stress_report_{crop_stage}_{pd.Timestamp.now().strftime('%Y%m%d')}.pdf",
                 mime="application/pdf",
-                width="stretch",
+                use_container_width=True,
                 type="primary"
             )
         

@@ -29,7 +29,7 @@ def render_metric_bar_chart(title: str, labels: list[str], values: list[float], 
         marker_color=colors if colors else '#3498db'
     ))
     fig.update_layout(title=title, margin=dict(l=0, r=0, t=40, b=0), height=300)
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(fig, use_container_width=True)
 
 def render_timeseries_chart(title: str, dates: list, values: list[float], ylabel: str = "Value") -> None:
     """Render a time-series line chart using Plotly."""
@@ -39,4 +39,4 @@ def render_timeseries_chart(title: str, dates: list, values: list[float], ylabel
         
     fig = px.line(x=dates, y=values, title=title, markers=True)
     fig.update_layout(yaxis_title=ylabel, xaxis_title="Date", margin=dict(l=0, r=0, t=40, b=0))
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(fig, use_container_width=True)
