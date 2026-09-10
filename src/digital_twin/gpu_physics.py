@@ -10,6 +10,7 @@ import torch
 import numpy as np
 from typing import Tuple, List
 import threading
+import math
 
 class GPUPhysicsEngine:
     def __init__(self, max_particles: int = 50000):
@@ -23,6 +24,7 @@ class GPUPhysicsEngine:
         self.p_vel = torch.zeros((self.max_particles, 3), dtype=torch.float32, device=self.device)
         self.p_age = torch.zeros(self.max_particles, dtype=torch.float32, device=self.device)
         self.p_active = torch.zeros(self.max_particles, dtype=torch.bool, device=self.device)
+        self.p_tau = torch.zeros(self.max_particles, dtype=torch.float32, device=self.device)
         
         self.gravity = -9.81
         
@@ -64,6 +66,16 @@ class GPUPhysicsEngine:
             self.p_vel[indices, 1] = (initial_velocity[1] * 1e-5) + vy_scatter
             self.p_vel[indices, 2] = initial_velocity[2] + vz_scatter
             
+            # Particle-specific Stokes relaxation times (log-normal droplet size distribution)
+            # Volume Median Diameter (VMD) centered at 250 micrometers
+            log_dp = torch.randn(emit_count, device=self.device) * 0.35 + math.log(2.5e-4)
+            dp = torch.exp(log_dp)
+            
+            # Stokes relaxation: tau = (rho_liquid * dp^2) / (18 * mu_air)
+            # rho_liquid = 1000 kg/m^3, mu_air = 1.81e-5 Pa.s
+            # (1000 * dp^2) / (18 * 1.81e-5) = 3.0693e6 * dp^2
+            self.p_tau[indices] = 3.0693e6 * (dp ** 2)
+            
             self.p_age[indices] = 0.0
             self.p_active[indices] = True
 
@@ -72,20 +84,21 @@ class GPUPhysicsEngine:
         Step the physics simulation for all active particles using GPU tensors.
         wind_vector: (wind_lon_deg_per_sec, wind_lat_deg_per_sec, wind_alt_m_per_sec)
         """
-    def update_particles(self, dt: float, wind_vector: tuple = (0.0, 0.0, 0.0)):
         with self.lock:
             active = self.p_active
             if not active.any():
                 return
                 
-            # Kinematic updates
-            # 1. Apply gravity to Z velocity
-            self.p_vel[active, 2] += self.gravity * dt
-            
-            # 2. Apply wind drift to velocity (simple drag approximation)
+            # Kinematic updates using Stokes drag with individual droplet relaxation times
             wind_tensor = torch.tensor(wind_vector, dtype=torch.float32, device=self.device)
-            drag_coefficient = 0.5
-            self.p_vel[active] += (wind_tensor - self.p_vel[active]) * drag_coefficient * dt
+            drag_acc = (wind_tensor - self.p_vel[active]) / self.p_tau[active].unsqueeze(1)
+            
+            # Gravity acceleration along Z axis
+            gravity_acc = torch.zeros_like(drag_acc)
+            gravity_acc[:, 2] = self.gravity
+            
+            # Update velocities
+            self.p_vel[active] += (drag_acc + gravity_acc) * dt
             
             # 3. Update positions based on velocity
             self.p_pos[active] += self.p_vel[active] * dt

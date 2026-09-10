@@ -1,0 +1,61 @@
+{
+  "generated_at": "2026-09-08T07:33:38.508333+00:00",
+  "total_flights": 20,
+  "total_complete_image_sets": 8244,
+  "fields": [
+    "Field001",
+    "Field002"
+  ],
+  "image_sets_by_field": {
+    "Field001": 4758,
+    "Field002": 3486
+  },
+  "image_sets_by_stage_4class": {
+    "Nursery": 1021,
+    "Vegetative": 3490,
+    "Flowering": 1866,
+    "Mature": 1867
+  },
+  "image_sets_by_stage_5class": {
+    "Nursery": 1021,
+    "Vegetative": 1866,
+    "Booting": 1624,
+    "Flowering": 1866,
+    "Mature": 1867
+  },
+  "flights_by_field": {
+    "Field001": [
+      "F1_01",
+      "F1_02",
+      "F1_03",
+      "F1_04",
+      "F1_05",
+      "F1_06",
+      "F1_07",
+      "F1_08",
+      "F1_09",
+      "F1_10"
+    ],
+    "Field002": [
+      "F2_01",
+      "F2_02",
+      "F2_03",
+      "F2_04",
+      "F2_05",
+      "F2_06",
+      "F2_07",
+      "F2_08",
+      "F2_09",
+      "F2_10"
+    ]
+  },
+  "note_booting_flights": [
+    "F1_05",
+    "F1_06",
+    "F2_05",
+    "F2_06"
+  ],
+  "note_duplicate_dirs_skipped": [
+    "F1_05_2025_09_27_1450(1)_Booting_Stage"
+  ]
+}

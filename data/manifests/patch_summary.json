@@ -1,0 +1,178 @@
+{
+  "generated_at": "2026-09-08T07:40:02.165247+00:00",
+  "total_patches": 5000,
+  "patch_size": 224,
+  "stride": 224,
+  "max_sets_per_flight": 10,
+  "max_patches_per_flight": 250,
+  "dtype": "float16",
+  "stage_distribution": {
+    "Nursery": 1000,
+    "Vegetative": 1000,
+    "Booting": 1000,
+    "Flowering": 1000,
+    "Mature": 1000
+  },
+  "flights": [
+    {
+      "flight_id": "F1_01",
+      "field_id": "Field001",
+      "date": "2025-07-15",
+      "time": "17:16",
+      "raw_stage": "Nursery",
+      "n_patches": 250
+    },
+    {
+      "flight_id": "F1_02",
+      "field_id": "Field001",
+      "date": "2025-07-19",
+      "time": "10:51",
+      "raw_stage": "Nursery",
+      "n_patches": 250
+    },
+    {
+      "flight_id": "F1_03",
+      "field_id": "Field001",
+      "date": "2025-08-16",
+      "time": "16:09",
+      "raw_stage": "Vegetative",
+      "n_patches": 250
+    },
+    {
+      "flight_id": "F1_04",
+      "field_id": "Field001",
+      "date": "2025-09-06",
+      "time": "07:07",
+      "raw_stage": "Vegetative",
+      "n_patches": 250
+    },
+    {
+      "flight_id": "F1_05",
+      "field_id": "Field001",
+      "date": "2025-09-27",
+      "time": "14:50",
+      "raw_stage": "Booting",
+      "n_patches": 250
+    },
+    {
+      "flight_id": "F1_06",
+      "field_id": "Field001",
+      "date": "2025-10-04",
+      "time": "15:50",
+      "raw_stage": "Booting",
+      "n_patches": 250
+    },
+    {
+      "flight_id": "F1_07",
+      "field_id": "Field001",
+      "date": "2025-10-11",
+      "time": "10:48",
+      "raw_stage": "Flowering",
+      "n_patches": 250
+    },
+    {
+      "flight_id": "F1_08",
+      "field_id": "Field001",
+      "date": "2025-10-21",
+      "time": "16:00",
+      "raw_stage": "Flowering",
+      "n_patches": 250
+    },
+    {
+      "flight_id": "F1_09",
+      "field_id": "Field001",
+      "date": "2025-11-08",
+      "time": "17:00",
+      "raw_stage": "Mature",
+      "n_patches": 250
+    },
+    {
+      "flight_id": "F1_10",
+      "field_id": "Field001",
+      "date": "2025-11-15",
+      "time": "16:58",
+      "raw_stage": "Mature",
+      "n_patches": 250
+    },
+    {
+      "flight_id": "F2_01",
+      "field_id": "Field002",
+      "date": "2025-07-15",
+      "time": "17:16",
+      "raw_stage": "Nursery",
+      "n_patches": 250
+    },
+    {
+      "flight_id": "F2_02",
+      "field_id": "Field002",
+      "date": "2025-07-19",
+      "time": "09:37",
+      "raw_stage": "Nursery",
+      "n_patches": 250
+    },
+    {
+      "flight_id": "F2_03",
+      "field_id": "Field002",
+      "date": "2025-08-16",
+      "time": "16:39",
+      "raw_stage": "Vegetative",
+      "n_patches": 250
+    },
+    {
+      "flight_id": "F2_04",
+      "field_id": "Field002",
+      "date": "2025-09-06",
+      "time": "06:44",
+      "raw_stage": "Vegetative",
+      "n_patches": 250
+    },
+    {
+      "flight_id": "F2_05",
+      "field_id": "Field002",
+      "date": "2025-09-27",
+      "time": "14:26",
+      "raw_stage": "Booting",
+      "n_patches": 250
+    },
+    {
+      "flight_id": "F2_06",
+      "field_id": "Field002",
+      "date": "2025-10-04",
+      "time": "16:23",
+      "raw_stage": "Booting",
+      "n_patches": 250
+    },
+    {
+      "flight_id": "F2_07",
+      "field_id": "Field002",
+      "date": "2025-10-11",
+      "time": "10:25",
+      "raw_stage": "Flowering",
+      "n_patches": 250
+    },
+    {
+      "flight_id": "F2_08",
+      "field_id": "Field002",
+      "date": "2025-10-21",
+      "time": "16:46",
+      "raw_stage": "Flowering",
+      "n_patches": 250
+    },
+    {
+      "flight_id": "F2_09",
+      "field_id": "Field002",
+      "date": "2025-11-08",
+      "time": "16:38",
+      "raw_stage": "Mature",
+      "n_patches": 250
+    },
+    {
+      "flight_id": "F2_10",
+      "field_id": "Field002",
+      "date": "2025-11-15",
+      "time": "16:37",
+      "raw_stage": "Mature",
+      "n_patches": 250
+    }
+  ]
+}

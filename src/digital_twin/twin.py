@@ -357,3 +357,73 @@ class FieldDigitalTwin:
             "planned_interventions": planned_interventions,
             "qgc_mission": qgc_mission
         }
+
+    # ── Live Field Mode integration ────────────────────────────────────
+
+    def synchronize_live_observation(
+        self,
+        observation_dict: Dict[str, Any],
+    ) -> None:
+        """
+        Ingest a real-time Live Field Mode observation into the Digital Twin state.
+
+        This allows the twin to accumulate live scouting data alongside
+        historical TIFF/multispectral surveys. The twin does NOT distinguish
+        between sensor sources — it stores normalized metrics only.
+
+        Parameters
+        ----------
+        observation_dict : dict
+            Keys expected (all optional with safe defaults):
+              - timestamp       : float (Unix epoch)
+              - lat, lon        : float (GPS)
+              - crop_stress_score : float 0-1
+              - stress_label    : str
+              - crop_stage      : str
+              - grvi, vari, exg : float (RGB vegetation indices)
+              - disease_detections : list
+              - weed_coverage_pct : float
+              - model_confidence : float
+        """
+        import datetime
+        ts = observation_dict.get("timestamp", 0)
+        ts_iso = datetime.datetime.utcfromtimestamp(ts).isoformat() + "Z" if ts else None
+
+        # Update live_field_observations list (rolling window of 200)
+        if "live_field_observations" not in self.state:
+            self.state["live_field_observations"] = []
+
+        self.state["live_field_observations"].append({
+            "ts":                ts_iso,
+            "lat":               observation_dict.get("lat"),
+            "lon":               observation_dict.get("lon"),
+            "crop_stress_score": observation_dict.get("crop_stress_score"),
+            "stress_label":      observation_dict.get("stress_label"),
+            "crop_stage":        observation_dict.get("crop_stage"),
+            "grvi":              observation_dict.get("grvi"),
+            "vari":              observation_dict.get("vari"),
+            "exg":               observation_dict.get("exg"),
+            "weed_coverage_pct": observation_dict.get("weed_coverage_pct"),
+            "disease_count":     len(observation_dict.get("disease_detections", [])),
+            "confidence":        observation_dict.get("model_confidence"),
+            "source":            "phone_rgb",
+        })
+
+        # Keep rolling window
+        if len(self.state["live_field_observations"]) > 200:
+            self.state["live_field_observations"] = \
+                self.state["live_field_observations"][-200:]
+
+        # Update summary stats
+        obs = self.state["live_field_observations"]
+        stress_vals = [o["crop_stress_score"] for o in obs
+                       if o.get("crop_stress_score") is not None]
+        if stress_vals:
+            self.state["live_mean_stress"]  = float(np.mean(stress_vals))
+            self.state["live_max_stress"]   = float(np.max(stress_vals))
+            self.state["live_obs_count"]    = len(obs)
+            self.state["live_last_updated"] = ts_iso
+
+        # Persist
+        self.save_state()
+

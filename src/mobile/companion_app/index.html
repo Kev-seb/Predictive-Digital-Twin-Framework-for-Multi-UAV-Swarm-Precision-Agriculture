@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#0f172a" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>Live Field — Ground Station Companion</title>
+  <link rel="manifest" href="/mobile/manifest.json" />
+  <style>
+    :root {
+      --bg: #0f172a;
+      --surface: #1e293b;
+      --border: #334155;
+      --green: #22c55e;
+      --yellow: #eab308;
+      --red: #ef4444;
+      --blue: #3b82f6;
+      --text: #f1f5f9;
+      --muted: #94a3b8;
+      --radius: 12px;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Inter', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── Header ─────────────────────────────────────────── */
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 12px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .app-title { font-size: 1rem; font-weight: 700; letter-spacing: -0.3px; }
+    .app-title span { color: var(--green); }
+    .conn-badge {
+      font-size: 0.72rem;
+      padding: 4px 10px;
+      border-radius: 20px;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+    }
+    .conn-badge.connected    { background: #14532d; color: var(--green); }
+    .conn-badge.connecting   { background: #451a03; color: var(--yellow); }
+    .conn-badge.disconnected { background: #450a0a; color: var(--red); }
+
+    /* ── Main layout ────────────────────────────────────── */
+    main { flex: 1; padding: 12px; display: flex; flex-direction: column; gap: 12px; }
+
+    /* ── Card ───────────────────────────────────────────── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 14px;
+    }
+    .card-title {
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--muted);
+      margin-bottom: 10px;
+    }
+
+    /* ── Camera ─────────────────────────────────────────── */
+    #camera-container {
+      position: relative;
+      border-radius: var(--radius);
+      overflow: hidden;
+      background: #000;
+      aspect-ratio: 16/9;
+    }
+    #camera-video {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+    .camera-overlay {
+      position: absolute;
+      top: 0; left: 0; right: 0; bottom: 0;
+      pointer-events: none;
+    }
+    .camera-corner {
+      position: absolute;
+      width: 24px; height: 24px;
+      border-color: var(--green);
+      border-style: solid;
+    }
+    .camera-corner.tl { top: 10px; left: 10px; border-width: 2px 0 0 2px; }
+    .camera-corner.tr { top: 10px; right: 10px; border-width: 2px 2px 0 0; }
+    .camera-corner.bl { bottom: 10px; left: 10px; border-width: 0 0 2px 2px; }
+    .camera-corner.br { bottom: 10px; right: 10px; border-width: 0 2px 2px 0; }
+    .fps-badge {
+      position: absolute;
+      bottom: 8px; right: 8px;
+      background: rgba(0,0,0,0.7);
+      color: var(--green);
+      font-size: 0.65rem;
+      font-weight: 700;
+      padding: 3px 8px;
+      border-radius: 8px;
+    }
+    .stream-mode-badge {
+      position: absolute;
+      top: 8px; left: 8px;
+      background: rgba(0,0,0,0.7);
+      color: var(--blue);
+      font-size: 0.65rem;
+      font-weight: 700;
+      padding: 3px 8px;
+      border-radius: 8px;
+    }
+
+    /* ── Metrics grid ───────────────────────────────────── */
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+    }
+    .metric {
+      background: rgba(255,255,255,0.04);
+      border-radius: 8px;
+      padding: 10px 8px;
+      text-align: center;
+    }
+    .metric-value {
+      font-size: 1.15rem;
+      font-weight: 700;
+      line-height: 1;
+      margin-bottom: 4px;
+    }
+    .metric-label {
+      font-size: 0.62rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .good    { color: var(--green); }
+    .warn    { color: var(--yellow); }
+    .danger  { color: var(--red); }
+    .neutral { color: var(--blue); }
+
+    /* ── Attitude ───────────────────────────────────────── */
+    .attitude-row {
+      display: flex;
+      gap: 10px;
+    }
+    .attitude-item {
+      flex: 1;
+      background: rgba(255,255,255,0.04);
+      border-radius: 8px;
+      padding: 10px 6px;
+      text-align: center;
+    }
+    .attitude-val { font-size: 1.1rem; font-weight: 700; color: var(--blue); }
+    .attitude-lbl { font-size: 0.6rem; color: var(--muted); text-transform: uppercase; }
+
+    /* ── Buttons ────────────────────────────────────────── */
+    .btn-row { display: flex; gap: 10px; }
+    .btn {
+      flex: 1;
+      padding: 14px;
+      border: none;
+      border-radius: var(--radius);
+      font-size: 0.9rem;
+      font-weight: 700;
+      cursor: pointer;
+      transition: transform 0.1s, opacity 0.2s;
+      letter-spacing: 0.3px;
+    }
+    .btn:active { transform: scale(0.97); }
+    .btn-start  { background: linear-gradient(135deg, #16a34a, #22c55e); color: #fff; }
+    .btn-stop   { background: linear-gradient(135deg, #b91c1c, #ef4444); color: #fff; }
+    .btn-calib  { background: var(--border); color: var(--text); }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    /* ── Status log ─────────────────────────────────────── */
+    #log {
+      font-size: 0.72rem;
+      color: var(--muted);
+      max-height: 80px;
+      overflow-y: auto;
+      font-family: monospace;
+      line-height: 1.5;
+    }
+
+    /* ── Battery bar ─────────────────────────────────────── */
+    .battery-bar-bg {
+      background: var(--border);
+      border-radius: 4px;
+      height: 6px;
+      overflow: hidden;
+      margin-top: 4px;
+    }
+    .battery-bar-fill {
+      height: 100%;
+      border-radius: 4px;
+      transition: width 0.5s;
+      background: var(--green);
+    }
+
+    /* ── Server URL ─────────────────────────────────────── */
+    #server-url-input {
+      width: 100%;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      padding: 10px 12px;
+      font-size: 0.85rem;
+      margin-bottom: 10px;
+    }
+    #server-url-input:focus {
+      outline: none;
+      border-color: var(--blue);
+    }
+
+    /* ── Calibration overlay ─────────────────────────────── */
+    #calib-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.85);
+      z-index: 200;
+      align-items: center;
+      justify-content: center;
+      flex-direction: column;
+      gap: 16px;
+      text-align: center;
+      padding: 24px;
+    }
+    #calib-overlay.show { display: flex; }
+    .calib-title { font-size: 1.2rem; font-weight: 700; }
+    .calib-sub   { color: var(--muted); font-size: 0.85rem; }
+    .calib-progress {
+      width: 100%;
+      max-width: 280px;
+      background: var(--border);
+      border-radius: 4px;
+      height: 8px;
+    }
+    .calib-fill {
+      height: 100%;
+      border-radius: 4px;
+      background: var(--green);
+      width: 0%;
+      transition: width 0.3s;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="app-title">Live Field <span>Companion</span></div>
+  <div class="conn-badge disconnected" id="conn-badge">OFFLINE</div>
+</header>
+
+<main>
+
+  <!-- Server connection -->
+  <div class="card">
+    <div class="card-title">Ground Station Connection</div>
+    <input type="text" id="server-url-input"
+      placeholder="http://192.168.1.x:8080" />
+    <div class="btn-row">
+      <button class="btn btn-start" id="btn-connect" onclick="app.connect()">
+        🔗 Connect
+      </button>
+      <button class="btn btn-calib" id="btn-calibrate"
+        onclick="app.startCalibration()" disabled>
+        🎨 Calibrate
+      </button>
+    </div>
+  </div>
+
+  <!-- Camera -->
+  <div class="card">
+    <div class="card-title">Live Camera Stream</div>
+    <div id="camera-container">
+      <video id="camera-video" autoplay muted playsinline></video>
+      <div class="camera-overlay">
+        <div class="camera-corner tl"></div>
+        <div class="camera-corner tr"></div>
+        <div class="camera-corner bl"></div>
+        <div class="camera-corner br"></div>
+      </div>
+      <div class="stream-mode-badge" id="stream-mode">⚡ WebRTC</div>
+      <div class="fps-badge" id="fps-badge">0 FPS</div>
+    </div>
+  </div>
+
+  <!-- Mission controls -->
+  <div class="card">
+    <div class="card-title">Mission Control</div>
+    <div class="btn-row">
+      <button class="btn btn-start" id="btn-start"
+        onclick="app.startMission()" disabled>
+        ▶ Start Mission
+      </button>
+      <button class="btn btn-stop" id="btn-stop"
+        onclick="app.stopMission()" disabled>
+        ■ Stop
+      </button>
+    </div>
+  </div>
+
+  <!-- Telemetry -->
+  <div class="card">
+    <div class="card-title">Telemetry</div>
+    <div class="metrics-grid">
+      <div class="metric">
+        <div class="metric-value neutral" id="m-lat">—</div>
+        <div class="metric-label">Latitude</div>
+      </div>
+      <div class="metric">
+        <div class="metric-value neutral" id="m-lon">—</div>
+        <div class="metric-label">Longitude</div>
+      </div>
+      <div class="metric">
+        <div class="metric-value good" id="m-acc">—</div>
+        <div class="metric-label">GPS Acc (m)</div>
+      </div>
+      <div class="metric">
+        <div class="metric-value neutral" id="m-heading">—</div>
+        <div class="metric-label">Heading °</div>
+      </div>
+      <div class="metric">
+        <div class="metric-value neutral" id="m-speed">—</div>
+        <div class="metric-label">Speed m/s</div>
+      </div>
+      <div class="metric">
+        <div class="metric-value good" id="m-frames">0</div>
+        <div class="metric-label">Frames Sent</div>
+      </div>
+    </div>
+
+    <!-- Attitude -->
+    <div class="attitude-row" style="margin-top: 10px;">
+      <div class="attitude-item">
+        <div class="attitude-val" id="a-pitch">0°</div>
+        <div class="attitude-lbl">Pitch</div>
+      </div>
+      <div class="attitude-item">
+        <div class="attitude-val" id="a-roll">0°</div>
+        <div class="attitude-lbl">Roll</div>
+      </div>
+      <div class="attitude-item">
+        <div class="attitude-val" id="a-yaw">0°</div>
+        <div class="attitude-lbl">Yaw</div>
+      </div>
+    </div>
+
+    <!-- Battery -->
+    <div style="margin-top: 10px;">
+      <div style="display:flex; justify-content:space-between; font-size:0.75rem;">
+        <span style="color:var(--muted)">Device Battery</span>
+        <span id="m-bat" class="good">—%</span>
+      </div>
+      <div class="battery-bar-bg">
+        <div class="battery-bar-fill" id="bat-bar" style="width:0%"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Status log -->
+  <div class="card">
+    <div class="card-title">Status Log</div>
+    <div id="log">Waiting for connection...</div>
+  </div>
+
+</main>
+
+<!-- Calibration overlay -->
+<div id="calib-overlay">
+  <div class="calib-title">📷 Camera Calibration</div>
+  <div class="calib-sub" id="calib-instruction">
+    Point camera at healthy green grass or crop.<br>
+    Hold steady for 3 seconds.
+  </div>
+  <div class="calib-progress">
+    <div class="calib-fill" id="calib-fill"></div>
+  </div>
+  <div style="color:var(--muted); font-size:0.8rem;" id="calib-count">0 / 15 frames</div>
+  <button class="btn btn-stop" onclick="app.cancelCalibration()"
+    style="max-width:180px; margin-top:8px;">Cancel</button>
+</div>
+
+<script src="/mobile/sensor_manager.js"></script>
+<script src="/mobile/offline_manager.js"></script>
+<script src="/mobile/webrtc_client.js"></script>
+<script src="/mobile/calibration.js"></script>
+<script src="/mobile/app.js"></script>
+
+</body>
+</html>

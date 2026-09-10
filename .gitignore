@@ -46,3 +46,38 @@ scratch/
 logs/
 .system_generated/
 *.log
+
+# LaTeX auxiliary files
+*.aux
+*.out
+*.spl
+*.synctex.gz
+*.fdb_latexmk
+*.fls
+*.toc
+*.lof
+*.lot
+
+# Large binary / data files
+*.npy
+*.npz
+*.pkl
+*.h5
+*.hdf5
+*.pth
+*.pt
+*.onnx
+
+# Pinggy / tunnel files
+pinggy.log
+*.pid
+
+# Results (large experiment outputs)
+results/runs/
+results/*.csv
+results/*.json
+
+# Track data manifests (CSVs/JSONs are small enough)
+!data/manifests/*.csv
+!data/manifests/*.json
+data/manifests/*.log

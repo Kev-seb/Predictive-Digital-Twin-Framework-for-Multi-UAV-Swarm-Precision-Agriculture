@@ -473,8 +473,12 @@ class AITreatmentOptimizer:
             if optimization_model == "Reinforcement Learning (MDP)":
                 agent = QLearningAgAgent()
                 # Rapid tabular train
+                # Locally seed the random number generator to ensure training convergence stability
+                rand_state = np.random.get_state()
+                np.random.seed(17)
                 agent.train(initial_state, weather_forecast, zp.recommendations[0].spray_window, objective_weights, cost_params, episodes=100)
                 zone_schedule = agent.get_optimal_schedule(initial_state, weather_forecast, zp.recommendations[0].spray_window)
+                np.random.set_state(rand_state)
             else: # "Monte Carlo Rollout"
                 zone_schedule = self._monte_carlo_rollout_planner(initial_state, weather_forecast, zp.recommendations[0].spray_window, objective_weights, cost_params)
             
@@ -608,7 +612,7 @@ class AITreatmentOptimizer:
         avg_roi = total_benefit / (running_cost + 1e-5)
 
         return OptimizationReport(
-            timestamp=datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
             actions=final_allocated,
             total_estimated_cost=round(running_cost, 2),
             total_projected_benefit=round(total_benefit, 2),
@@ -855,7 +859,7 @@ class AITreatmentOptimizer:
         avg_roi = total_benefit / (running_budget + 1e-5)
         
         return OptimizationReport(
-            timestamp=datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
             actions=allocated_actions,
             total_estimated_cost=round(running_budget, 2),
             total_projected_benefit=round(total_benefit, 2),
