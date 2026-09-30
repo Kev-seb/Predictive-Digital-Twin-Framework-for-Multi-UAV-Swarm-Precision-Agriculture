@@ -173,7 +173,31 @@ class TelemetryRequestHandler(BaseHTTPRequestHandler):
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
             self.wfile.write(json.dumps(MAVLINK_TELEMETRY).encode('utf-8'))
+        elif self.path == '/swarm':
+            # Serve positions of the full swarm so JS can render all drones
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            swarm_data = {
+                "home_lat": shared_state.get("HOME_LAT", 11.0),
+                "home_lon": shared_state.get("HOME_LON", 79.0),
+                "drones": {}
+            }
+            for d_id, drone in MULTIPLAYER_DRONES.items():
+                swarm_data["drones"][d_id] = {
+                    "lat": drone.get("lat", 0.0),
+                    "lon": drone.get("lon", 0.0),
+                    "alt": drone.get("alt", 10.0),
+                    "yaw": drone.get("yaw", 0.0),
+                    "pitch": drone.get("pitch", 0.0),
+                    "roll": drone.get("roll", 0.0),
+                    "is_spraying": bool(drone.get("is_spraying", False)),
+                    "color": drone.get("color", "#38bdf8"),
+                }
+            self.wfile.write(json.dumps(swarm_data).encode('utf-8'))
         elif self.path == '/camera':
+
             self.send_response(200)
             self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
             self.send_header('Access-Control-Allow-Origin', '*')
@@ -392,11 +416,20 @@ def start_mavlink_listener():
         # Step GPU Engine
         if shared_state.get("GPU_ENGINE") is not None:
             engine = shared_state["GPU_ENGINE"]
-            # Emit particles for all active spraying swarm drones
+            # Emit particles for all active spraying swarm drones, scaled by stress dose
             for d_id, drone in MULTIPLAYER_DRONES.items():
                 if drone.get("is_spraying"):
+                    # Look up stress-proportional dose for this drone (0.0 = minimal, 1.0 = maximum)
+                    if d_id == "drone_alpha":
+                        dose = float(shared_state.get("SPRAY_DOSE_ALPHA", 1.0))
+                    elif d_id == "drone_beta":
+                        dose = float(shared_state.get("SPRAY_DOSE_BETA", 1.0))
+                    else:
+                        dose = 1.0
+                    # Scale particle count: 30 minimum, 200 maximum based on severity
+                    particle_count = max(30, int(200 * dose))
                     engine.emit_particles(
-                        count=150,
+                        count=particle_count,
                         source_pos=(drone["lon"], drone["lat"], drone["alt"] - 1.0),
                         initial_velocity=(0.0, 0.0, -4.0),
                         spread=1.5
@@ -507,19 +540,78 @@ def start_mavlink_listener():
             
             # Determine flight targets and spray commands based on selected swarm mission type
             if swarm_mode == "coordinated_spraying":
-                # Coordinated Spraying: Alpha sprays Sector A (West), Beta sprays Sector B (East)
-                alpha_y = 25.0 * math.sin(mock_t * 0.15)
-                sim_alpha.target_pos = np.array([-15.0, alpha_y, 8.0])
-                sim_alpha.target_yaw = math.pi/2 if math.cos(mock_t * 0.15) > 0 else -math.pi/2
+                # =========================================================================
+                # Continuous Serpentine Sweep — spray whenever stress is detected below
+                # Both drones sweep the FULL field width so they both encounter stress patches.
+                # Alpha sweeps Top→Bottom, Beta sweeps Bottom→Top simultaneously.
+                # =========================================================================
+                sweep_time = 60.0          # seconds per full field sweep (loops continuously)
+                t_norm = (mock_t % sweep_time) / sweep_time  # 0.0 to 1.0, continuous
+                cycles = 8.0              # number of left-right S-curves in one sweep
+
+                # ── Alpha Drone: Full Width (X: -26 to 26), Top to Bottom ─────────────────
+                y_a = 25.0 - (t_norm * 50.0)
+                # Oscillation centered at 0, amplitude 25
+                x_a = 25.0 * math.sin(t_norm * math.pi * 2.0 * cycles)
+                dx_a = 25.0 * math.pi * 2.0 * cycles * math.cos(t_norm * math.pi * 2.0 * cycles)
+                yaw_a = math.atan2(-50.0, dx_a)   # tangent of the curve = smooth heading
+
+                sim_alpha.target_pos = np.array([x_a, y_a, 8.0])
+                sim_alpha.target_yaw = yaw_a
                 sim_alpha.autopilot_mode = "terrain_follow"
-                sim_alpha.is_spraying = (abs(alpha_y) < 15.0)
-                
-                beta_y = 25.0 * math.cos(mock_t * 0.15)
-                sim_beta.target_pos = np.array([15.0, beta_y, 8.0])
-                sim_beta.target_yaw = 0.0 if math.sin(mock_t * 0.15) > 0 else math.pi
+
+                # Read stress beneath each drone's position.
+                # If no real NDVI map has been processed yet, use a synthetic one so
+                # drones always spray in demo/simulation mode.
+                ndvi_map = shared_state.get("NDVI_MAP")
+                field_half = 27.5
+
+                if ndvi_map is None or ndvi_map.size == 0:
+                    if "_SYNTHETIC_NDVI" not in shared_state:
+                        _SZ = 64
+                        sy = np.full((_SZ, _SZ), 0.60, dtype=np.float32)   # healthy background
+                        sy[4:18,  4:20] = 0.15   # stressed patch 1 – top-left
+                        sy[24:38, 36:56] = 0.22  # stressed patch 2 – centre-right
+                        sy[48:62, 8:28]  = 0.18  # stressed patch 3 – bottom-left
+                        shared_state["_SYNTHETIC_NDVI"] = sy
+                    ndvi_map = shared_state["_SYNTHETIC_NDVI"]
+
+                spray_dose_a = 0.0
+                h_map, w_map = ndvi_map.shape
+                u_a = float(np.clip((sim_alpha.pos[0] + field_half) / (2.0 * field_half), 0.0, 1.0))
+                v_a = float(np.clip(1.0 - (sim_alpha.pos[1] + field_half) / (2.0 * field_half), 0.0, 1.0))
+                ndvi_a = float(ndvi_map[int(v_a * (h_map - 1)), int(u_a * (w_map - 1))])
+                if ndvi_a < 0.35:
+                    spray_dose_a = float(np.clip((0.35 - ndvi_a) / 0.35, 0.0, 1.0))
+                    sim_alpha.is_spraying = True
+                else:
+                    sim_alpha.is_spraying = False
+                shared_state["SPRAY_DOSE_ALPHA"] = spray_dose_a
+
+                # ── Beta Drone: Full Width (X: -26 to 26), Bottom to Top ────────────────────
+                y_b = -25.0 + (t_norm * 50.0)
+                x_b = 25.0 * math.sin(t_norm * math.pi * 2.0 * cycles)
+                dx_b = 25.0 * math.pi * 2.0 * cycles * math.cos(t_norm * math.pi * 2.0 * cycles)
+                yaw_b = math.atan2(50.0, dx_b)
+
+                sim_beta.target_pos = np.array([x_b, y_b, 8.0])
+                sim_beta.target_yaw = yaw_b
                 sim_beta.autopilot_mode = "terrain_follow"
-                sim_beta.is_spraying = (abs(beta_y) < 15.0)
-                
+
+                spray_dose_b = 0.0
+                u_b = float(np.clip((sim_beta.pos[0] + field_half) / (2.0 * field_half), 0.0, 1.0))
+                v_b = float(np.clip(1.0 - (sim_beta.pos[1] + field_half) / (2.0 * field_half), 0.0, 1.0))
+                ndvi_b = float(ndvi_map[int(v_b * (h_map - 1)), int(u_b * (w_map - 1))])
+                if ndvi_b < 0.35:
+                    spray_dose_b = float(np.clip((0.35 - ndvi_b) / 0.35, 0.0, 1.0))
+                    sim_beta.is_spraying = True
+                else:
+                    sim_beta.is_spraying = False
+                shared_state["SPRAY_DOSE_BETA"] = spray_dose_b
+
+
+
+
             elif swarm_mode == "synchronized_scouting":
                 # Synchronized Scouting: Parallel scanning sweeps of the field sectors
                 alpha_x = -20.0 + 15.0 * math.sin(mock_t * 0.2)
@@ -4038,9 +4130,52 @@ with tabs[8]:
                 }});
             }}
 
-            // Drone model creation
+            // Drone model creation (Alpha — primary blue drone)
             buildDroneModel();
             generatePath();
+            
+            // Build Beta drone model (pink) — permanently in scene, updated from /swarm poll
+            const betaModel = createDroneModel(0xec4899);
+            scene.add(betaModel.group);
+            betaModel.group.position.set(15, 15, 10);
+            swarmDrones = {{ 'drone_beta': betaModel }};
+            
+            // Poll /swarm endpoint every 100ms to keep all drones in sync
+            setInterval(() => {{
+                fetch('http://127.0.0.1:{TELEMETRY_PORT}/swarm')
+                    .then(r => r.json())
+                    .then(swarmData => {{
+                        if (swarmData.home_lat && swarmData.home_lon) {{
+                            homeLat = swarmData.home_lat;
+                            homeLon = swarmData.home_lon;
+                        }}
+                        if (!homeLat || !homeLon) return;
+                        
+                        const EARTH_RADIUS = 6378137.0;
+                        const homeLatRad = homeLat * Math.PI / 180;
+                        const homeLonRad = homeLon * Math.PI / 180;
+                        
+                        for (const [droneId, model] of Object.entries(swarmDrones)) {{
+                            const d = swarmData.drones[droneId];
+                            if (!d) continue;
+                            const latRad = d.lat * Math.PI / 180;
+                            const lonRad = d.lon * Math.PI / 180;
+                            const dx = (lonRad - homeLonRad) * EARTH_RADIUS * Math.cos(homeLatRad);
+                            const dy = (latRad - homeLatRad) * EARTH_RADIUS;
+                            const limitX = sizeX / 2.0 - 1.5;
+                            const limitY = sizeY / 2.0 - 1.5;
+                            model.group.position.x = Math.max(-limitX, Math.min(limitX, dx));
+                            model.group.position.y = Math.max(-limitY, Math.min(limitY, dy));
+                            model.group.position.z = Math.max(1.0, d.alt);
+                            model.group.rotation.set(d.roll, d.pitch, d.yaw, 'ZYX');
+                            model.isSpraying = d.is_spraying;
+                            model.sprayDose = d.dose || 1.0;
+                            // Spin rotors
+                            model.rotors.forEach(r => {{ r.rotation.z += 0.3; }});
+                        }}
+                    }})
+                    .catch(() => {{}});
+            }}, 100);
             
             // Render vegetated crop canopy grid
             buildCrops();
@@ -4294,6 +4429,8 @@ with tabs[8]:
         let droneGroup;
         let rotors = [];
         let sprayNozzles = [];
+        // swarmDrones is module-level so triggerSprayParticles() can access it from any scope
+        let swarmDrones = {{}};
 
         function buildDroneModel() {{
             droneGroup = new THREE.Group();
@@ -4432,11 +4569,65 @@ with tabs[8]:
                 }}
                 cleanupRings();
             }} else {{
-                // Smart Stress Spot Visit locations (comfortably inside mesh boundaries)
-                waypoints.push(new THREE.Vector3(-11, -8, 12));
-                waypoints.push(new THREE.Vector3(8, 11, 12));
-                waypoints.push(new THREE.Vector3(14, -14, 12));
-                waypoints.push(new THREE.Vector3(-6, 14, 12));
+                // Dynamic Stress-Aware Waypoint Generation
+                // Scans the live stress texture to find damaged zones and routes the drone directly to them.
+                // This replaces the old hardcoded guesses with pixel-accurate spray targets.
+                const stressWaypoints = [];
+                if (texturePix && textureW > 0 && textureH > 0) {{
+                    const sampleStep = 6; // sample every 6th pixel for performance
+                    const rawPts = [];
+                    for (let ty = 0; ty < textureH; ty += sampleStep) {{
+                        for (let tx = 0; tx < textureW; tx += sampleStep) {{
+                            const idx = (ty * textureW + tx) * 4;
+                            const r = texturePix[idx];
+                            const g = texturePix[idx + 1];
+                            const b = texturePix[idx + 2];
+                            // Detect: Severe Disease Pathogen (red: R>150, G<100)
+                            //         Moisture / Nitrogen Deficit (yellow: R>150, G>150, B<100)
+                            const isStressed = (r > 150 && g < 100) || (r > 150 && g > 150 && b < 100);
+                            if (isStressed) {{
+                                // Convert texture UV coordinates to local Three.js scene coordinates
+                                const u = tx / textureW;
+                                const v = ty / textureH;
+                                rawPts.push({{ x: (u - 0.5) * sizeX, y: (0.5 - v) * sizeY }});
+                            }}
+                        }}
+                    }}
+                    // Greedy centroid clustering: merge nearby stress pixels into distinct spray zones
+                    const clusterRadius = 9.0;
+                    const clusters = [];
+                    rawPts.forEach(pt => {{
+                        let best = -1, bestDist = Infinity;
+                        clusters.forEach((c, i) => {{
+                            const cxC = c.sumX / c.n;
+                            const cyC = c.sumY / c.n;
+                            const dist = Math.hypot(pt.x - cxC, pt.y - cyC);
+                            if (dist < bestDist) {{ bestDist = dist; best = i; }}
+                        }});
+                        if (best >= 0 && bestDist < clusterRadius) {{
+                            clusters[best].sumX += pt.x;
+                            clusters[best].sumY += pt.y;
+                            clusters[best].n++;
+                        }} else {{
+                            clusters.push({{ sumX: pt.x, sumY: pt.y, n: 1 }});
+                        }}
+                    }});
+                    // Convert each cluster centroid to a Three.js waypoint, clamped to safe field margins
+                    const margin = 7.5;
+                    clusters.forEach(c => {{
+                        const cx = Math.max(-sizeX / 2 + margin, Math.min(sizeX / 2 - margin, c.sumX / c.n));
+                        const cy = Math.max(-sizeY / 2 + margin, Math.min(sizeY / 2 - margin, c.sumY / c.n));
+                        stressWaypoints.push(new THREE.Vector3(cx, cy, 12));
+                    }});
+                }}
+                // Fallback: use original fixed positions if texture not yet loaded or no stress detected
+                if (stressWaypoints.length === 0) {{
+                    stressWaypoints.push(new THREE.Vector3(-11, -8, 12));
+                    stressWaypoints.push(new THREE.Vector3(8, 11, 12));
+                    stressWaypoints.push(new THREE.Vector3(14, -14, 12));
+                    stressWaypoints.push(new THREE.Vector3(-6, 14, 12));
+                }}
+                stressWaypoints.forEach(wp => waypoints.push(wp));
                 buildTargetRings();
             }}
             if (droneGroup && waypoints.length > 0) {{
@@ -4709,90 +4900,60 @@ with tabs[8]:
         const particleGeom = new THREE.SphereGeometry(0.15, 8, 8);
 
         function triggerSprayParticles() {{
-            if (!droneGroup) return;
-
-            const sensorText = document.getElementById('sensor-text').textContent;
-            let particleColor = 0x38bdf8;
-            let treatment = "Broad-Spectrum Blanket Spray";
-            let shouldEmit = isSpraying; // default to current spray toggle status
-
-            let selectedChemical = activeChemical;
-            
-            if (selectedChemical === 'dynamic') {{
-                if (sensorText === "SEVERE PATHOGEN STRESS") {{
-                    selectedChemical = 'fungicide';
-                    shouldEmit = true; // force spot spray on stress even if base spray is toggled off
-                }} else if (sensorText === "NITROGEN / WATER DEFICIT") {{
-                    selectedChemical = 'nutrient';
-                    shouldEmit = true; // force spot spray on stress even if base spray is toggled off
-                }} else {{
-                    selectedChemical = 'blanket';
-                    shouldEmit = isSpraying; // only blanket spray if Spray toggle is ON
-                }}
-            }}
-
-            if (selectedChemical === 'fungicide') {{
-                particleColor = 0xec4899; // pink
-                treatment = "Spot Fungicide (Pathogen)";
-            }} else if (selectedChemical === 'nutrient') {{
-                particleColor = 0xeab308; // yellow
-                treatment = "Spot Liquid Nitrogen (Nutrient)";
-            }} else {{
-                particleColor = 0x38bdf8; // blue
-                treatment = "Broad-Spectrum Blanket Spray";
-            }}
-
-            // If payload is empty, shut down spray
-            if (remainingPayload <= 0) {{
-                shouldEmit = false;
-            }}
-
-            // Update HUD labels
-            const treatVal = document.getElementById('hud-treatment');
-            isCurrentlyEmitting = shouldEmit;
-
-            if (shouldEmit) {{
-                treatVal.textContent = treatment;
-                if (selectedChemical === 'fungicide') treatVal.style.color = "#ec4899";
-                else if (selectedChemical === 'nutrient') treatVal.style.color = "#eab308";
-                else treatVal.style.color = "#38bdf8";
-            }} else {{
-                treatVal.textContent = "None (Spray Off)";
-                treatVal.style.color = "#94a3b8";
-            }}
-
-            if (!shouldEmit || remainingPayload <= 0) return;
-            
-            // Emit particles from both nozzles
-            sprayNozzles.forEach((nozzle, nIdx) => {{
-                const nozzleWorldPos = new THREE.Vector3();
-                nozzle.getWorldPosition(nozzleWorldPos);
-
-                // Initial velocity relative to drone, plus wingtip vortex interaction
-                const initialVel = new THREE.Vector3(droneVelocity.x, droneVelocity.y, droneVelocity.z - 3.5);
+            // 1. Process Alpha Drone
+            if (droneGroup && isSpraying && remainingPayload > 0) {{
+                isCurrentlyEmitting = true;
+                const pColor = 0x38bdf8; // Blue spray for Blue drone (Alpha)
                 
-                // Add tip vortex vector perpendicular to drone body longitudinal axis
-                const swirlSpeed = 2.8;
-                const swirlVec = new THREE.Vector3(0, swirlSpeed, 0);
-                swirlVec.applyAxisAngle(new THREE.Vector3(0, 0, 1), droneRotation.z);
-                
-                if (nIdx === 0) {{
-                    initialVel.addScaledVector(swirlVec, 1);
-                }} else {{
-                    initialVel.addScaledVector(swirlVec, -1);
-                }}
-
-                const pMat = new THREE.MeshBasicMaterial({{ color: particleColor, transparent: true, opacity: 0.8 }});
-                const p = new THREE.Mesh(particleGeom, pMat);
-                p.position.copy(nozzleWorldPos);
-                scene.add(p);
-
-                particles.push({{
-                    mesh: p,
-                    vel: initialVel,
-                    age: 0
+                sprayNozzles.forEach((nozzle, nIdx) => {{
+                    const nozzleWorldPos = new THREE.Vector3();
+                    nozzle.getWorldPosition(nozzleWorldPos);
+                    const initialVel = new THREE.Vector3(droneVelocity.x, droneVelocity.y, droneVelocity.z - 3.5);
+                    const swirlVec = new THREE.Vector3(0, 2.8, 0);
+                    swirlVec.applyAxisAngle(new THREE.Vector3(0, 0, 1), droneRotation.z);
+                    if (nIdx === 0) initialVel.addScaledVector(swirlVec, 1);
+                    else initialVel.addScaledVector(swirlVec, -1);
+                    
+                    const pMat = new THREE.MeshBasicMaterial({{ color: pColor, transparent: true, opacity: 0.8 }});
+                    const p = new THREE.Mesh(particleGeom, pMat);
+                    p.position.copy(nozzleWorldPos);
+                    scene.add(p);
+                    particles.push({{ mesh: p, vel: initialVel, age: 0 }});
                 }});
-            }});
+                
+                // Update HUD
+                const treatVal = document.getElementById('hud-treatment');
+                if (treatVal) {{
+                    treatVal.textContent = "Spot Treatment Active";
+                    treatVal.style.color = "#38bdf8";
+                }}
+            }} else {{
+                isCurrentlyEmitting = false;
+                const treatVal = document.getElementById('hud-treatment');
+                if (treatVal) {{
+                    treatVal.textContent = "None (Spray Off)";
+                    treatVal.style.color = "#94a3b8";
+                }}
+            }}
+
+            // 2. Process Beta Drone (from swarmDrones)
+            if (typeof swarmDrones !== 'undefined' && swarmDrones['drone_beta']) {{
+                const beta = swarmDrones['drone_beta'];
+                if (beta.isSpraying) {{
+                    const pColorBeta = 0xec4899; // Pink spray for Pink drone (Beta)
+                    beta.sprayNozzles.forEach((nozzle, nIdx) => {{
+                        const nozzleWorldPos = new THREE.Vector3();
+                        nozzle.getWorldPosition(nozzleWorldPos);
+                        const initialVel = new THREE.Vector3(0, 0, -3.5); // Beta has simple straight-down spray for now
+                        
+                        const pMat = new THREE.MeshBasicMaterial({{ color: pColorBeta, transparent: true, opacity: 0.8 }});
+                        const p = new THREE.Mesh(particleGeom, pMat);
+                        p.position.copy(nozzleWorldPos);
+                        scene.add(p);
+                        particles.push({{ mesh: p, vel: initialVel, age: 0 }});
+                    }});
+                }}
+            }}
         }}
 
         // Dynamic Sensor Lookup logic
