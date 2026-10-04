@@ -1,310 +1,605 @@
 # Predictive Digital Twin Framework for Multi-UAV Swarm Precision Agriculture
-## Spatiotemporal Biophysical Modeling, Deep Representation Learning, and Reinforcement Learning Optimization
+## Spatiotemporal Biophysical Modeling · Deep Representation Learning · Reinforcement Learning Optimization · Real-Time Ground Control
 
 [![Python Version](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue.svg)](https://www.python.org/)
 [![Framework](https://img.shields.io/badge/framework-Streamlit-FF4B4B.svg)](https://streamlit.io/)
-[![Build & Tests](https://img.shields.io/badge/tests-passed-green.svg)](#)
+[![API](https://img.shields.io/badge/API-FastAPI-009688.svg)](https://fastapi.tiangolo.com/)
+[![Build & Tests](https://img.shields.io/badge/tests-passed-brightgreen.svg)](#6-test-suite)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![UE5](https://img.shields.io/badge/Unreal%20Engine-5.x-blueviolet.svg)](#55-unreal-engine-5--unity-digital-twin-bridge)
 
 ---
 
-### Abstract
-This repository contains the source code for an enterprise-ready, research-grade **Predictive Digital Twin Framework** designed for autonomous multi-UAV (Unmanned Aerial Vehicle) precision agriculture. The platform ingests 4-band multispectral aerial imagery (Green, Red, Red Edge, Near-Infrared) to perform real-time vegetative indexing, pixel-level deep semantic crop stress segmentation, explainable AI attribution mapping (Grad-CAM), and photogrammetric elevation mapping (DSM/CHM). 
+## Abstract
 
-Furthermore, the framework couples these static biophysical observations with dynamic predictive modeling: spatiotemporal epidemiological spread forecasting (via anisotropic Fisher-Kolmogorov PDEs and Graph Neural Networks) and Variable-Rate Application (VRA) input optimization (via Reinforcement Learning under uncertainty and multi-objective knapsack scheduling). Finally, a GPU-accelerated particle physics engine models drone spray drift and streams parallel telemetry for cooperative Multi-UAV swarm operations in a real-time WebGL 3D dashboard.
+This repository contains the complete source code for an enterprise-grade, research-calibrated **Predictive Digital Twin Framework** for autonomous multi-UAV precision agriculture. The platform operates end-to-end: from raw multispectral GeoTIFF ingestion through AI-driven crop stress analysis, real-time swarm dispatch, live ground-station telemetry, and a persistent Unreal Engine 5 / Unity digital twin that mirrors field biophysics in 3D.
+
+**Core capabilities at a glance:**
+
+| Layer | Technology |
+|---|---|
+| Data ingestion | Rasterio · 4-band GeoTIFF (G/R/RE/NIR) |
+| Vegetation indices | NDVI · NDRE · NDWI · SAVI · EVI · MSAVI2 · CIRE |
+| Semantic segmentation | PyTorch DeepLabV3+ with Grad-CAM XAI |
+| Disease spread | Fisher-Kolmogorov PDE · Directed GNN |
+| Treatment optimization | Tabular Q-Learning MDP · Monte Carlo VaR/CVaR |
+| Swarm coordination | Potential-field path planning · Serpentine sweep · Stress waypoints |
+| Live telemetry | MAVLink · WebRTC video · WebSocket streaming |
+| Digital twin | FastAPI backend · UE5 / Unity C# bridge · 20 × 20 HISM grid |
+| Mobile | Progressive Web App · WebRTC · offline sensor fusion |
+| Research pipeline | 7-stage reproducible ML pipeline · spectral ablation |
+| Dashboard | Streamlit multi-tab · dark/light mode · interactive maps |
 
 ---
 
-## 1. System Architecture & Modularity
+## Table of Contents
 
-The framework is structured as a highly decoupled, modular Python package under `src/` to facilitate clean separation of concerns and computational efficiency:
+1. [System Architecture](#1-system-architecture)
+2. [Module Reference](#2-module-reference)
+3. [Theoretical Formulations](#3-theoretical-formulations)
+4. [Research Pipeline](#4-research-pipeline)
+5. [Installation & Run Guide](#5-installation--run-guide)
+6. [Test Suite](#6-test-suite)
+7. [Feature Matrix](#7-feature-matrix)
+8. [Academic Documentation](#8-academic-documentation)
+
+---
+
+## 1. System Architecture
 
 ```
 uav-crop-stress-intelligence/
 │
-├── .streamlit/                     # Streamlit environment configuration
-│   └── config.toml                 # Native theme parameters (Dark/Light mode support)
+├── .streamlit/                        # Streamlit theme config (dark/light)
 │
-├── data/                           # Data storage directory
-│   ├── raw/                        # Original multispectral GeoTIFF surveys
-│   └── processed/                  # Masked maps, zone boundaries, and twin state memory
+├── data/
+│   ├── raw/                           # Original multispectral GeoTIFF flights
+│   ├── processed/                     # Masked maps, zone boundaries, twin state
+│   ├── manifests/                     # Flight manifest, patch manifest CSV (5 487 patches)
+│   │   ├── flight_manifest.csv
+│   │   ├── patch_manifest.csv
+│   │   ├── patch_summary.json
+│   │   └── dataset_statistics.json
+│   └── splits/
+│       └── splits_manifest.json       # Flight-disjoint train/val/test splits
 │
-├── models/                         # Persistent model checkpoints
-│   ├── segmentation/               # DeepLabV3+ multispectral weights (.pth)
-│   └── classifiers/                # EfficientNet-B0 transfer-learning weights (.pt)
+├── models/
+│   ├── segmentation/                  # DeepLabV3+ weights (.pth)
+│   └── classifiers/                   # EfficientNet-B0 weights (.pt)
 │
-├── src/                            # Core Engine Source Code
-│   ├── ai_engine/                  # Treatment optimization & VRA planning engines
-│   │   ├── prescription_generator.py # Variable-rate prescription algorithms
-│   │   └── treatment_optimizer.py  # MDP Q-learning, Knapsack scheduling & Monte Carlo
-│   │
-│   ├── classification/             # EfficientNet image-level classification pipeline
-│   │   └── train_classifier.py     # Two-phase transfer learning scripts
-│   │
-│   ├── config/                     # Global configurations & system settings
-│   │   └── config.py               # Pydantic BaseSettings environment config
-│   │
-│   ├── core/                       # GeoTIFF data ingestion and preprocessing
-│   │   └── image_loader.py         # Rasterio wrappers and multiband alignments
-│   │
-│   ├── dashboard/                  # Multi-tab user interface layer
-│   │   └── dashboard.py            # High-end commercial-grade Streamlit application
-│   │
-│   ├── digital_twin/               # Spatiotemporal forecasting & simulation engines
-│   │   ├── contagion_forecaster.py  # Fisher-Kolmogorov PDEs & Graph Neural Networks
-│   │   ├── gpu_physics.py          # PyTorch GPU particle drift kinematics & advection
-│   │   └── state_manager.py        # Persistent JSON state engine (twin_state.json)
-│   │
-│   ├── gis/                        # Vector zoning & GIS layout utilities
-│   │   └── mapping.py              # Leaflet/Folium satellite basemap overlay systems
-│   │
-│   ├── indices/                    # Vectorized mathematical remote sensing algorithms
-│   │   ├── indices.py              # Central multispectral calculation router
-│   │   ├── ndvi.py / ndre.py...    # Modular index implementations (NDVI, SAVI, EVI)
-│   │   └── stress_score.py         # Multi-index weighted composite stress equation
-│   │
-│   ├── reports/                    # Diagnostic document compilation
-│   │   └── pdf_report.py           # Offline FPDF2 deterministic report compiler
-│   │
-│   ├── segmentation/               # DeepLabV3+ semantic segmentation pipeline
-│   │   ├── deeplabv3_model.py      # PyTorch DeepLabV3+ architecture with custom backbone
-│   │   ├── gradcam_segmentation.py # Grad-CAM explainability saliency maps
-│   │   └── train_segmentation.py   # Online training & validation engine
-│   │
-│   ├── spatial/                    # Stereoscopic photogrammetry pipeline
-│   │   └── reconstruction.py       # ORB stitching, disparity DSM, and canopy CHM
-│   │
-│   ├── temporal/                   # Change detection & growth metrics
-│   │   ├── change_detection.py     # Z-score differencing & Change Vector Analysis (CVA)
-│   │   └── growth_stage_tracking.py# Growing Degree Days (GDD) maturity trackers
-│   │
-│   └── weather/                    # Meteorological risk assessment
-│       ├── openmeteo_client.py     # REST client for coordinates-based weather forecasts
-│       └── weather_risk_engine.py  # Spray feasibility window assessment
+├── research/                          # 7-stage reproducible ML pipeline
+│   ├── 01_build_data_manifest.py
+│   ├── 02_extract_patches_with_provenance.py
+│   ├── 03_create_flight_disjoint_splits.py
+│   ├── 04_train_spectral_ablation.py
+│   ├── 05_stress_proxy_generator.py
+│   ├── 06_radiometric_normalization.py
+│   ├── 07_train_stress_classifier.py
+│   └── reproducibility/
+│       └── capture_environment.py
 │
-└── tests/                          # Automated Pytest regression test suite
-    ├── test_ai_optimizer.py        # Validates Q-learning convergence and Knapsack
-    ├── test_flight_physics.py      # Verifies potential-field swarm collision avoidance
-    └── test_indices.py...          # Mathematically asserts remote sensing index formulas
+├── scripts/                           # Utility & validation scripts
+│   ├── benchmark_optimizer.py         # RL optimizer benchmarking (33 KB)
+│   ├── sensitivity_analysis.py        # Parameter sensitivity analysis
+│   ├── simulate_unity_client.py       # HTTP API simulation client
+│   ├── validate_digital_twin.py       # End-to-end digital twin validation
+│   ├── validate_ndvi.py               # NDVI reference validation
+│   ├── verify_sitl_telemetry.py       # Software-in-the-loop telemetry check
+│   ├── batch_processing.py            # Batch GeoTIFF processing
+│   ├── generate_sample_tiff.py        # Synthetic test data generator
+│   └── prepare_dataset.py             # Dataset preparation utilities
+│
+├── src/                               # Core engine (24 modules)
+│   ├── ai_engine/                     # Treatment optimization & yield
+│   │   ├── treatment_optimizer.py     # Q-Learning MDP, Knapsack, Monte Carlo
+│   │   ├── treatment_recommender.py   # Rule-based prescription recommender
+│   │   ├── yield_predictor.py         # Monteith LUE biomass & GDD yield model
+│   │   ├── disease_evolution.py       # SIR/SEIR disease evolution model
+│   │   └── epidemiology.py            # Spatiotemporal epidemiology engine
+│   │
+│   ├── classification/
+│   │   └── train_classifier.py        # EfficientNet-B0 two-phase transfer learning
+│   │
+│   ├── config/
+│   │   └── config.py                  # Pydantic BaseSettings environment config
+│   │
+│   ├── core/
+│   │   └── image_loader.py            # Rasterio GeoTIFF wrappers & band alignment
+│   │
+│   ├── dashboard/
+│   │   └── dashboard.py               # Streamlit multi-tab UI (all features)
+│   │
+│   ├── database.py                    # SQLite mission & telemetry database layer
+│   │
+│   ├── digital_twin/                  # Spatiotemporal simulation engines
+│   │   ├── twin.py                    # Digital twin state manager & UE5 sync
+│   │   ├── simulator.py               # Field physics & crop growth simulator
+│   │   ├── flight_physics.py          # UAV kinematics & potential-field planner
+│   │   ├── gpu_physics.py             # PyTorch GPU particle spray simulation
+│   │   └── camera_feed.py             # Simulated UAV camera feed generator
+│   │
+│   ├── gis/
+│   │   └── mapping.py                 # Folium satellite basemap & zone overlay
+│   │
+│   ├── ground_station/                # Real-time ground control station
+│   │   ├── live_field_tab.py          # Live field monitoring dashboard tab
+│   │   ├── live_telemetry_panel.py    # MAVLink telemetry display panel
+│   │   ├── live_ai_panel.py           # Real-time AI inference results panel
+│   │   ├── live_video_panel.py        # WebRTC live video feed panel
+│   │   ├── live_qos_panel.py          # Link quality & QoS metrics panel
+│   │   ├── live_report_generator.py   # Auto-generated mission reports
+│   │   ├── mission_map_panel.py       # Interactive mission map with waypoints
+│   │   └── mission_replay_panel.py    # Recorded mission replay & analysis
+│   │
+│   ├── indices/                       # Vectorized remote sensing indices
+│   │   ├── indices.py                 # Central multispectral calculation router
+│   │   ├── ndvi.py                    # Normalized Difference Vegetation Index
+│   │   ├── ndre.py                    # Normalized Difference Red Edge Index
+│   │   ├── ndwi.py                    # Normalized Difference Water Index
+│   │   ├── savi.py                    # Soil-Adjusted Vegetation Index
+│   │   ├── evi.py                     # Enhanced Vegetation Index
+│   │   ├── msavi2.py                  # Modified SAVI 2
+│   │   ├── cire.py                    # Chlorophyll Index Red Edge
+│   │   └── stress_score.py            # Multi-index weighted composite stress
+│   │
+│   ├── live_mode/                     # Real-time live field operations
+│   │   ├── live_field_controller.py   # Live field state machine & dispatch
+│   │   └── alert_engine.py            # Threshold-based alert & notification engine
+│   │
+│   ├── mission/                       # Mission lifecycle management
+│   │   ├── mission_object.py          # Mission data model & waypoint definitions
+│   │   ├── mission_recorder.py        # Flight-to-disk mission recorder
+│   │   └── mission_database.py        # SQLite-backed mission persistence
+│   │
+│   ├── mobile/
+│   │   └── companion_app/             # Progressive Web App (PWA)
+│   │       ├── index.html             # App shell & UI layout
+│   │       ├── app.js                 # Core app logic & API integration
+│   │       ├── sensor_manager.js      # GPS/IMU/compass sensor access
+│   │       ├── webrtc_client.js       # WebRTC video streaming client
+│   │       ├── calibration.js         # Sensor calibration routines
+│   │       ├── offline_manager.js     # IndexedDB offline data storage
+│   │       ├── service_worker.js      # PWA service worker & cache
+│   │       └── manifest.json          # Web app manifest
+│   │
+│   ├── mobile_api/
+│   │   └── mobile_api_server.py       # FastAPI server for companion app
+│   │
+│   ├── reports/
+│   │   └── pdf_report.py              # FPDF2 offline PDF report compiler
+│   │
+│   ├── rgb_ai/                        # RGB-only AI inference engine
+│   │   ├── rgb_inference_engine.py    # Unified RGB inference coordinator
+│   │   ├── rgb_crop_stage_classifier.py  # Growth stage classification
+│   │   ├── rgb_disease_detector.py    # Disease symptom detection
+│   │   ├── rgb_stress_estimator.py    # Visual stress intensity estimation
+│   │   └── rgb_weed_detector.py       # Weed presence detection
+│   │
+│   ├── segmentation/                  # DeepLabV3+ segmentation pipeline
+│   │   ├── deeplabv3_model.py         # PyTorch DeepLabV3+ custom backbone
+│   │   ├── gradcam_segmentation.py    # Grad-CAM explainability saliency
+│   │   ├── stress_segmentation.py     # Full stress segmentation pipeline
+│   │   ├── predict_segmentation.py    # Inference-time prediction wrapper
+│   │   ├── segmentation_metrics.py    # mIoU, F1, confusion matrix
+│   │   └── train_segmentation.py      # Training & validation loop
+│   │
+│   ├── spatial/
+│   │   └── reconstruction.py          # ORB stitching · DSM · Canopy CHM
+│   │
+│   ├── streaming/                     # WebRTC video streaming
+│   │   ├── webrtc_bridge.py           # aiortc signalling & STUN/TURN bridge
+│   │   ├── frame_interface.py         # Camera frame abstraction layer
+│   │   └── frame_queue.py             # Lock-free frame queue for low latency
+│   │
+│   ├── telemetry/                     # Sensor telemetry processing
+│   │   ├── phone_telemetry_adapter.py # Smartphone GPS/IMU → MAVLink adapter
+│   │   └── sensor_fusion.py           # Extended Kalman Filter sensor fusion
+│   │
+│   ├── temporal/                      # Change detection & growth tracking
+│   │   ├── change_detection.py        # Z-score differencing & CVA analysis
+│   │   └── growth_stage_tracking.py   # GDD-based phenology stage tracker
+│   │
+│   ├── unity_integration/             # Game engine digital twin bridge
+│   │   ├── UnityBridgeClient.cs       # C# Unity/UE5 HTTP API client
+│   │   └── README.md                  # Integration setup guide
+│   │
+│   ├── vision/                        # Low-level computer vision
+│   │   ├── camera_calibrator.py       # Intrinsic/extrinsic camera calibration
+│   │   └── image_quality_assessor.py  # BRISQUE/NIQE quality assessment
+│   │
+│   └── weather/
+│       ├── openmeteo_client.py        # Open-Meteo REST weather client
+│       └── weather_risk_engine.py     # Spray feasibility window assessment
+│
+├── tests/                             # Pytest regression suite (8 modules)
+│
+├── digital_twin_api.py                # FastAPI UE5 backend (20×20 HISM grid)
+├── academic_paper.tex                 # Full IEEE-format LaTeX paper
+├── academic_paper_draft.md            # Markdown paper draft
+├── academic_paper_outline.md          # Structured paper outline
+└── requirements.txt                   # All dependencies
 ```
 
 ---
 
-## 2. Theoretical Formulations & Core Engines
+## 2. Module Reference
 
-### 2.1 Multi-Spectral Biophysical Indexing
-The vectorized mathematics engine (powered by NumPy and Rasterio) processes raw reflectance values across Green ($G$), Red ($R$), Red Edge ($RE$), and Near-Infrared ($NIR$) bands to compute target biophysical indicators:
+### 2.1 `src/ai_engine/` — Treatment Optimization & Prediction
 
-*   **Normalized Difference Vegetation Index (NDVI):**
-    $$NDVI = \frac{NIR - R}{NIR + R}$$
-    *Agro-physical interpretation:* Assesses chlorophyll density and structural canopy vigor. Healthy dense crop: $NDVI > 0.6$.
+| File | Description |
+|---|---|
+| `treatment_optimizer.py` | Tabular Q-Learning MDP (ε-greedy), Knapsack multi-resource scheduling, Monte Carlo rollouts, VaR/CVaR risk estimation. **36 KB** |
+| `treatment_recommender.py` | Rule-based prescription engine; outputs variable-rate fertilizer, fungicide, and irrigation recommendations per zone |
+| `yield_predictor.py` | Monteith Light Use Efficiency biomass model + Growing Degree Days (GDD) thermal accumulation + heat-sterility harvest index |
+| `disease_evolution.py` | SIR/SEIR compartmental disease state evolution with weather coupling |
+| `epidemiology.py` | Anisotropic Fisher-Kolmogorov PDE spread + Directed GNN transmission routing |
 
-*   **Normalized Difference Red Edge Index (NDRE):**
-    $$NDRE = \frac{NIR - RE}{NIR + RE}$$
-    *Agro-physical interpretation:* Sensitive to leaf chlorophyll concentration and nitrogen content, penetrating deeper into mature, closed canopies.
+### 2.2 `src/digital_twin/` — Spatiotemporal Simulation
 
-*   **Normalized Difference Water Index (NDWI):**
-    $$NDWI = \frac{NIR - \text{SWIR}}{NIR + \text{SWIR}} \quad \text{or} \quad \frac{G - NIR}{G + NIR}$$
-    *Agro-physical interpretation:* Maps canopy hydration and soil waterlogging status. Optimal range: $-0.10 \le NDWI \le 0.30$.
+| File | Description |
+|---|---|
+| `twin.py` | Persistent digital twin state manager; synchronises field JSON state to UE5 via REST |
+| `simulator.py` | Full field physics simulator: crop growth, stress propagation, nutrient cycles |
+| `flight_physics.py` | UAV 6-DoF kinematics, potential-field collision avoidance, serpentine sweep, stress-proportional waypoint generation |
+| `gpu_physics.py` | PyTorch GPU particle spray engine: droplet advection, wind drift, gravity, turbulence |
+| `camera_feed.py` | Synthetic simulated UAV camera feed with configurable noise and altitude |
 
-*   **Soil-Adjusted Vegetation Index (SAVI):**
-    $$SAVI = \frac{(NIR - R) \cdot (1 + L)}{NIR + R + L}$$
-    *Agro-physical interpretation:* Corrects for background soil reflectance in early growth stages, where $L = 0.5$ is the soil brightness correction factor.
+### 2.3 `src/ground_station/` — Real-Time Ground Control Station
 
-*   **Enhanced Vegetation Index (EVI):**
-    $$EVI = G \cdot \frac{NIR - R}{NIR + C_1 \cdot R - C_2 \cdot B + L}$$
-    *Agro-physical interpretation:* De-noises atmospheric aerosols and resists canopy saturation in high-biomass crops (e.g. dense paddy fields).
+The ground station provides a full operational interface for live UAV missions:
+
+- **`live_field_tab.py`** — Live field monitoring with real-time NDVI heatmap refresh
+- **`live_telemetry_panel.py`** — MAVLink telemetry display (battery, altitude, speed, GPS)
+- **`live_ai_panel.py`** — Real-time AI inference results streamed from edge UAV
+- **`live_video_panel.py`** — WebRTC live video feed from onboard camera
+- **`live_qos_panel.py`** — Link quality, latency, packet loss, and RSSI indicators
+- **`live_report_generator.py`** — Auto-generated mission PDF reports with flight logs
+- **`mission_map_panel.py`** — Interactive Folium map with live UAV position and waypoints
+- **`mission_replay_panel.py`** — Post-flight mission replay with timeline scrubbing
+
+### 2.4 `src/live_mode/` — Real-Time Field Operations
+
+- **`live_field_controller.py`** — State machine managing live UAV dispatch, field update cycles, and swarm coordination triggers
+- **`alert_engine.py`** — Threshold-based alert system: stress exceedance, battery low, geofence breach, link loss
+
+### 2.5 `src/mission/` — Mission Lifecycle
+
+- **`mission_object.py`** — Mission data model: waypoints, spray parameters, crop zones, flight plan
+- **`mission_recorder.py`** — Records flight telemetry, AI inferences, and images to disk
+- **`mission_database.py`** — SQLite-backed mission persistence, query, and replay
+
+### 2.6 `src/mobile/companion_app/` — Progressive Web App
+
+A fully offline-capable smartphone companion app:
+
+| File | Purpose |
+|---|---|
+| `index.html` | App shell, responsive layout, tab navigation |
+| `app.js` | Core logic, API integration, real-time data polling |
+| `sensor_manager.js` | Accesses device GPS, accelerometer, gyroscope, compass |
+| `webrtc_client.js` | WebRTC peer connection for live UAV video streaming |
+| `calibration.js` | In-app IMU and compass calibration routines |
+| `offline_manager.js` | IndexedDB caching for offline field data access |
+| `service_worker.js` | PWA service worker; enables offline usage and background sync |
+| `manifest.json` | Web app manifest for installable PWA |
+
+### 2.7 `src/rgb_ai/` — RGB-Only AI Inference
+
+Enables AI analysis even without multispectral data (standard camera):
+
+- **`rgb_inference_engine.py`** — Unified coordinator for all RGB models
+- **`rgb_crop_stage_classifier.py`** — Growth stage classification (seedling → mature)
+- **`rgb_disease_detector.py`** — Visual disease symptom detection
+- **`rgb_stress_estimator.py`** — Canopy stress estimation from colour features
+- **`rgb_weed_detector.py`** — Weed detection for precision herbicide application
+
+### 2.8 `src/segmentation/` — DeepLabV3+ Semantic Segmentation
+
+| File | Description |
+|---|---|
+| `deeplabv3_model.py` | PyTorch DeepLabV3+ with 4-channel multispectral input backbone |
+| `gradcam_segmentation.py` | Grad-CAM spatial attribution saliency maps |
+| `stress_segmentation.py` | End-to-end stress segmentation pipeline |
+| `predict_segmentation.py` | Inference wrapper with softmax class probability maps |
+| `segmentation_metrics.py` | mIoU, class F1, confusion matrix computation |
+| `train_segmentation.py` | Training loop with validation, checkpointing, LR scheduling |
+
+### 2.9 `src/streaming/` — WebRTC Video Streaming
+
+- **`webrtc_bridge.py`** — aiortc-based signalling server with STUN/TURN support
+- **`frame_interface.py`** — Abstraction layer for GStreamer / OpenCV camera sources
+- **`frame_queue.py`** — Lock-free frame queue for sub-100 ms end-to-end latency
+
+### 2.10 `src/telemetry/` — Sensor Telemetry
+
+- **`phone_telemetry_adapter.py`** — Converts smartphone GPS/IMU data to MAVLink messages
+- **`sensor_fusion.py`** — Extended Kalman Filter fusing GPS, accelerometer, and barometer
+
+### 2.11 `src/unity_integration/` — UE5 / Unity Digital Twin Bridge
+
+- **`UnityBridgeClient.cs`** — C# Unity/UE5 HTTP client that polls `digital_twin_api.py` and updates Hierarchical Instanced Static Mesh (HISM) material parameters
+- **`digital_twin_api.py`** — FastAPI backend serving the 20 × 20 paddy field state grid with endpoints for per-instance updates, anomaly detection, NDVI heatmap, and full state dump
+
+### 2.12 `src/indices/` — Remote Sensing Vegetation Indices
+
+All indices are vectorised with NumPy for zero-copy band operations:
+
+| Index | Formula | Interpretation |
+|---|---|---|
+| NDVI | $(NIR-R)/(NIR+R)$ | Chlorophyll density & canopy vigour |
+| NDRE | $(NIR-RE)/(NIR+RE)$ | Leaf nitrogen content (deep canopy) |
+| NDWI | $(G-NIR)/(G+NIR)$ | Canopy water content & waterlogging |
+| SAVI | $(NIR-R)(1+L)/(NIR+R+L)$ | Soil-corrected vegetation (L=0.5) |
+| EVI | $G(NIR-R)/(NIR+C_1R-C_2B+L)$ | Aerosol-corrected; no saturation |
+| MSAVI2 | $(2NIR+1-\sqrt{(2NIR+1)^2-8(NIR-R)})/2$ | Improved soil adjustment |
+| CIRE | $NIR/RE-1$ | Canopy chlorophyll content |
 
 ---
 
-### 2.2 Deep Semantic Segmentation & Explainable AI (XAI)
-To isolate localized stress variations, the platform deploys a **DeepLabV3+** architecture optimized for multi-spectral inputs. 
+## 3. Theoretical Formulations
 
+### 3.1 Spatiotemporal Disease Spread
+
+Anisotropic advection-diffusion-reaction PDE:
+
+$$\frac{\partial S}{\partial t} = \nabla \cdot (\mathbf{D} \nabla S) + rS\left(1 - \frac{S}{K}\right) - \vec{v}_{\text{wind}} \cdot \nabla S$$
+
+- $\mathbf{D}$ = diffusion tensor, skewed along wind vector
+- $r$ = growth rate dynamically coupled to relative humidity and temperature
+- $K$ = NDVI-limited carrying capacity
+
+Directed GNN edge weights:
+
+$$e_{ij} = \text{softmax}\!\left(\text{LeakyReLU}\!\left(\vec{W}^T[\vec{h}_i \| \vec{h}_j] + \theta\cos(\phi_{\text{wind}} - \phi_{ij})\right)\right)$$
+
+### 3.2 Q-Learning Treatment Optimization
+
+$$Q(s, a) \leftarrow Q(s, a) + \alpha\!\left[R(s,a) + \gamma\max_{a'}Q(s',a') - Q(s,a)\right]$$
+
+Reward function (yield vs. cost vs. stress penalty):
+
+$$R(s,a) = \text{Yield}(s') \cdot P_{\text{crop}} - \sum_i \text{Input}_i \cdot C_{\text{chem}} - \lambda \cdot \text{Stress}(s')$$
+
+Monte Carlo risk estimation: $N = 1000$ rollouts for VaR and CVaR at 95th percentile.
+
+### 3.3 Multi-UAV Swarm Path Planning
+
+Potential-field repulsive force between drone $i$ and $j$:
+
+$$\vec{F}_{\text{repulsive},i} = \sum_{j \neq i} \eta\!\left(\frac{1}{d_{ij}} - \frac{1}{d_0}\right)\frac{1}{d_{ij}^2}\hat{u}_{ji}$$
+
+**Stress-proportional spray dosing**: spray rate $\rho_k$ at waypoint $k$ scales with local stress score $\sigma_k$:
+
+$$\rho_k = \rho_{\min} + (\rho_{\max} - \rho_{\min}) \cdot \sigma_k$$
+
+**Serpentine sweep**: boustrophedon path minimises re-crossing and total flight distance.
+
+### 3.4 GPU Particle Spray Engine
+
+Droplet kinematic update (PyTorch CUDA):
+
+$$\vec{x}_p(t+\Delta t) = \vec{x}_p(t) + \left(\vec{v}_{\text{drone}} + \vec{w}_{\text{wind}} + \vec{v}_{\text{turbulent}}\right)\Delta t - \tfrac{1}{2}\vec{g}\Delta t^2$$
+
+### 3.5 Grad-CAM Explainability
+
+Channel importance weight from gradient global average pool:
+
+$$\alpha_k^c = \frac{1}{Z}\sum_i\sum_j \frac{\partial y^c}{\partial A^k_{i,j}}$$
+
+Saliency map:
+
+$$L^c_{\text{Grad-CAM}} = \text{ReLU}\!\left(\sum_k \alpha_k^c A^k\right)$$
+
+### 3.6 Biomass & Yield Forecasting
+
+Monteith Light Use Efficiency model:
+
+$$\text{Biomass} = \sum \left(PAR \times fPAR \times LUE_{\max} \times f(T) \times f(W)\right)$$
+
+Growing Degree Days and heat-stress adjusted harvest index:
+
+$$GDD = \sum_{\text{day}}\!\left(\frac{T_{\max}+T_{\min}}{2} - T_{\text{base}}\right)$$
+
+$$\text{HI} = \text{HI}_{\text{base}} \times \left(1 - \kappa_{\text{heat}} \cdot \text{Days}_{>38^\circ\text{C}}\right), \qquad \text{Yield} = \text{Biomass} \times \text{HI}$$
+
+### 3.7 Sensor Fusion (Extended Kalman Filter)
+
+State vector $\mathbf{x} = [x, y, z, v_x, v_y, v_z, \phi, \theta, \psi]^T$ fused from GPS, barometer, and 6-DoF IMU with process noise $\mathbf{Q}$ and measurement noise $\mathbf{R}$ tuned per sensor.
+
+---
+
+## 4. Research Pipeline
+
+A 7-stage reproducible ML pipeline for crop stress classification research:
+
+| Step | Script | Description |
+|---|---|---|
+| 01 | `01_build_data_manifest.py` | Scans all UAV flight directories, parses FLIGHT_RE regex, builds flight manifest CSV (20 flights, 8 244 image sets) |
+| 02 | `02_extract_patches_with_provenance.py` | Disk-efficient 224 × 224 patch extraction; max 250 patches/flight; float16 `.npy`; ~1.6 GB total |
+| 03 | `03_create_flight_disjoint_splits.py` | Creates 4 split types: temporal holdout, cross-field, LOFO, random patch |
+| 04 | `04_train_spectral_ablation.py` | Multi-seed (5 seeds) spectral ablation: RGB vs 3-band vs 4-band vs 5-channel; leakage quantification |
+| 05 | `05_stress_proxy_generator.py` | NDVI-threshold proxy label generation for weakly-supervised learning |
+| 06 | `06_radiometric_normalization.py` | Empirical line calibration + histogram matching across flights |
+| 07 | `07_train_stress_classifier.py` | EfficientNet-B0 multi-task classifier (crop stage + stress severity); flight-disjoint validation |
+
+**Reproducibility**: `research/reproducibility/capture_environment.py` snapshots the full conda/pip environment, git commit hash, and hardware specs.
+
+**Dataset**: 20 UAV flights across 2 paddy fields (Field001 3 acres, Field002 2 acres), 5 487 patches total, 4-band multispectral (G/R/RE/NIR).
+
+---
+
+## 5. Installation & Run Guide
+
+### Prerequisites
+
+- Python 3.11 / 3.12 / 3.13
+- Windows, Linux, or macOS
+- CUDA GPU optional (CPU fallback supported everywhere)
+
+### 5.1 Install
+
+```bash
+git clone https://github.com/Kev-seb/Predictive-Digital-Twin-Framework-for-Multi-UAV-Swarm-Precision-Agriculture.git
+cd Predictive-Digital-Twin-Framework-for-Multi-UAV-Swarm-Precision-Agriculture
+
+python -m venv .venv
+# Windows
+.venv\Scripts\activate
+# macOS/Linux
+source .venv/bin/activate
+
+pip install -r requirements.txt
 ```
-                          [ Input Multi-spectral Tensor ]
-                                        │
-                                        ▼
-                          [ Atrous Spatial Pyramid (ASPP) ]
-                           (Dilated Conv 1x1, 6x6, 12x12)
-                                        │
-                                        ▼
-   ┌────────────────────────────────────┴────────────────────────────────────┐
-   ▼                                                                         ▼
-[ Low-Level Encoder Features ]                                   [ High-Level ASPP Decoder ]
-   │                                                                         │
-   ▼                                                                         ▼
-[ Conv 1x1 (Dim Reduction) ]                                     [ Bilinear Upsampling (4x) ]
-   │                                                                         │
-   └────────────────────────────────────┬────────────────────────────────────┘
-                                        ▼
-                              [ Concatenate & Conv 3x3 ]
-                                        │
-                                        ▼
-                              [ Bilinear Upsampling (4x) ]
-                                        │
-                                        ▼
-                             [ Segmentation Mask output ]
-```
 
-#### Class Attribution Mapping (Grad-CAM)
-To guarantee transparency, we calculate spatial attributions of the model's classifications. Let $y^c$ be the raw prediction score for class $c$ (e.g., *Severe Stress*), and $A^k_{i,j}$ be the activation maps of channel $k$ in the final convolutional layer of the decoder. The channel weight $\alpha_k^c$ is computed using the spatial global average pool of gradients:
-$$\alpha_k^c = \frac{1}{Z} \sum_{i} \sum_{j} \frac{\partial y^c}{\partial A^k_{i,j}}$$
-The final saliency map $L^c_{\text{Grad-CAM}} \in \mathbb{R}^{U \times V}$ is calculated as a rectified linear combination of weighted activation maps:
-$$L^c_{\text{Grad-CAM}} = \text{ReLU}\left( \sum_{k} \alpha_k^c A^k \right)$$
+### 5.2 Run the Streamlit Dashboard
 
----
-
-### 2.3 Spatiotemporal Contagion Spread Forecasting
-To model how diseases (such as *Pyricularia oryzae* or leaf blast) spread across fields, we implement an anisotropic, advection-diffusion reaction model.
-
-$$\frac{\partial S}{\partial t} = \nabla \cdot (\mathbf{D} \nabla S) + r S \left(1 - \frac{S}{K}\right) - \vec{v}_{\text{wind}} \cdot \nabla S$$
-
-Where:
-*   $S(x,y,t)$ is the localized disease intensity.
-*   $\mathbf{D}$ is the diffusion tensor, skewed along the wind velocity vector $\vec{v}_{\text{wind}}$.
-*   $r$ is the growth rate, modeled dynamically based on ambient relative humidity ($RH$) and temperature ($T$).
-*   $K$ is the carrying capacity (limited by local NDVI).
-
-Alternatively, a **Directed Graph Neural Network (GNN)** routes transmission vectors. Nodes $v_i$ represent homogeneous management zones, and directional edges $e_{ij}$ calculate probability weights based on meteorological advection:
-$$e_{ij} = \text{softmax}\left( \text{LeakyReLU}\left(\vec{W}^T [\vec{h}_i \parallel \vec{h}_j] + \theta \cdot \cos(\phi_{wind} - \phi_{ij}) \right) \right)$$
-
----
-
-### 2.4 Reinforcement Learning Variable-Rate Prescription Optimization
-Resource optimization is modeled as a finite Markov Decision Process (MDP) solved via a tabular Q-learning agent.
-
-```
-       ┌──────────────────────── Action (a_t) ────────────────────────┐
-       │     (Precision fertilizer, fungicide, or irrigation rate)    │
-       ▼                                                              │
-┌──────────────┐                                               ┌──────────────┐
-│ Environment  │                                               │   Agent      │
-│ (Field Zones)│                                               │ (Q-Learning) │
-└──────────────┘                                               └──────────────┘
-       │                                                              ▲
-       └────── State (s_t) & Reward (r_t) ────────────────────────────┘
-        (Soil moisture, crop biomass, Yield vs Chemical cost)
-```
-
-#### Q-Learning Optimization Update
-$$Q(s, a) \leftarrow Q(s, a) + \alpha \left[ R(s, a) + \gamma \max_{a'} Q(s', a') - Q(s, a) \right]$$
-
-The reward function $R(s, a)$ balances agricultural yield gains against input costs and environment footprints:
-$$R(s, a) = \text{Yield}(s') \cdot P_{\text{crop}} - \sum \left( \text{Input}_i \cdot C_{\text{chemical}} \right) - \lambda_{\text{penalty}} \cdot \text{Stress}(s')$$
-
-To mitigate risk under seasonal fluctuations, we run $N = 1000$ **Monte Carlo Rollouts** to estimate **Value at Risk (VaR)** and **Conditional Value at Risk (CVaR)** on treatment ROI.
-
----
-
-### 2.5 Multi-UAV Swarm Path Planning & GPU Physics
-Autonomous swarm coordination uses a potential-field formulation to guide UAVs toward target prescription coordinates while maintaining distance guards.
-
-The net virtual force $\vec{F}_i$ acting on drone $i$ is:
-$$\vec{F}_i = \vec{F}_{\text{target}, i} + \vec{F}_{\text{repulsive}, i}$$
-$$\vec{F}_{\text{repulsive}, i} = \sum_{j \neq i} \eta \left( \frac{1}{d_{ij}} - \frac{1}{d_0} \right) \frac{1}{d_{ij}^2} \hat{u}_{ji}$$
-Where $d_{ij}$ is the distance between drone $i$ and $j$, $d_0$ is the minimum safety radius (e.g. 6.0m), and $\hat{u}_{ji}$ is the unit directional vector.
-
-#### PyTorch GPU Particle Spray Engine
-Kinematic updates for millions of chemical droplets are parallelized on the GPU. The position $\vec{x}_p$ of droplet $p$ changes due to wind advection, gravity, and turbulence:
-$$\vec{x}_p(t+\Delta t) = \vec{x}_p(t) + \left( \vec{v}_{\text{drone}} + \vec{w}_{\text{wind}} + \vec{v}_{\text{turbulent}} \right) \Delta t - \frac{1}{2} \vec{g} \Delta t^2$$
-This simulation runs in a background thread and streams positions via WebSockets to a Deck.gl WebGL viewport for real-time 3D instanced rendering.
-
----
-
-### 2.6 Biomass and Yield Forecasting
-Biomass growth utilizes a modified Monteith Light Use Efficiency (LUE) model:
-
-$$Biomass (Above\text{-}Ground) = \sum \left( PAR \times fPAR \times LUE_{max} \times f(T) \times f(W) \right)$$
-
-*   $PAR$: Photosynthetically Active Radiation.
-*   $fPAR$: Fraction of absorbed PAR, derived linearly from NDVI.
-*   $f(T), f(W)$: Climatological penalty functions for temperature and moisture stress.
-
-#### Growing Degree Days (GDD) and Yield Calculation
-The platform monitors thermal unit accumulation:
-$$GDD = \sum_{day} \left( \frac{T_{\text{max}} + T_{\text{min}}}{2} - T_{\text{base}} \right)$$
-If temperatures exceed $38^\circ\text{C}$ during reproductive/flowering phases, a sterility penalty factor is applied to adjust the target harvest index:
-$$\text{Harvest Index (HI)} = \text{HI}_{\text{base}} \times \left( 1 - \kappa_{\text{heat}} \cdot \text{Days}_{>38^\circ\text{C}} \right)$$
-$$\text{Yield} = \text{Biomass} \times \text{HI}$$
-
----
-
-## 3. Installation & Local Setup
-
-### Prerequisite Environment
-- **Operating System:** Windows, Linux, or macOS.
-- **Python Version:** Python 3.11, 3.12, or 3.13.
-- **GPU Acceleration (Optional):** CUDA-compatible GPU for faster training and physics rendering.
-
-### Step-by-Step Installation
-1.  **Clone the repository:**
-    ```bash
-    git clone https://github.com/Kev-seb/AI-powered-predictive-digital-twin-for-agriculture.git
-    cd AI-powered-predictive-digital-twin-for-agriculture/uav-crop-stress-intelligence
-    ```
-
-2.  **Create and activate a virtual environment:**
-    ```bash
-    python -m venv .venv
-    # On Windows:
-    .venv\Scripts\activate
-    # On macOS/Linux:
-    source .venv/bin/activate
-    ```
-
-3.  **Install dependencies:**
-    ```bash
-    pip install -r requirements.txt
-    ```
-
----
-
-## 4. Run Guide
-
-### 4.1 Running the Streams-based Dashboard Web Application
-Start the Streamlit portal locally:
 ```bash
 streamlit run src/dashboard/dashboard.py
 ```
-Open `http://localhost:8501` in your browser. The dashboard is configured to automatically adjust visualization colors, labels, and plot styling based on Streamlit's Light or Dark mode setting.
 
-### 4.2 Local Classifier Training CLI
-To train the crop stress classification head on new custom drone patch data:
+Open **http://localhost:8501** in your browser.
+
+**Dashboard tabs:**
+- 🌱 **Vegetation Analytics** — NDVI/NDRE/EVI maps, zone statistics
+- 🔬 **Segmentation & XAI** — DeepLabV3+ stress segmentation + Grad-CAM
+- 🦠 **Disease Forecasting** — PDE spread maps & GNN transmission graph
+- 💊 **Treatment Optimizer** — Q-Learning prescription + Knapsack scheduler
+- 🚁 **Swarm Operations** — Multi-UAV path planning & spray dispatch
+- 📊 **Yield Forecast** — Biomass model + GDD growth stage tracker
+- 🌦️ **Weather Risk** — Spray window feasibility from Open-Meteo API
+- 🗺️ **GIS Map** — Satellite basemap with zone overlays
+- 🏭 **Ground Station** — Live telemetry, AI results, video, QoS panels
+- 📡 **Live Mode** — Real-time field state, alert engine, swarm dispatch
+- 📄 **PDF Report** — Offline mission report compiler
+
+### 5.3 Run the Digital Twin API (for UE5 / Unity)
+
 ```bash
-python src/classification/train_classifier.py --task stage --data_dir data/processed/classification --epochs 50 --batch_size 16
+python digital_twin_api.py
 ```
 
-### 4.3 Running Verification Tests
-Execute the comprehensive Pytest verification suites:
+API available at **http://127.0.0.1:8008/docs** (Swagger UI).
+
+Key endpoints:
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/` | Health check |
+| `POST` | `/field/update` | Receive per-instance state from UE5 |
+| `GET` | `/field/status` | Full 400-instance field state |
+| `GET` | `/field/heatmap` | NDVI grid as 20 × 20 list |
+| `GET` | `/field/anomalies` | Instances with NDVI drop above threshold |
+| `GET` | `/field/summary` | Aggregated field statistics |
+| `DELETE` | `/field/reset` | Reset all instances to defaults |
+
+### 5.4 Run the Mobile API (companion app backend)
+
 ```bash
-# Activates venv and runs tests
-.\.venv\Scripts\pytest
+python -m uvicorn src.mobile_api.mobile_api_server:app --host 0.0.0.0 --port 8080
+```
+
+Scan the QR code from the dashboard to open the companion app on your phone.
+
+### 5.5 Unreal Engine 5 / Unity Digital Twin Bridge
+
+1. Start `digital_twin_api.py` on the same machine as UE5.
+2. In UE5, add `src/unity_integration/UnityBridgeClient.cs` (or the Blueprint equivalent) to your level Actor.
+3. Set `ApiBaseUrl = "http://127.0.0.1:8008"` in the component.
+4. The C# client polls `/field/status` every 500 ms and updates the HISM material parameters (`NDVI`, `StressLevel`, `GrowthStage`) per-instance on the GPU.
+
+### 5.6 Research Pipeline
+
+Run stages in order from `uav-crop-stress-intelligence/`:
+
+```bash
+python research/01_build_data_manifest.py
+python research/02_extract_patches_with_provenance.py
+python research/03_create_flight_disjoint_splits.py
+python research/04_train_spectral_ablation.py
+python research/05_stress_proxy_generator.py
+python research/06_radiometric_normalization.py
+python research/07_train_stress_classifier.py
+```
+
+### 5.7 Training Classifiers
+
+Train crop stress classification head on custom drone data:
+
+```bash
+python src/classification/train_classifier.py \
+    --task stage \
+    --data_dir data/processed/classification \
+    --epochs 50 \
+    --batch_size 16
 ```
 
 ---
 
-## 5. Architectural & Feature Matrix
+## 6. Test Suite
 
-The platform's features are fully implemented and verified against standard agricultural datasets:
+```bash
+.venv\Scripts\pytest tests/ -v
+```
 
-| Architectural Component | Methodological Details | Verification Status |
-| :--- | :--- | :--- |
-| **Data Ingestion** | Multiband raster indexing via `rasterio` and `numpy`. | ✅ Verified (Tests pass) |
-| **Photogrammetry** | Homographic stitching (ORB+RANSAC), Stereo disparity DSM/CHM. | ✅ Complete |
-| **Explainable AI (XAI)** | Pixel-level Grad-CAM backpropagation. | ✅ Verified |
-| **GIS Zoning** | Homogeneous zone clustering via K-Means and Folium mapping. | ✅ Complete |
-| **Disease Forecasting** | Spatiotemporal Fisher-Kolmogorov PDEs and GNNs. | ✅ Active |
-| **Treatment Optimizer** | Tabular MDP Q-Learning, Knapsack schedulers, Monte Carlo. | ✅ Verified (Q-learning tests pass) |
-| **Yield Forecasting** | Monteith LUE Biomass, GDD calculations, heat deficit index. | ✅ Verified (Yield tests pass) |
-| **Swarm Operations** | Multi-UAV potential field pathing, WebGL 3D views. | ✅ Verified (Swarm tests pass) |
-| **Theme Sync** | Auto Dark/Light theme switches on UI/matplotlib canvases. | ✅ Complete |
+| Test File | What It Validates |
+|---|---|
+| `test_ai_optimizer.py` | Q-Learning policy converges; net reward exceeds baseline |
+| `test_flight_physics.py` | Potential-field forces maintain $d_{ij} > d_0 = 6\,\text{m}$ across trajectories |
+| `test_indices.py` | NDVI, SAVI, NDWI outputs match reference arrays |
+| `test_segmentation.py` | DeepLabV3+ forward pass produces correct output shape |
+| `test_swarm_coordination.py` | Swarm reaches all waypoints without collision |
+| `test_temporal.py` | Change detection outputs plausible difference maps |
+| `test_weather.py` | Weather risk engine returns valid spray window |
+| `test_yield.py` | Biomass model outputs within $[0.0, 12.0]\,\text{t/ha}$ |
 
 ---
 
-## 6. Mathematical Verification & Test Suite
+## 7. Feature Matrix
 
-The automated test suite in `tests/` executes verification checks before packaging or deployments:
-*   `test_ai_optimizer.py`: Asserts Q-learning policy yields higher net reward than baseline treatments.
-*   `test_flight_physics.py`: Asserts the potential-field forces result in drone separations greater than the safety limit $d_0$ (6m) across simulated trajectories.
-*   `test_indices.py`: Mathematically asserts values for NDVI, SAVI, and NDWI indices against known reference data arrays.
-*   `test_yield.py`: Asserts biomass models output within standard agricultural yields ($0.0 \le \text{yield} \le 12.0 \text{ t/ha}$).
+| Component | Technology | Status |
+|---|---|---|
+| **Multispectral Ingestion** | Rasterio · NumPy (4-band GeoTIFF) | ✅ Verified |
+| **Vegetation Indices** | NDVI · NDRE · NDWI · SAVI · EVI · MSAVI2 · CIRE | ✅ Verified |
+| **Semantic Segmentation** | PyTorch DeepLabV3+ (4-channel backbone) | ✅ Verified |
+| **Explainable AI (XAI)** | Grad-CAM pixel-level saliency | ✅ Verified |
+| **Photogrammetry** | ORB+RANSAC stitching · Stereo DSM/CHM | ✅ Complete |
+| **Disease Forecasting** | Fisher-Kolmogorov PDE · Directed GNN | ✅ Active |
+| **Treatment Optimizer** | Q-Learning MDP · Knapsack · Monte Carlo VaR | ✅ Verified |
+| **Yield Forecasting** | Monteith LUE · GDD · Heat-sterility index | ✅ Verified |
+| **Swarm Path Planning** | Potential-field · Serpentine sweep · Stress waypoints | ✅ Verified |
+| **Stress-Proportional Dosing** | Per-waypoint dosing ∝ local stress score | ✅ Active |
+| **GPU Spray Physics** | PyTorch CUDA particle drift simulation | ✅ Active |
+| **GIS Mapping** | Folium satellite basemap · K-Means zone clustering | ✅ Complete |
+| **Weather Risk** | Open-Meteo REST · Spray feasibility windows | ✅ Active |
+| **Ground Control Station** | MAVLink telemetry · QoS · mission map/replay | ✅ Complete |
+| **Live Mode** | Real-time field state machine · alert engine | ✅ Active |
+| **WebRTC Video Streaming** | aiortc · STUN/TURN · lock-free frame queue | ✅ Complete |
+| **Sensor Fusion** | Extended Kalman Filter (GPS+IMU+baro) | ✅ Active |
+| **RGB-Only AI** | Stage classification · disease · stress · weed | ✅ Complete |
+| **Mobile PWA** | WebRTC · offline IndexedDB · service worker | ✅ Complete |
+| **UE5 / Unity Bridge** | FastAPI · C# HISM material update client | ✅ Active |
+| **Digital Twin API** | 20×20 NDVI grid · anomaly detection · heatmap | ✅ Active |
+| **PDF Reports** | FPDF2 offline deterministic report compiler | ✅ Complete |
+| **Research Pipeline** | 7-stage reproducible ML pipeline | ✅ Complete |
+| **Test Suite** | 8 Pytest modules — all passing | ✅ Verified |
+| **Theme Sync** | Auto dark/light mode on UI + matplotlib | ✅ Complete |
+
+---
+
+## 8. Academic Documentation
+
+This project is documented at research-paper level:
+
+- **`academic_paper.tex`** — Full IEEE double-column LaTeX paper covering all theoretical formulations, system architecture, experiments, and results
+- **`academic_paper_draft.md`** — Markdown draft for collaborative editing
+- **`academic_paper_outline.md`** — Structured section-by-section paper outline
+
+---
+
+## License
+
+MIT License — see [LICENSE](LICENSE) for full terms.
+
+---
+
+*Built with ❤️ for sustainable precision agriculture — reducing chemical inputs, maximising crop yield, and enabling autonomous multi-UAV field intelligence.*
