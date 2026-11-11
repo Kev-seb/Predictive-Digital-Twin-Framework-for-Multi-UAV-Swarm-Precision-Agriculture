@@ -81,7 +81,7 @@ Setup: a hidden outbreak and a dry patch, a drone RGB pass every 3 days (10 m al
 
 Coverage near 1.0 means the twin's uncertainty is honest, if slightly conservative. Process noise can be tuned down in Phase 5.
 
-### Phase 3: Swarm as first-class assets ✅ (done, except the dashboard migration)
+### Phase 3: Swarm as first-class assets ✅ (done)
 - [x] `Fleet` (`src/twin_core/swarm.py`): any number of `UAVFlightDynamicsSimulator` drones sharing one `shared_state`, so the existing potential-field collision avoidance works fleet-wide. Includes add/remove, launch pads, battery swap and tank refill.
 - [x] Task generation from the twin:
   - **scout:** one lawn-mower task per zone; the most uncertain zones go first.
@@ -93,7 +93,12 @@ Coverage near 1.0 means the twin's uncertainty is honest, if slightly conservati
   - spray flow is duty-cycled to apply the planned dose
   - the battery failsafe aborts the mission and flies the drone home
 - [x] API: `/swarm/state`, `/swarm/drones`, `/swarm/plan`, `/sim/mission`.
-- [ ] Remove the `drone_alpha` / `drone_beta` hardcoding in `dashboard.py`. The fleet can feed it: `/swarm/state` returns the same shape as the dashboard's `/swarm` endpoint.
+- [x] Dashboard migrated off the hardcoded `drone_alpha` / `drone_beta` (`src/digital_twin/swarm_guidance.py`).
+  - The fleet size is set with `UAV_DASHBOARD_SWARM_SIZE` (default 2) and can be changed live from the Swarm tab, up to 12 drones.
+  - Every mission pattern is written for drone *i* of *n* and reproduces the original two-drone paths exactly at *n* = 2 (tested).
+  - The physics loop, `/swarm`, the three.js followers, fleet commands, the 3D plot and the telemetry deck all scale with the fleet.
+  - Alpha stays the primary drone, linked to MAVLink telemetry and waypoint missions.
+  - The two-operator multiplayer roles (`operator_alpha` / `operator_beta`) are unchanged.
 
 ### Phase 4: Close the loop (in progress)
 - [x] Closed loop in simulation: scout → assimilate → spray the zones the twin flags → completed sprays become interventions on the next simulated day, for both the hidden field and the twin (`/sim/mission` + `/sim/advance`).
