@@ -562,7 +562,9 @@ Scan the QR code from the dashboard to open the companion app on your phone.
 
 ### 5.5 Unreal Engine 5 / Unity Digital Twin Bridge
 
-**UE5 (recommended):** install the `TwinStream` plugin from `src/ue5_integration/`. It subscribes to `/ws/field`, so the twin pushes 20 × 20 field snapshots (NDVI, stress, uncertainty, moisture, fungus, anomalies) and drone mission tracks as they change. It writes them into the HISM's per-instance custom data for `M_RiceCrop`. Setup, material slots and the message schema are in [`src/ue5_integration/README.md`](src/ue5_integration/README.md).
+**UE5, no C++:** enable UE5's built-in *Python Editor Script Plugin*, then run `src/ue5_integration/python/twin_live.py` with *File → Execute Python Script*. It drives your rice field, or builds a twin field and a reality field from blocks, moves the drones and shows captions. See the quick start in [`src/ue5_integration/README.md`](src/ue5_integration/README.md).
+
+**UE5 C++ plugin:** alternatively, install the `TwinStream` plugin from `src/ue5_integration/`. It subscribes to `/ws/field`, so the twin pushes 20 × 20 field snapshots (NDVI, stress, uncertainty, moisture, fungus, anomalies) and drone mission tracks as they change. It writes them into the HISM's per-instance custom data for `M_RiceCrop`. Setup, material slots and the message schema are in [`src/ue5_integration/README.md`](src/ue5_integration/README.md).
 
 Check the stream without UE5:
 

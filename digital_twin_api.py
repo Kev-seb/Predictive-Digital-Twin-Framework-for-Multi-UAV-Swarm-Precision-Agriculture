@@ -58,6 +58,10 @@ Demo mode (paced closed loop for live UE5 presentations):
   POST   /demo/stop                Stop it
   GET    /demo/status              Current phase
   (streams swarm.positions at 10 Hz and twin.status captions on /ws/field)
+
+Polling for clients without WebSockets (UE5 Python, VaRest):
+  GET    /ue5/frame?since=<seq>    Latest caption + drone poses, and the field snapshot
+                                   only when it changed since <seq>
 ================================================================
 """
 
@@ -251,6 +255,13 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
     def get_twin() -> DigitalTwin:
         if ctx["twin"] is None:
             ctx["twin"] = _default_twin()
+        if not ctx.get("_versioned"):
+            ctx["_versioned"] = True
+            ctx["field_version"] = 1
+
+            def bump(_event: Dict[str, Any]) -> None:
+                ctx["field_version"] = ctx.get("field_version", 0) + 1
+            ctx["twin"].subscribe(bump)
         return ctx["twin"]
 
     def get_virtual() -> VirtualField:
@@ -763,8 +774,10 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
     def demo_status(phase: str, text: str) -> None:
         d = ctx["demo"]
         d.update(phase=phase, text=text, day=get_twin().state.sim_day)
-        notify_field_listeners({"type": "twin.status", "phase": phase, "text": text,
-                                "sim_day": d["day"], "error": vf_error_brief()})
+        status_msg = {"type": "twin.status", "phase": phase, "text": text,
+                      "sim_day": d["day"], "error": vf_error_brief()}
+        ctx["latest_status"] = status_msg
+        notify_field_listeners(status_msg)
 
     def vf_error_brief() -> Optional[Dict[str, float]]:
         if ctx["virtual"] is None:
@@ -809,9 +822,11 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
                 yaw = math.degrees(math.atan2(c2 - c1, -(r2 - r1))) if (r2, c2) != (r1, c1) else None
                 drones[d] = [round(row, 3), round(col, 3), round(a[3] + f * (b[3] - a[3]), 2),
                              int(a[4]), None if yaw is None else round(yaw % 360.0, 1)]
-            notify_field_listeners({"type": "swarm.positions", "t_s": round(min(sim_t, end_t), 2),
-                                    "fields": ["row", "col", "alt_m", "spraying", "heading_deg"],
-                                    "drones": drones})
+            pos_msg = {"type": "swarm.positions", "t_s": round(min(sim_t, end_t), 2),
+                       "fields": ["row", "col", "alt_m", "spraying", "heading_deg"],
+                       "drones": drones}
+            ctx["latest_positions"] = pos_msg
+            notify_field_listeners(pos_msg)
             batch = []
             while ci < len(captures) and captures[ci][0] <= sim_t:
                 batch.append(captures[ci])
@@ -907,6 +922,23 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
         return {"running": d["task"] is not None and not d["task"].done(), "phase": d["phase"],
                 "text": d["text"], "sim_day": d["day"], "error": d["error"],
                 "twin_error": vf_error_brief()}
+
+    @app.get("/ue5/frame", summary="Polling view for UE5 Python / VaRest clients")
+    def ue5_frame(since: int = -1):
+        """
+        Everything a UE5 client needs per frame. ``field`` (a field.snapshot)
+        is only included when the twin changed since ``since``; pass back the
+        returned ``seq``. Drone poses and the caption are always included.
+        """
+        get_twin()
+        version = int(ctx.get("field_version", 0))
+        return {
+            "seq": version,
+            "status": ctx.get("latest_status"),
+            "drones": ctx.get("latest_positions"),
+            "demo_running": ctx["demo"]["task"] is not None and not ctx["demo"]["task"].done(),
+            "field": field_snapshot(version) if version != since else None,
+        }
 
     @app.get("/sim/error", summary="Twin vs ground truth")
     def sim_error():

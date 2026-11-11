@@ -187,7 +187,11 @@ Moisture is now informative: the hidden leaky patch drains between canal turns.
   - assimilates camera frames as the replay passes them, so the field changes under the drones
   - sends the hidden reality (`truth_*`) for a twin-vs-reality view
   - the plugin exposes `OnDronePositions`, `OnStatus` and `TruthInstances`; the Blueprint recipe is in `src/ue5_integration/README.md`
-- [ ] Build the plugin in the UE5 project, wire `M_RiceCrop` to the custom-data slots, and drive the drone actors from `OnDronePositions`.
+- [x] No-C++ path: `src/ue5_integration/python/twin_live.py` runs in UE5's built-in Python and polls `GET /ue5/frame`.
+  - It drives a 400-instance HISM through custom data, or builds block fields (twin and reality) by itself.
+  - It moves the drones, with spray cones, and shows captions.
+  - It is tested against the real API with a fake `unreal` module (`tests/test_ue5_python.py`).
+- [ ] Run `twin_live.py` (or build the C++ plugin) in the UE5 project and wire `M_RiceCrop` to the custom-data slots.
 - [ ] three.js view: read drone positions from `/swarm/state` and field layers from `/twin/layers/*`.
 
 ## Done when

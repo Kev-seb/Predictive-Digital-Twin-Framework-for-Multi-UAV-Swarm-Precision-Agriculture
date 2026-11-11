@@ -1,8 +1,37 @@
-# UE5 integration: TwinStream plugin
+# UE5 integration
 
-`TwinStream` connects a UE5 level to the digital twin API (`digital_twin_api.py`) over the `/ws/field` WebSocket. It replaces polling `/field/status` every 500 ms. The server pushes a snapshot whenever the twin changes, and a flight track after every drone mission.
+The `TwinStream` C++ plugin (sections 1–7) connects a UE5 level to the digital twin API (`digital_twin_api.py`) over the `/ws/field` WebSocket. It replaces polling `/field/status` every 500 ms. The server pushes a snapshot whenever the twin changes, and a flight track after every drone mission.
 
 > **Status:** written against long-stable UE 5.x APIs (WebSockets, Json, instanced static mesh custom data), but **not yet compiled in a UE5 project**. The server side and the message schema are covered by tests (`tests/test_twin_core.py::test_ws_field_*`). If your engine version reports a compile error, it's most likely a small API-signature difference in a `TryGet…Field` call.
+
+## Quick start: no C++ (recommended)
+
+`python/twin_live.py` runs inside the UE5 editor using UE5's built-in Python. There's nothing to compile and nothing to buy.
+
+1. **Enable Python in UE5 (once):** *Edit → Plugins*, search for **Python Editor Script Plugin**, tick it, and restart the editor.
+2. **Start the twin** on the same PC:
+
+   ```bash
+   python digital_twin_api.py
+   ```
+
+3. **Run the script in UE5:** *File → Execute Python Script…* and pick `src/ue5_integration/python/twin_live.py`.
+   - **Empty level:** the script builds a **Twin** field and a **Reality** field next to each other, 20×20 blocks each. Block colour shows stress and fungus, and block height shows NDVI.
+   - **Level with your rice field** (a 400-instance HISM): the script drives your field instead, through per-instance custom data slots 0–5, which you read in `M_RiceCrop` with *PerInstanceCustomData* nodes. Label a second field actor with "Reality" to get the hidden truth on it.
+4. **Start the story:**
+
+   ```bash
+   curl -X POST localhost:8008/demo/start -H 'content-type: application/json' -d '{}'
+   ```
+
+   Drones (spheres) take off, scout, and spray, with a blue cone showing while they spray. The twin field changes under them as they fly. A caption above the field narrates each step and shows the twin-vs-reality error.
+5. **Stop or restart:** run the script again, or type `twin_live_stop()` in the Output Log's Python console.
+
+Settings are at the top of the script: API address, field mode, and where to build the blocks.
+
+This path is tested against the real API with a stand-in for UE5's Python module (`tests/test_ue5_python.py`), but it hasn't been run inside UE5 yet. If a call doesn't exist in your engine version, the Output Log names it. Send me that line.
+
+**Want the C++ plugin instead?** Your project can compile C++ if its folder has a `Source/` folder and a `.sln` file next to the `.uproject`, and Visual Studio with the *Game development with C++* workload is installed. If not, use the Python path above; it does the same job.
 
 ## 1. Install
 

@@ -682,3 +682,23 @@ def test_demo_stop(client):
     client.post("/demo/stop")
     st = client.get("/demo/status").json()
     assert st["running"] is False and st["phase"] == "stopped"
+
+
+def test_ue5_frame_polling(client):
+    f0 = client.get("/ue5/frame").json()
+    assert f0["field"] is not None and len(f0["field"]["ndvi"]) == 400
+    again = client.get(f"/ue5/frame?since={f0['seq']}").json()
+    assert again["field"] is None and again["seq"] == f0["seq"]          # unchanged -> no payload
+    client.post("/twin/step", json={"days": 1})
+    f1 = client.get(f"/ue5/frame?since={f0['seq']}").json()
+    assert f1["seq"] > f0["seq"] and f1["field"]["sim_day"] == f0["field"]["sim_day"] + 1
+    client.post("/demo/start", json={"days": 3, "scout_every": 3, "day_seconds": 0, "playback_speed": 500})
+    for _ in range(200):
+        fr = client.get("/ue5/frame").json()
+        if not fr["demo_running"] and fr["status"] and fr["status"]["phase"] == "done":
+            break
+        import time as _t
+        _t.sleep(0.05)
+    assert fr["status"]["phase"] == "done"
+    assert fr["drones"]["fields"][0] == "row" and len(fr["drones"]["drones"]) >= 1
+    assert "truth_stress" in fr["field"]
