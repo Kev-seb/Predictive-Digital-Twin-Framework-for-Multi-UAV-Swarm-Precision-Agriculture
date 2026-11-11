@@ -87,6 +87,8 @@ def run(days: int, drone_every: int, survey_every: int, altitude: float,
 
 def closed_loop(days: int, every: int, n_drones: int, threshold: float, seed: int,
                 propagation_model: str, spray: bool) -> dict:
+    import random
+    random.seed(seed)   # flight-physics turbulence: identical across paired runs
     grid = FieldGrid.centered_on(10.0, 78.0)
     truth = VirtualField(grid, seed=seed, propagation_model=propagation_model)
     twin = DigitalTwin("closed_loop", grid=grid, propagation_model=propagation_model)

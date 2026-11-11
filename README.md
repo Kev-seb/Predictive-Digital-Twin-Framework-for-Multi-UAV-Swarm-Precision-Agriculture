@@ -482,9 +482,11 @@ API available at **http://127.0.0.1:8008/docs** (Swagger UI).
 
 The API is backed by `src/twin_core`, the single source of truth for the simulated
 paddy field: a georeferenced 40 × 40 grid (2.5 m cells, ~1 ha) holding a mean and a
-variance for NDVI, stress, moisture, nitrogen and fungus. The twin advances with the
-agronomic simulator (predict) and is corrected by observations through a per-cell
-Kalman filter (assimilate). State persists to `outputs/twin_core/<field_id>/`.
+variance for NDVI, stress, moisture, nitrogen and fungus. The twin advances with a
+rice-specific process model (`paddy_model.py`: flooded water balance, GDD phenology
+fitted to the flight manifest, weather-driven disease) and is corrected by observations
+through a per-cell Kalman filter with adaptive inflation (assimilate). Calibrate it with
+`scripts/extract_flight_ndvi.py` + `scripts/calibrate_paddy.py`. State persists to `outputs/twin_core/<field_id>/`.
 Ports, grid size and field id are set in `src/config/config.py` (env prefix `UAV_`).
 See [`docs/digital_twin_plan.md`](docs/digital_twin_plan.md) for the roadmap.
 

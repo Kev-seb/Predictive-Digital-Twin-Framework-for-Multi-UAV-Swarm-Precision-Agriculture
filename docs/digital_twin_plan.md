@@ -67,7 +67,7 @@ Most parts existed, but they weren't connected:
 - [ ] Upgrade to an ensemble Kalman filter over the simulator, so moisture and nitrogen get updated through their correlation with NDVI.
 - [ ] Point `mobile_api_server.py` `/api/field/state` at the twin API instead of `FieldDigitalTwin` survey files.
 
-#### Validation result (`python scripts/run_twin_osse.py --days 21`)
+#### Validation result with the original generic crop model (superseded; see Phase 5)
 
 Setup: a hidden outbreak and a dry patch, a drone RGB pass every 3 days (10 m altitude, 200 frames), and a multispectral survey every 7 days with 90% coverage. Values are RMSE against the hidden truth on day 21:
 
@@ -100,31 +100,63 @@ Coverage near 1.0 means the twin's uncertainty is honest, if slightly conservati
 - [ ] Execute the same plans on ArduPilot SITL: QGC mission → MAVLink upload → fly, with telemetry replacing the in-process physics.
 - [ ] Compare the outcome after the mission against the `what_if` prediction.
 
-#### Closed-loop result (`python scripts/run_twin_osse.py --closed-loop --days 21 --fleet 3`)
+Results are reported under Phase 5, after model calibration.
 
-A 3-drone fleet scouts every 3 days. The twin-driven run also sprays zones whose fungal load is above 0.2. It is compared with an identical run that only scouts.
+### Phase 5: Calibrate and validate ✅ (done in simulation; real-data steps ready to run)
+
+The generic `AgronomicDigitalTwinSimulator` was the limiting factor:
+- It treated moisture > 0.85 as waterlogging damage, which is wrong for a flooded paddy.
+- It dried the field by 0.03 a day and saturated it after any rain.
+- Its outbreaks decayed, and NDVI fell during the vegetative stage.
+
+It's replaced as the twin's default by a rice-specific process model. The legacy model is still available as `crop_model="legacy"`.
+
+- [x] **`src/twin_core/paddy_model.py`**, with every coefficient in `PaddyParams` (JSON-serialisable):
+  - **Water balance:** ponded depth and root-zone saturation per cell; crop ET = FAO-56 rice Kc × ET0; cell-varying percolation; 100 mm bund overflow; canal irrigation every 5 days. Drought stress starts only once standing water is gone.
+  - **Phenology:** thermal time (GDD, base 10 °C); NDVI potential rises to a booting peak and declines through senescence.
+  - **Nitrogen:** uptake, leaching and top-dressing.
+  - **Disease:** logistic growth driven by temperature and leaf wetness, capped at a 0.6 maximum severity, with adult-plant resistance, spore diffusion and wind advection, and fungicide kill plus ~5-day half-life protection.
+  - **Stress:** NDVI shortfall relative to the stage's potential, plus fungal load (`0.65·deficit + 0.35·fungus`).
+- [x] **Phenology fitted to `flight_manifest.csv`** (`scripts/calibrate_paddy.py`): all 20 labelled flights over both fields are classified correctly. Stage onsets: Vegetative 252, Booting 1071, Flowering 1449, Mature 1854 GDD after transplanting.
+- [x] **Seasonal behaviour** (tested):
+  - A managed season peaks at NDVI ~0.85 at booting and ends at ~0.45.
+  - An unsprayed monsoon epidemic plateaus at 30–50% severity.
+  - Without irrigation, the field drains in ~1 week and then droughts.
+  - Disease does not grow in dry weather.
+- [x] **Twin uncertainty calibrated:**
+  - Process and prior noise are tuned so normalised squared errors average ~1; the 95% intervals now contain the truth 95–97% of the time, up from 99–100%.
+  - Adaptive covariance inflation (innovations > 3σ) lets the twin absorb surprises such as a hidden outbreak, which one scout pass now detects: 0.28 vs a true 0.34.
+  - Observation noise is matched to the sensor's real error.
+- [x] **Experiment fixes:**
+  - The virtual field uses separate weather and sensor random streams, and flight turbulence is seeded, so paired runs see identical weather.
+  - Spraying triggers on infected *area* (≥10% of a zone above the action threshold) instead of the zone mean.
+- [ ] **On your machine with the raw imagery:**
+  1. Run `python scripts/extract_flight_ndvi.py --raw <paddy_dataset>`, which writes `data/manifests/flight_ndvi.csv`.
+  2. Run `python scripts/calibrate_paddy.py` to refit phenology with Open-Meteo archive temperatures and fit the NDVI curve. This writes `outputs/calibration/paddy_params.json`, which the twin API loads automatically.
+- [ ] **Re-tune sensor noise on real data:** estimate `SENSOR_NOISE` from ground-truth plots, then process noise from real innovation statistics. The current values are only self-consistent inside the simulation.
+
+#### Results with the calibrated model
+
+**Tracking** (`python scripts/run_twin_osse.py --days 21`). RMSE against the hidden truth on day 21:
+
+| Layer | Model-only twin | Assimilating twin | 95% coverage |
+|---|---|---|---|
+| Stress | 0.062 | **0.017** | 0.94 |
+| NDVI | 0.045 | **0.014** | 0.97 |
+| Fungus | 0.080 | **0.027** | 0.92 |
+| Moisture | 0.032 | **0.019** | 1.00 |
+| Nitrogen | 0.033 | **0.026** | 0.98 |
+
+Moisture is now informative: the hidden leaky patch drains between canal turns.
+
+**Closed loop** (`python scripts/run_twin_osse.py --closed-loop --days 21 --fleet 3`). Paired runs with identical weather:
 
 | Day 21, hidden field | Scout only | Twin-driven spraying |
 |---|---|---|
-| Peak fungal load | 0.486 | **0.308** (−37%) |
-| Mean fungal load | 0.081 | **0.073** |
-| Mean NDVI | 0.586 | **0.592** |
-| Fungicide used | 0 | 2.9 kg (2 zone sprays) |
-
-Caveats, both for Phase 5:
-- The outbreak shrinks on its own (0.61 → 0.49), so the disease model under-spreads and the value of spraying is understated.
-- NDVI declines in both runs, which is unrealistic for a vegetative paddy.
-
-### Phase 5: Calibrate and validate
-- [ ] Fit simulator coefficients to the flight time series in `data/manifests/flight_manifest.csv`. Two water-balance problems are known:
-  - Evapotranspiration dries a flooded paddy from 0.65 to 0.38 moisture in 7 days without rain.
-  - Rain adds 0.06 per mm, so one monsoon spell saturates moisture to 1.0 field-wide. Moisture then carries no information (both twins score ~0 error).
-  - A bunded paddy water-depth model (ponding, percolation, drainage) would fix both.
-- [ ] Tune process noise per layer so the twin's 95% intervals contain the truth ~95% of the time, not 97–100%.
-- [ ] Disease dynamics: the PDE outbreak decays under humid monsoon weather. Check the growth rate against blast/sheath-blight literature.
-- [ ] Crop growth: NDVI falls ~0.11 in 21 vegetative days without stress. The nitrogen uptake and growth terms need fitting.
-- [ ] Train the ConvLSTM on real flight sequences instead of synthetic history.
-- [ ] Report forecast skill: RMSE of predicted vs. observed NDVI and stress at the next flight, plus calibration of the twin's uncertainty.
+| Mean fungal load | 0.072 | **0.050** (−31%) |
+| Peak fungal load | 0.375 | **0.190** (−49%) |
+| Mean NDVI | 0.788 | **0.799** |
+| Fungicide | 0 | 3.7 kg, 2 zones, day 3 |
 
 ### Phase 6: Visualization
 - [ ] UE5 subscribes to `/ws/twin` instead of polling; drive HISM material parameters from `ndvi`, `stress` and `stress_std`.

@@ -29,23 +29,34 @@ import numpy as np
 from src.twin_core.field_state import LAYER_BOUNDS, LAYERS, FieldState
 
 # Per-day growth of variance in each layer when the model runs unobserved.
+# Tuned with the OSSE (3 seeds x 21 days, drone pass every 3 days, survey
+# every 7) so that normalised squared errors average ~1 and the twin's 95%
+# intervals contain the hidden truth 95-97% of the time. This is
+# self-consistency inside the simulation; re-tune on real residuals.
+# Stress is diagnostic (derived from NDVI and fungus), its entry is unused.
 PROCESS_NOISE_PER_DAY: Dict[str, float] = {
-    "ndvi": 0.0015,
-    "stress": 0.0015,
-    "moisture": 0.004,
-    "nitrogen": 0.002,
-    "fungus": 0.003,
+    "ndvi": 7.8e-05,
+    "stress": 7.8e-05,
+    "moisture": 4.0e-04,
+    "nitrogen": 4.2e-05,
+    "fungus": 3.0e-04,
 }
 
-# Typical observation variance per sensor source and layer.
+# Observation error variance per sensor source and layer. These must match
+# the sensors' real error: drone_rgb matches the simulated camera in
+# virtual_field.py (stress sd 0.06, disease-coverage sd 0.08). For real
+# sensors, estimate them from ground-truth plots.
 SENSOR_NOISE: Dict[str, Dict[str, float]] = {
     "multispectral": {"ndvi": 0.0009, "stress": 0.0025, "moisture": 0.01, "nitrogen": 0.01},
-    "phone_rgb": {"stress": 0.01, "ndvi": 0.01, "fungus": 0.02},
-    "drone_rgb": {"stress": 0.006, "ndvi": 0.006, "fungus": 0.015},
+    "phone_rgb": {"stress": 0.01, "ndvi": 0.01, "fungus": 0.012},
+    "drone_rgb": {"stress": 0.0036, "ndvi": 0.006, "fungus": 0.0064},
     "soil_probe": {"moisture": 0.0025, "nitrogen": 0.004},
     "ue5": {"ndvi": 0.004, "stress": 0.004, "moisture": 0.01},
 }
 DEFAULT_OBS_VAR = 0.01
+
+# Innovations beyond this many standard deviations trigger adaptive inflation.
+INFLATION_SIGMA = 3.0
 
 
 @dataclass
@@ -109,7 +120,16 @@ def kalman_update(
 
     p_before = float(p[valid].mean())
     innovation = z[valid] - x[valid]
-    gain = p[valid] / (p[valid] + r[valid])
+    # Adaptive inflation: an innovation far outside the predicted spread
+    # (> INFLATION_SIGMA * sqrt(P + R)) means the model missed something
+    # (e.g. an unseen outbreak). Raise P to the variance the innovation
+    # implies so the surprise is absorbed now instead of over many visits.
+    p_valid = p[valid]
+    surprise = innovation ** 2 > (INFLATION_SIGMA ** 2) * (p_valid + r[valid])
+    if np.any(surprise):
+        p_valid = np.where(surprise, np.maximum(p_valid, innovation ** 2 - r[valid]), p_valid)
+        p[valid] = p_valid
+    gain = p_valid / (p_valid + r[valid])
 
     x[valid] = x[valid] + gain * innovation
     p[valid] = (1.0 - gain) * p[valid]

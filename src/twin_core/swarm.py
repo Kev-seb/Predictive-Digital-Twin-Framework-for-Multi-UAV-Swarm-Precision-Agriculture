@@ -147,12 +147,15 @@ def lawnmower(bounds: Tuple[float, float, float, float], spacing: float) -> List
 # ========================================================================= tasks
 def tasks_from_twin(twin, kind: str, frame: LocalFrame, spec: DroneSpec = DroneSpec(),
                     fungus_threshold: float = 0.2, dose_l_per_ha: float = 25.0,
-                    zones: Optional[List[int]] = None) -> List[Task]:
+                    zones: Optional[List[int]] = None, min_infected_frac: float = 0.1) -> List[Task]:
     """
     ``scout``: one lawn-mower task per zone (priority = mean uncertainty, so
     the least-known zones are visited first).
-    ``spray``: zones whose mean fungal load exceeds ``fungus_threshold``;
-    dose scales with load (1 L ≈ 1 kg), priority = mean load.
+    ``spray``: zones where at least ``min_infected_frac`` of the area has a
+    fungal load above ``fungus_threshold`` (an action threshold on infected
+    area, so a hotspot is not averaged away by healthy surroundings). Dose
+    scales with the infected cells' load (1 L ≈ 1 kg); priority = infected
+    fraction x load.
     """
     if kind not in ("scout", "spray"):
         raise ValueError("kind must be 'scout' or 'spray'")
@@ -173,13 +176,16 @@ def tasks_from_twin(twin, kind: str, frame: LocalFrame, spec: DroneSpec = DroneS
                               lawnmower(bounds, spec.scout_lane_m),
                               priority=float(uncertainty[mask].mean()), alt_m=spec.scout_alt_m))
         else:
-            load = float(fungus[mask].mean())
-            if load < fungus_threshold:
+            zone_f = fungus[mask]
+            infected = zone_f > fungus_threshold
+            frac = float(infected.mean())
+            if frac < min_infected_frac:
                 continue
+            load = float(zone_f[infected].mean())
             area_ha = float(mask.sum()) * cell_ha
-            dose = dose_l_per_ha * min(2.0, load / max(fungus_threshold, 1e-6))
+            dose = dose_l_per_ha * float(np.clip(load / max(fungus_threshold, 1e-6), 0.5, 2.0))
             tasks.append(Task(f"spray-z{z_id}", "spray", z_id,
-                              lawnmower(bounds, spec.spray_swath_m), priority=load,
+                              lawnmower(bounds, spec.spray_swath_m), priority=frac * load,
                               payload_kg=round(area_ha * dose, 3), alt_m=spec.spray_alt_m))
     return tasks
 

@@ -9,6 +9,11 @@ It owns
     moisture / nitrogen / fungus layers carry over from day to day,
   * an event log and in-process subscribers (used by the API's WebSocket).
 
+The crop model is pluggable: ``crop_model="paddy"`` (default) uses the
+rice-specific PaddyFieldSimulator (flooded water balance, thermal-time
+phenology, weather-driven disease); ``"legacy"`` wraps the original
+AgronomicDigitalTwinSimulator.
+
 The core loop is PREDICT -> ASSIMILATE:
 
   step()            advances the simulator by N days and grows uncertainty
@@ -33,6 +38,7 @@ import numpy as np
 
 from src.twin_core import assimilation as da
 from src.twin_core.field_state import LAYERS, FieldGrid, FieldState
+from src.twin_core.paddy_model import PaddyFieldSimulator, PaddyParams
 
 # Default daily weather for a monsoon-season paddy in Tamil Nadu
 # (matches the default field centre in src/config/config.py).
@@ -77,6 +83,48 @@ def sim_stage(stage: str) -> str:
     return _STAGE_TO_SIM.get(stage.strip().lower(), "Vegetative")
 
 
+class LegacyCropModel:
+    """Adapter giving AgronomicDigitalTwinSimulator the crop-model interface."""
+
+    def __init__(self, state: FieldState, zone_labels, zone_names, propagation_model: str):
+        from src.digital_twin.simulator import AgronomicDigitalTwinSimulator
+
+        m = state.mean
+        self.state = state
+        self.propagation_model = propagation_model
+        self.sim = AgronomicDigitalTwinSimulator(
+            ndvi=m["ndvi"], stress=m["stress"], ndwi=m["moisture"] * 2.0 - 1.0,
+            cire=m["nitrogen"] * 5.0, zone_labels=zone_labels, zone_names=zone_names)
+
+    def sync_from_moisture(self) -> None:
+        pass
+
+    def set_stage(self, stage: str) -> None:
+        self.state.growth_stage = stage
+
+    def simulate_day(self, weather, interventions, **_):
+        for name in LAYERS:
+            setattr(self.sim, name, self.state.mean[name].astype(np.float32).copy())
+        logs = self.sim.simulate_day(weather=weather, interventions=interventions,
+                                     propagation_model=self.propagation_model,
+                                     growth_stage=sim_stage(self.state.growth_stage))
+        for name in LAYERS:
+            self.state.mean[name] = np.asarray(getattr(self.sim, name), dtype=np.float32).copy()
+        return logs
+
+    @staticmethod
+    def stress(ndvi, fungus):
+        return np.clip((1.0 - ndvi) / 2.0 + STRESS_FUNGUS_WEIGHT * fungus, 0.0, 1.0).astype(np.float32)
+
+    @staticmethod
+    def ndvi_from_stress(stress, fungus):
+        return np.clip(1.0 - 2.0 * (stress - STRESS_FUNGUS_WEIGHT * fungus), -1.0, 1.0).astype(np.float32)
+
+    @staticmethod
+    def ndvi_per_stress() -> float:
+        return 2.0
+
+
 class DigitalTwin:
     def __init__(
         self,
@@ -87,7 +135,11 @@ class DigitalTwin:
         propagation_model: str = "pde",
         zone_layout: tuple = (4, 4),
         max_events: int = 500,
+        crop_model: str = "paddy",
+        params: Optional[PaddyParams] = None,
     ):
+        if crop_model not in ("paddy", "legacy"):
+            raise ValueError("crop_model must be 'paddy' or 'legacy'")
         if state is None:
             if grid is None:
                 grid = FieldGrid.centered_on(10.0, 78.0)
@@ -103,7 +155,11 @@ class DigitalTwin:
         self.history: List[Dict[str, Any]] = []
         self._subscribers: List[Subscriber] = []
         self._lock = threading.RLock()
-        self._sim = None  # built lazily; torch import is slow
+        self.crop_model = crop_model
+        self.params = params or PaddyParams()
+        self._sim = None        # built lazily (the legacy model imports torch)
+        self._sim_state = None  # the FieldState object the model is bound to
+        self._model()           # initialise process state (water, GDD, stage)
 
     # ================================================================ setup
     @classmethod
@@ -134,39 +190,24 @@ class DigitalTwin:
             self.state = FieldState.initial(self.state.grid, values=values,
                                             growth_stage=self.state.growth_stage, seed=seed)
             self._sim = None
+            self._model()
+            self._refresh_stress()
             self.history = []
             self._record_history("reset")
             self._emit("twin.reset", {})
             self.save()
 
-    # ============================================================ simulator
-    def _simulator(self):
-        if self._sim is None:
-            from src.digital_twin.simulator import AgronomicDigitalTwinSimulator
-
-            m = self.state.mean
-            # The simulator derives moisture/nitrogen/fungus from spectral
-            # indices; we overwrite them with the twin's own layers below.
-            self._sim = AgronomicDigitalTwinSimulator(
-                ndvi=m["ndvi"],
-                stress=m["stress"],
-                ndwi=m["moisture"] * 2.0 - 1.0,
-                cire=m["nitrogen"] * 5.0,
-                zone_labels=self.zone_labels,
-                zone_names=self.zone_names,
-            )
-        self._push_to_sim()
+    # ============================================================ crop model
+    def _model(self):
+        if self._sim is None or self._sim_state is not self.state:
+            if self.crop_model == "paddy":
+                self._sim = PaddyFieldSimulator(self.state, self.zone_labels, self.zone_names,
+                                                self.params)
+            else:
+                self._sim = LegacyCropModel(self.state, self.zone_labels, self.zone_names,
+                                            self.propagation_model)
+            self._sim_state = self.state
         return self._sim
-
-    def _push_to_sim(self) -> None:
-        sim = self._sim
-        for name in LAYERS:
-            setattr(sim, name, self.state.mean[name].astype(np.float32).copy())
-
-    def _pull_from_sim(self) -> None:
-        for name in LAYERS:
-            self.state.mean[name] = np.asarray(getattr(self._sim, name), dtype=np.float32).copy()
-        self.state.clip()
 
     # ============================================================== predict
     def step(
@@ -195,16 +236,12 @@ class DigitalTwin:
 
         logs: List[str] = []
         with self._lock:
-            sim = self._simulator()
+            model = self._model()
             for d in range(1, days + 1):
                 todays = [i for i in interventions if int(i.get("day", 1)) == d]
-                day_logs = sim.simulate_day(
-                    weather=weather_seq[d - 1],
-                    interventions=todays,
-                    propagation_model=self.propagation_model,
-                    growth_stage=sim_stage(self.state.growth_stage),
-                )
-                self._pull_from_sim()
+                model.sync_from_moisture()   # respect assimilated moisture
+                day_logs = model.simulate_day(weather=weather_seq[d - 1], interventions=todays)
+                self.state.clip()
                 da.inflate_process_noise(self.state, days=1.0)
                 self._refresh_stress()
                 self.state.sim_day += 1
@@ -230,7 +267,7 @@ class DigitalTwin:
             if layer == "stress":
                 # Stress is diagnostic: assimilate the NDVI it implies.
                 implied = self._ndvi_from_stress(np.asarray(values, dtype=np.float32))
-                r = da.observation_variance(source, "stress", obs_var) * 4.0
+                r = da.observation_variance(source, "stress", obs_var) * self._model().ndvi_per_stress() ** 2
                 result = da.assimilate_grid(self.state, "ndvi", implied, source, r)
                 result.layer = "stress->ndvi"
             else:
@@ -268,10 +305,11 @@ class DigitalTwin:
                     if "ndvi" in values:
                         continue  # a direct NDVI reading is more informative
                     cell = self.state.grid.latlon_to_cell(lat, lon)
-                    fungus = float(self.state.mean["fungus"][cell])
-                    implied = float(np.clip(
-                        1.0 - 2.0 * (float(value) - STRESS_FUNGUS_WEIGHT * fungus), -1.0, 1.0))
-                    r = da.observation_variance(source, "stress", obs_var.get("stress")) * 4.0
+                    fungus = np.float32(self.state.mean["fungus"][cell])
+                    model = self._model()
+                    implied = float(model.ndvi_from_stress(np.float32(value), fungus))
+                    r = da.observation_variance(source, "stress", obs_var.get("stress")) \
+                        * model.ndvi_per_stress() ** 2
                     res = da.assimilate_point(self.state, "ndvi", implied, lat, lon, source,
                                               r, footprint_m, influence_radius_m)
                     res.layer = "stress->ndvi"
@@ -288,29 +326,34 @@ class DigitalTwin:
 
     def _ndvi_from_stress(self, stress_obs: np.ndarray) -> np.ndarray:
         """
-        Invert the simulator's stress relation, so a stress observation is
-        assimilated as the NDVI it implies. The observation variance must be
-        scaled by 4 because d(ndvi)/d(stress) = -2.
+        Invert the crop model's stress relation, so a stress observation is
+        assimilated as the NDVI it implies. The observation variance is scaled
+        by (d ndvi / d stress)^2 = ndvi_per_stress()^2.
         """
         if stress_obs.shape != self.state.grid.shape:
             stress_obs = da._resample_to(stress_obs, self.state.grid.shape)
-        implied = 1.0 - 2.0 * (stress_obs - STRESS_FUNGUS_WEIGHT * self.state.mean["fungus"])
-        return np.clip(implied, -1.0, 1.0)
+        out = self._model().ndvi_from_stress(stress_obs, self.state.mean["fungus"])
+        return np.where(np.isfinite(stress_obs), out, np.nan).astype(np.float32)
 
     def _refresh_stress(self) -> None:
         """
         Recompute the diagnostic stress layer from NDVI and fungus, exactly as
-        the simulator does, and propagate their variances (first order).
+        the crop model does, and propagate their variances (first order).
         """
-        m, v, w = self.state.mean, self.state.var, STRESS_FUNGUS_WEIGHT
-        m["stress"] = np.clip((1.0 - m["ndvi"]) / 2.0 + w * m["fungus"], 0.0, 1.0).astype(np.float32)
-        v["stress"] = (v["ndvi"] / 4.0 + (w ** 2) * v["fungus"]).astype(np.float32)
+        model = self._model()
+        m, v = self.state.mean, self.state.var
+        w = getattr(getattr(model, "p", None), "stress_fungus_weight", STRESS_FUNGUS_WEIGHT)
+        m["stress"] = model.stress(m["ndvi"], m["fungus"])
+        g = model.ndvi_per_stress()
+        v["stress"] = (v["ndvi"] / g ** 2 + (w ** 2) * v["fungus"]).astype(np.float32)
         self.state.clip()
 
     def set_growth_stage(self, stage: str) -> None:
         with self._lock:
-            self.state.growth_stage = stage
-            self._emit("twin.stage", {"growth_stage": stage})
+            self._model().set_stage(stage)
+            self._refresh_stress()
+            self._emit("twin.stage", {"growth_stage": self.state.growth_stage,
+                                      "gdd": self.state.scalars.get("gdd")})
             self.save()
 
     # ============================================================ scenarios
@@ -323,6 +366,8 @@ class DigitalTwin:
                 storage_dir=None,
                 propagation_model=self.propagation_model,
                 zone_layout=self.zone_layout,
+                crop_model=self.crop_model,
+                params=self.params,
             )
             twin.history = copy.deepcopy(self.history[-30:])
             return twin

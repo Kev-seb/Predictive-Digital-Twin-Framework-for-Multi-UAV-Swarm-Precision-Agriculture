@@ -103,6 +103,8 @@ class AppSettings(BaseSettings):
     twin_propagation_model: Literal["baseline", "pde", "hybrid", "gnn"] = "pde"
     twin_swarm_size:  int   = 3        # simulated drones in the twin's fleet
     twin_forward_live: bool = True     # mobile API forwards live inferences to the twin
+    twin_crop_model:  Literal["paddy", "legacy"] = "paddy"
+    twin_params_file: Path  = Path(__file__).resolve().parents[2] / "outputs" / "calibration" / "paddy_params.json"
     twin_storage_dir: Path  = Path(__file__).resolve().parents[2] / "outputs" / "twin_core"
 
     # --- Logging ---

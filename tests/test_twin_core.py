@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from src.twin_core import DigitalTwin, FieldGrid, FieldState
+from src.twin_core.field_state import PADDY_DEFAULTS
 from src.twin_core.assimilation import assimilate_grid, assimilate_point, inflate_process_noise
 
 LAT, LON = 10.0, 78.0
@@ -71,8 +72,9 @@ def test_point_assimilation_is_local(grid):
     lat, lon = grid.cell_center_latlon(10, 10)
     assimilate_point(s, "stress", 0.9, lat, lon, source="drone_rgb")
     assert s.mean["stress"][10, 10] > 0.6
-    assert s.mean["stress"][10, 11] > s.mean["stress"][10, 13] > 0.15 - 1e-6
-    assert s.mean["stress"][0, 0] == pytest.approx(0.15)
+    prior = PADDY_DEFAULTS["stress"]
+    assert s.mean["stress"][10, 11] > s.mean["stress"][10, 13] > prior - 1e-6
+    assert s.mean["stress"][0, 0] == pytest.approx(prior)
 
 
 def test_process_noise_grows_variance(grid):
@@ -444,3 +446,149 @@ def test_api_swarm_and_closed_loop(client):
     adv = client.post("/sim/advance", json={"days": 1}).json()
     assert sorted(i["zone_id"] for i in adv["applied_fleet_interventions"]) == sorted(queued)
     assert client.get("/swarm/state").json()["pending_interventions"] == []
+
+
+# ------------------------------------------------------- paddy crop model
+from src.twin_core.calibration import (  # noqa: E402
+    Flight, constant_temperature, fit_ndvi_curve, fit_phenology, read_flights,
+)
+from src.twin_core.paddy_model import (  # noqa: E402
+    PaddyParams, moisture_from_water, ndvi_potential, stage_for_gdd, water_from_moisture,
+)
+import datetime as _dt  # noqa: E402
+
+DRY = {"temperature": 31.0, "humidity": 65.0, "precipitation": 0.0, "wind_speed": 8.0}
+
+
+def _paddy(grid, irrigation_interval=5, **values):
+    p = PaddyParams(irrigation_interval_days=irrigation_interval)
+    return DigitalTwin("p", grid=grid, params=p,
+                       state=FieldState.initial(grid, values=values or None, seed=None))
+
+
+def test_water_moisture_mapping_round_trips():
+    p = PaddyParams()
+    for m in (0.2, 0.55, 0.6, 0.8, 1.0):
+        h, s = water_from_moisture(p, np.array([m], dtype=np.float32))
+        assert moisture_from_water(p, h, s)[0] == pytest.approx(m, abs=1e-5)
+
+
+def test_flooded_paddy_stays_wet_with_canal_rotation(grid):
+    tw = _paddy(grid)
+    tw.step(14, DRY)
+    assert tw.state.mean["moisture"].min() > 0.6           # never drains below saturation
+    assert tw.state.aux["water_mm"].max() <= tw.params.bund_mm
+    out = tw.step(1, DRY)
+    assert not any("Drought" in line for line in out["logs"])
+
+
+def test_paddy_without_irrigation_drains_then_droughts(grid):
+    tw = _paddy(grid, irrigation_interval=0)
+    tw.step(7, DRY)
+    assert tw.state.aux["water_mm"].mean() < 15.0           # ET + percolation ~ 7.5 mm/day
+    ndvi_7 = float(tw.state.mean["ndvi"].mean())
+    tw.step(14, DRY)
+    assert tw.state.aux["soil_sat"].mean() < 0.85
+    assert tw.state.mean["moisture"].mean() < 0.6
+    assert tw.state.mean["ndvi"].mean() < ndvi_7            # drought hurts the canopy
+
+
+def test_heavy_rain_overflows_bund_not_unbounded(grid):
+    tw = _paddy(grid)
+    tw.step(3, {**DRY, "precipitation": 80.0})
+    assert tw.state.aux["water_mm"].max() == pytest.approx(tw.params.bund_mm)
+
+
+def test_disease_grows_in_humid_weather_only(grid):
+    humid = {"temperature": 26.0, "humidity": 93.0, "precipitation": 5.0, "wind_speed": 6.0}
+    a = _paddy(grid, fungus=0.02)
+    a.step(14, humid)
+    b = _paddy(grid, fungus=0.02)
+    b.step(14, DRY)
+    assert a.state.mean["fungus"].mean() > 0.1             # ~r 0.15/day
+    assert a.state.mean["fungus"].max() <= a.params.max_severity + 1e-6
+    assert b.state.mean["fungus"].mean() < 0.03
+
+
+def test_fungicide_kills_and_protects(grid):
+    humid = {"temperature": 26.0, "humidity": 93.0, "precipitation": 5.0}
+    tw = _paddy(grid, fungus=0.2)
+    spray = [{"day": 1, "zone_id": z, "type": "Fungicide Spray"} for z in tw.zone_names]
+    tw.step(1, humid, spray)
+    assert tw.state.mean["fungus"].mean() < 0.1
+    after_spray = float(tw.state.mean["fungus"].mean())
+    tw.step(5, humid)
+    unsprayed = _paddy(grid, fungus=after_spray)
+    unsprayed.step(5, humid)
+    assert tw.state.mean["fungus"].mean() < unsprayed.state.mean["fungus"].mean()   # residual protection
+
+
+def test_season_follows_paddy_ndvi_curve(grid):
+    st = FieldState.initial(grid, values={"ndvi": 0.25, "nitrogen": 0.6}, seed=None, growth_stage="Nursery")
+    tw = DigitalTwin("season", state=st)
+    tw.state.scalars["gdd"] = 0.0
+    weather = synthetic_weather(120, seed=1)
+    ndvi, stages = [], []
+    for d in range(120):
+        iv = []
+        if d + 1 in (21, 45, 65):
+            iv += [{"day": 1, "zone_id": z, "type": "Nutrient Top-Dress"} for z in tw.zone_names]
+        if d + 1 in (40, 60):
+            iv += [{"day": 1, "zone_id": z, "type": "Fungicide Spray"} for z in tw.zone_names]
+        tw.step(1, weather[d], iv)
+        ndvi.append(float(tw.state.mean["ndvi"].mean()))
+        stages.append(tw.state.growth_stage)
+    peak = int(np.argmax(ndvi))
+    assert 0.78 < max(ndvi) < 0.9
+    assert stages[peak] in ("Vegetative", "Booting", "Flowering") and peak > 50
+    assert 0.3 < ndvi[-1] < 0.6                               # senescence by harvest
+    assert stages[-1] == "Mature" and "Booting" in stages and "Flowering" in stages
+
+
+def test_stage_and_stress_relations():
+    p = PaddyParams()
+    assert stage_for_gdd(p, 0) == "Nursery"
+    assert stage_for_gdd(p, p.gdd_onset["Booting"] + 1) == "Booting"
+    assert ndvi_potential(p, 50) < 0.3 < ndvi_potential(p, p.gdd_onset["Booting"])
+    assert ndvi_potential(p, p.gdd_harvest) == pytest.approx(p.ndvi_mature, abs=0.02)
+
+
+def test_set_growth_stage_moves_thermal_time(twin):
+    twin.set_growth_stage("Flowering")
+    assert twin.state.growth_stage == "Flowering"
+    assert twin.state.scalars["gdd"] == pytest.approx(twin.params.gdd_onset["Flowering"])
+
+
+def test_paddy_state_persists(twin, grid, tmp_path):
+    twin.step(3, DRY)
+    again = DigitalTwin.load_or_create("test_field", tmp_path, grid=grid)
+    np.testing.assert_allclose(again.state.aux["water_mm"], twin.state.aux["water_mm"])
+    assert again.state.scalars["gdd"] == pytest.approx(twin.state.scalars["gdd"])
+
+
+def test_legacy_crop_model_still_available(grid):
+    tw = DigitalTwin("legacy", grid=grid, crop_model="legacy")
+    tw.step(2)
+    assert tw.state.sim_day == 2
+
+
+# --------------------------------------------------------- calibration
+def test_phenology_fit_on_repo_manifest():
+    from pathlib import Path
+    manifest = Path(__file__).resolve().parents[1] / "data" / "manifests" / "flight_manifest.csv"
+    flights = read_flights(manifest)
+    assert len(flights) == 20
+    p, rep = fit_phenology(flights, PaddyParams(), constant_temperature(28.0))
+    assert rep["flights_classified_correctly"] == "20/20"
+    order = [p.gdd_onset[s] for s in ("Vegetative", "Booting", "Flowering", "Mature")]
+    assert order == sorted(order)
+
+
+def test_ndvi_curve_fit_recovers_parameters():
+    true = PaddyParams(ndvi_max=0.8, ndvi_rise_mid_gdd=600.0, ndvi_mature=0.4)
+    pts = [(g, ndvi_potential(true, g)) for g in range(0, 2300, 150)]
+    fitted, rep = fit_ndvi_curve(pts, PaddyParams())
+    assert rep["fitted"] and rep["rmse"] < 0.01
+    assert fitted.ndvi_max == pytest.approx(0.8, abs=0.03)
+    assert fitted.ndvi_rise_mid_gdd == pytest.approx(600.0, rel=0.1)
+    assert fit_ndvi_curve([(0, 0.3)], PaddyParams())[1]["fitted"] is False

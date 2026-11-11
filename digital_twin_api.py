@@ -150,7 +150,9 @@ class SimDronePass(BaseModel):
 class MissionRequest(BaseModel):
     kind: Literal["scout", "spray", "auto"] = Field(
         "scout", description="auto = scout, then spray zones the updated twin flags")
-    fungus_threshold: float = Field(0.2, ge=0.0, le=1.0)
+    fungus_threshold: float = Field(0.2, ge=0.0, le=1.0, description="cell-level action threshold")
+    min_infected_frac: float = Field(0.1, gt=0.0, le=1.0,
+                                     description="spray a zone when this share of it exceeds the threshold")
     dose_l_per_ha:    float = Field(25.0, gt=0.0, le=200.0)
     zones:            Optional[List[int]] = None
     include_track:    bool = False
@@ -202,9 +204,15 @@ def _default_twin() -> DigitalTwin:
         rows=settings.twin_grid_rows, cols=settings.twin_grid_cols,
         cell_size_m=settings.twin_cell_size_m,
     )
+    params = None
+    if settings.twin_crop_model == "paddy" and settings.twin_params_file.exists():
+        from src.twin_core.paddy_model import PaddyParams
+        params = PaddyParams.from_json(settings.twin_params_file)
+        print(f"[DigitalTwinAPI] Using calibrated paddy parameters from {settings.twin_params_file}")
     return DigitalTwin.load_or_create(
         settings.twin_field_id, settings.twin_storage_dir, grid=grid,
         propagation_model=settings.twin_propagation_model,
+        crop_model=settings.twin_crop_model, params=params,
     )
 
 
@@ -221,7 +229,8 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
         if ctx["virtual"] is None:
             twin = get_twin()
             ctx["virtual"] = VirtualField(twin.state.grid, propagation_model=twin.propagation_model,
-                                          zone_layout=twin.zone_layout)
+                                          zone_layout=twin.zone_layout, crop_model=twin.crop_model,
+                                          params=twin.params)
         return ctx["virtual"]
 
     def get_fleet() -> Fleet:
@@ -237,7 +246,8 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
                 raise HTTPException(400, f"Unknown zone_id(s) {bad}. Valid: {sorted(twin.zone_names)}")
         tasks = tasks_from_twin(twin, kind, fleet.frame, fleet.spec,
                                 fungus_threshold=req.fungus_threshold,
-                                dose_l_per_ha=req.dose_l_per_ha, zones=req.zones)
+                                dose_l_per_ha=req.dose_l_per_ha, zones=req.zones,
+                                min_infected_frac=req.min_infected_frac)
         return tasks, allocate(tasks, fleet.drone_info())
 
     def forecast(source: str, days: int, start_day: int) -> tuple:
@@ -488,7 +498,8 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
         ctx["pending_interventions"] = []
         ctx["virtual"] = VirtualField(twin.state.grid, seed=req.seed, outbreaks=req.outbreaks,
                                       propagation_model=twin.propagation_model,
-                                      zone_layout=twin.zone_layout)
+                                      zone_layout=twin.zone_layout, crop_model=twin.crop_model,
+                                      params=twin.params)
         return {"status": "ok", "seed": req.seed, "error": ctx["virtual"].twin_error(twin)}
 
     @app.post("/sim/advance", summary="Advance the virtual field and the twin together")

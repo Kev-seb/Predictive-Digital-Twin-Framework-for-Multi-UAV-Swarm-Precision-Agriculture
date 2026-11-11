@@ -7,8 +7,9 @@ The project is simulation-only, so something has to play the role of the
 real field the twin is trying to track. ``VirtualField`` is that hidden
 ground truth: it runs the same agronomic simulator, but
 
-  * starts from a different state (e.g. a fungal outbreak the twin has not
-    been told about, a drier corner),
+  * starts from a different state (a fungal outbreak the twin has not been
+    told about) and has different soil (a leaky patch with high percolation
+    that drains between canal irrigation turns),
   * experiences the *actual* weather, which differs from the forecast the
     twin is given.
 
@@ -44,8 +45,14 @@ class VirtualField:
         weather_noise: Dict[str, float] = None,
         propagation_model: str = "pde",
         zone_layout: tuple = (4, 4),
+        crop_model: str = "paddy",
+        params=None,
     ):
-        self.rng = np.random.default_rng(seed)
+        self.rng = np.random.default_rng(seed)                 # initial state
+        # Separate streams so sensor use never changes the weather: two runs
+        # with the same seed see identical weather whatever they observe.
+        self.weather_rng = np.random.default_rng([seed, 1])
+        self.sensor_rng = np.random.default_rng([seed, 2])
         state = FieldState.initial(grid, seed=seed + 1)
         rr, cc = np.mgrid[0:grid.rows, 0:grid.cols]
 
@@ -60,19 +67,24 @@ class VirtualField:
 
         if dry_patch is None:
             dry_patch = {"row": grid.rows * 0.8, "col": grid.cols * 0.2,
-                         "radius": grid.rows * 0.15, "deficit": 0.3}
+                         "radius": grid.rows * 0.15, "deficit": 0.3, "extra_percolation_mm": 12.0}
+        leak = np.zeros(grid.shape, dtype=np.float32)
         if dry_patch:
             d = np.hypot(rr - dry_patch["row"], cc - dry_patch["col"])
-            dip = dry_patch["deficit"] * np.exp(-(d / max(dry_patch["radius"], 1e-6)) ** 2)
-            state.mean["moisture"] = np.clip(state.mean["moisture"] - dip, 0.0, 1.0).astype(np.float32)
-
-        state.mean["stress"] = np.clip((1.0 - state.mean["ndvi"]) / 2.0
-                                       + 0.35 * state.mean["fungus"], 0.0, 1.0).astype(np.float32)
-        for name in LAYERS:
-            state.var[name][:] = 0.0  # truth has no uncertainty
+            leak = np.exp(-(d / max(dry_patch["radius"], 1e-6)) ** 2).astype(np.float32)
+            state.mean["moisture"] = np.clip(state.mean["moisture"] - dry_patch["deficit"] * leak,
+                                             0.0, 1.0).astype(np.float32)
 
         self.truth = DigitalTwin(field_id="virtual_field", state=state, storage_dir=None,
-                                 propagation_model=propagation_model, zone_layout=zone_layout)
+                                 propagation_model=propagation_model, zone_layout=zone_layout,
+                                 crop_model=crop_model, params=params)
+        if dry_patch and "percolation_mm_day" in state.aux:
+            # Sandy / cracked patch the twin does not know about.
+            state.aux["percolation_mm_day"] = (state.aux["percolation_mm_day"]
+                                               + dry_patch.get("extra_percolation_mm", 12.0) * leak)
+        self.truth._refresh_stress()
+        for name in LAYERS:
+            state.var[name][:] = 0.0  # truth has no uncertainty
         self.weather_noise = weather_noise or {"temperature": 1.0, "humidity": 4.0,
                                                "precipitation": 0.35}
 
@@ -91,11 +103,11 @@ class VirtualField:
         n = self.weather_noise
         for w in forecast:
             a = dict(w)
-            a["temperature"] = float(w.get("temperature", 29.0) + self.rng.normal(0, n["temperature"]))
+            a["temperature"] = float(w.get("temperature", 29.0) + self.weather_rng.normal(0, n["temperature"]))
             a["humidity"] = float(np.clip(w.get("humidity", 78.0)
-                                          + self.rng.normal(0, n["humidity"]), 30.0, 100.0))
+                                          + self.weather_rng.normal(0, n["humidity"]), 30.0, 100.0))
             a["precipitation"] = float(max(0.0, w.get("precipitation", 0.0)
-                                           * self.rng.lognormal(0.0, n["precipitation"])))
+                                           * self.weather_rng.lognormal(0.0, n["precipitation"])))
             out.append(a)
         return out
 
@@ -128,17 +140,17 @@ class VirtualField:
         stress_true = float(self.truth.state.mean["stress"][mask].mean())
         fungus_true = float(self.truth.state.mean["fungus"][mask].mean())
 
-        stress = float(np.clip(stress_true + self.rng.normal(0, 0.06), 0.0, 1.0))
-        coverage = float(np.clip(fungus_true + self.rng.normal(0, 0.08), 0.0, 1.0))
+        stress = float(np.clip(stress_true + self.sensor_rng.normal(0, 0.06), 0.0, 1.0))
+        coverage = float(np.clip(fungus_true + self.sensor_rng.normal(0, 0.08), 0.0, 1.0))
         detections = []
         if coverage > 0.08:
             # Split the diseased area into a few boxes covering `coverage` of the frame.
             w, h = frame_wh
-            k = int(self.rng.integers(1, 4))
+            k = int(self.sensor_rng.integers(1, 4))
             side = np.sqrt(coverage * w * h / k)
             for _ in range(k):
-                x1 = float(self.rng.uniform(0, max(1.0, w - side)))
-                y1 = float(self.rng.uniform(0, max(1.0, h - side)))
+                x1 = float(self.sensor_rng.uniform(0, max(1.0, w - side)))
+                y1 = float(self.sensor_rng.uniform(0, max(1.0, h - side)))
                 detections.append({"x1": x1, "y1": y1, "x2": x1 + side, "y2": y1 + side,
                                    "label": "Leaf Blast", "confidence": 1.0})
         return {
@@ -146,8 +158,8 @@ class VirtualField:
             "stress_label": "Severe" if stress > 0.6 else "Moderate" if stress > 0.4
                             else "Mild" if stress > 0.25 else "Healthy",
             "disease_detections": detections,
-            "model_confidence": float(np.clip(self.rng.normal(0.85, 0.05), 0.5, 1.0)),
-            "quality_score": float(np.clip(self.rng.normal(0.9, 0.05), 0.0, 1.0)),
+            "model_confidence": float(np.clip(self.sensor_rng.normal(0.85, 0.05), 0.5, 1.0)),
+            "quality_score": float(np.clip(self.sensor_rng.normal(0.9, 0.05), 0.0, 1.0)),
         }
 
     def multispectral_survey(self, noise: float = 0.01, coverage: float = 1.0) -> Dict[str, np.ndarray]:
@@ -169,9 +181,9 @@ class VirtualField:
             "red_edge": nir / (cire + 1.0),
         }
         for k, v in bands.items():
-            bands[k] = np.clip(v * (1.0 + self.rng.normal(0, noise, v.shape)), 1e-4, None).astype(np.float32)
+            bands[k] = np.clip(v * (1.0 + self.sensor_rng.normal(0, noise, v.shape)), 1e-4, None).astype(np.float32)
         if coverage < 1.0:
-            missing = self.rng.random(self.grid.shape) > coverage
+            missing = self.sensor_rng.random(self.grid.shape) > coverage
             for v in bands.values():
                 v[missing] = np.nan
         return bands

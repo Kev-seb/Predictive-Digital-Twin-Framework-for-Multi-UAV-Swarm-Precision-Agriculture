@@ -34,21 +34,22 @@ LAYER_BOUNDS: Dict[str, Tuple[float, float]] = {
 }
 
 # Prior variance of a freshly initialised layer (no observation yet).
+# Tuned together with PROCESS_NOISE_PER_DAY (see assimilation.py).
 DEFAULT_PRIOR_VAR: Dict[str, float] = {
-    "ndvi": 0.02,
-    "stress": 0.02,
-    "moisture": 0.03,
-    "nitrogen": 0.03,
-    "fungus": 0.02,
+    "ndvi": 0.00104,
+    "stress": 0.0012,
+    "moisture": 0.003,
+    "nitrogen": 0.00063,
+    "fungus": 0.00198,
 }
 
-# Healthy mid-season paddy defaults used when no survey has been ingested.
+# Healthy mid-vegetative paddy defaults used when no survey has been ingested.
 PADDY_DEFAULTS: Dict[str, float] = {
     "ndvi": 0.72,
-    "stress": 0.15,
-    "moisture": 0.65,   # paddies are kept wet
+    "stress": 0.05,
+    "moisture": 0.9,    # ~45 mm standing water (see paddy_model.moisture_from_water)
     "nitrogen": 0.55,
-    "fungus": 0.05,
+    "fungus": 0.01,     # latent inoculum
 }
 
 
@@ -157,6 +158,10 @@ class FieldState:
     sim_day: int = 0
     growth_stage: str = "Vegetative"
     last_weather: Dict[str, float] = field(default_factory=dict)
+    # Process-model state that is not assimilated directly (water depth,
+    # fungicide protection, ...) and field-wide scalars (thermal time, ...).
+    aux: Dict[str, np.ndarray] = field(default_factory=dict)
+    scalars: Dict[str, float] = field(default_factory=dict)
 
     # ---------------------------------------------------------------- build
     @classmethod
@@ -187,6 +192,8 @@ class FieldState:
             sim_day=self.sim_day,
             growth_stage=self.growth_stage,
             last_weather=dict(self.last_weather),
+            aux={k: v.copy() for k, v in self.aux.items()},
+            scalars=dict(self.scalars),
         )
 
     def clip(self) -> None:
@@ -239,6 +246,12 @@ class FieldState:
             "pct_stressed": round(float((stress > 0.5).mean() * 100.0), 2),
             "pct_healthy": round(float((stress < 0.2).mean() * 100.0), 2),
             "last_weather": self.last_weather,
+            "process": {
+                **{k: round(float(v), 2) for k, v in self.scalars.items()},
+                **({"water_mm_mean": round(float(self.aux["water_mm"].mean()), 1),
+                    "pct_no_standing_water": round(float((self.aux["water_mm"] <= 0).mean() * 100), 1)}
+                   if "water_mm" in self.aux else {}),
+            },
         }
 
     # --------------------------------------------------------- persistence
@@ -247,11 +260,13 @@ class FieldState:
         path.parent.mkdir(parents=True, exist_ok=True)
         arrays = {f"mean__{k}": v for k, v in self.mean.items()}
         arrays.update({f"var__{k}": v for k, v in self.var.items()})
+        arrays.update({f"aux__{k}": v for k, v in self.aux.items()})
         meta = np.array([repr({
             "grid": self.grid.to_dict(),
             "sim_day": self.sim_day,
             "growth_stage": self.growth_stage,
             "last_weather": self.last_weather,
+            "scalars": {k: float(v) for k, v in self.scalars.items()},
         })])
         tmp = path.with_suffix(".tmp.npz")
         np.savez_compressed(tmp, __meta__=meta, **arrays)
@@ -267,6 +282,8 @@ class FieldState:
                     for k in data.files if k.startswith("mean__")}
             var = {k.split("__", 1)[1]: data[k].astype(np.float32)
                    for k in data.files if k.startswith("var__")}
+            aux = {k.split("__", 1)[1]: data[k].astype(np.float32)
+                   for k in data.files if k.startswith("aux__")}
         return cls(
             grid=FieldGrid(**meta["grid"]),
             mean=mean,
@@ -274,6 +291,8 @@ class FieldState:
             sim_day=int(meta["sim_day"]),
             growth_stage=str(meta["growth_stage"]),
             last_weather=dict(meta.get("last_weather", {})),
+            aux=aux,
+            scalars=dict(meta.get("scalars", {})),
         )
 
 
