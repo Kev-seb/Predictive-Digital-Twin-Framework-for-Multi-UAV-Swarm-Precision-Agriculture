@@ -198,3 +198,143 @@ def test_api_websocket_streams_step_events(client):
         assert ws.receive_json()["type"] == "twin.hello"
         client.post("/twin/step", json={"days": 1})
         assert ws.receive_json()["type"] == "twin.stepped"
+
+
+# ------------------------------------------------- ingestion & virtual field
+from src.twin_core.ingest import (  # noqa: E402
+    bands_to_layers, disease_coverage, footprint_radius_m, ingest_rgb_result,
+    rgb_result_to_observation,
+)
+from src.twin_core.virtual_field import VirtualField, serpentine_waypoints  # noqa: E402
+from src.twin_core.weather_feed import get_weather, openmeteo_daily_to_twin, synthetic_weather  # noqa: E402
+
+
+def test_footprint_and_coverage():
+    assert footprint_radius_m(0.0) == pytest.approx(1.5)
+    assert footprint_radius_m(10.0) == pytest.approx(7.0, abs=0.01)
+    boxes = [{"x1": 0, "y1": 0, "x2": 320, "y2": 240, "confidence": 1.0}]
+    assert disease_coverage(boxes, (640, 480)) == pytest.approx(0.25)
+
+
+def test_rgb_observation_rejects_bad_frames():
+    good = {"crop_stress_score": 0.7, "model_confidence": 0.9, "quality_score": 0.9,
+            "disease_detections": []}
+    assert rgb_result_to_observation(good, {"lat": 0.0, "lon": 0.0}) is None
+    assert rgb_result_to_observation({**good, "quality_score": 0.1}, {"lat": 10, "lon": 78}) is None
+    obs = rgb_result_to_observation(good, {"lat": 10, "lon": 78, "alt": 10})
+    assert obs.values == {"stress": 0.7, "fungus": 0.0}
+    low = rgb_result_to_observation({**good, "model_confidence": 0.3}, {"lat": 10, "lon": 78})
+    assert low.obs_var["stress"] > obs.obs_var["stress"]
+
+
+def test_ingest_rgb_updates_twin(twin):
+    lat, lon = twin.state.grid.cell_center_latlon(3, 3)
+    out = ingest_rgb_result(twin, {"crop_stress_score": 0.8, "quality_score": 1.0,
+                                   "model_confidence": 1.0},
+                            {"lat": lat, "lon": lon, "alt": 3.0})
+    assert out["assimilated"]
+    assert twin.state.mean["stress"][3, 3] > 0.3
+
+
+def test_virtual_bands_invert_to_truth(grid):
+    vf = VirtualField(grid, seed=1)
+    layers = bands_to_layers(vf.multispectral_survey(noise=0.0))
+    for name in ("ndvi", "moisture", "nitrogen"):
+        np.testing.assert_allclose(layers[name], vf.truth.state.mean[name], atol=2e-3)
+
+
+def test_virtual_field_hidden_outbreak(grid):
+    vf = VirtualField(grid, seed=1)
+    twin = DigitalTwin("t", grid=grid)
+    assert vf.truth.state.mean["fungus"].max() > 0.4
+    assert vf.twin_error(twin)["fungus"]["rmse"] > 0.03
+
+
+def test_assimilation_beats_open_loop(grid):
+    vf = VirtualField(grid, seed=3)
+    open_loop, assim = DigitalTwin("o", grid=grid), DigitalTwin("a", grid=grid)
+    wps = serpentine_waypoints(grid, lane_spacing_m=10.0)
+    for day in range(1, 5):
+        fc = synthetic_weather(1, seed=3, start_day=day)
+        vf.advance(1, fc)
+        open_loop.step(1, fc)
+        assim.step(1, fc)
+    for lat, lon in wps:
+        ingest_rgb_result(assim, vf.drone_camera(lat, lon, alt=10.0), {"lat": lat, "lon": lon, "alt": 10.0})
+    eo, ea = vf.twin_error(open_loop), vf.twin_error(assim)
+    assert ea["stress"]["rmse"] < 0.6 * eo["stress"]["rmse"]
+    assert ea["fungus"]["rmse"] < 0.7 * eo["fungus"]["rmse"]
+    assert ea["stress"]["coverage_95"] > 0.8
+
+
+def test_serpentine_covers_field(grid):
+    wps = serpentine_waypoints(grid, lane_spacing_m=10.0, step_m=5.0)
+    cells = {grid.latlon_to_cell(lat, lon) for lat, lon in wps}
+    assert None not in cells
+    assert len(wps) == 10 * 20
+
+
+def test_weather_sources():
+    w = synthetic_weather(10, seed=5)
+    assert len(w) == 10 and w == synthetic_weather(10, seed=5)
+    assert all(20 < d["temperature"] < 40 and d["precipitation"] >= 0 for d in w)
+    conv = openmeteo_daily_to_twin({
+        "dates": ["2026-11-11"], "temperature_2m_max": [32.0], "temperature_2m_min": [24.0],
+        "relative_humidity_2m_max": [95], "relative_humidity_2m_min": [65],
+        "precipitation_sum": [12.5], "windspeed_10m_max": [14.0]})
+    assert conv[0]["temperature"] == 28.0 and conv[0]["humidity"] == 80.0
+    assert conv[0]["precipitation"] == 12.5
+    weather, used = get_weather(10.0, 78.0, 3, source="synthetic")
+    assert used == "synthetic" and len(weather) == 3
+
+
+def test_api_sim_loop(client):
+    r = client.post("/sim/reset", json={"seed": 7}).json()
+    start = r["error"]["fungus"]["rmse"]
+    r = client.post("/sim/advance", json={"days": 2}).json()
+    assert r["sim_day"] == r["truth_day"] == 2 and r["weather_source"] == "synthetic"
+    r = client.post("/sim/drone-pass", json={"altitude_m": 10, "lane_spacing_m": 20}).json()
+    assert r["frames_assimilated"] > 0
+    assert r["error_after"]["fungus"]["rmse"] < r["error_before"]["fungus"]["rmse"]
+    r = client.post("/sim/survey", json={}).json()
+    assert r["error_after"]["ndvi"]["rmse"] < r["error_before"]["ndvi"]["rmse"]
+    assert client.get("/sim/error").json()["error"]["fungus"]["rmse"] < start
+    assert len(client.get("/sim/truth/layers/fungus?rows=20&cols=20").json()["values"]) == 20
+
+
+def test_api_ingest_routes(client, twin):
+    lat, lon = twin.state.grid.center_latlon()
+    r = client.post("/twin/ingest/rgb", json={
+        "result": {"crop_stress_score": 0.7, "quality_score": 0.9, "model_confidence": 0.9},
+        "telemetry": {"lat": lat, "lon": lon, "alt": 5}}).json()
+    assert r["assimilated"]
+    band = [[0.45] * 4 for _ in range(4)]
+    r = client.post("/twin/ingest/multispectral", json={
+        "green": band, "red": [[0.05] * 4] * 4, "red_edge": [[0.1] * 4] * 4, "nir": band})
+    assert r.status_code == 200 and len(r.json()["results"]) == 3
+    assert client.post("/twin/ingest/multispectral", json={
+        "green": band, "red": [[0.05]], "red_edge": band, "nir": band}).status_code == 400
+    r = client.post("/twin/step", json={"days": 2, "weather_source": "synthetic"}).json()
+    assert r["weather_source"] == "synthetic"
+
+
+def test_twin_forwarder_posts_to_api(twin, monkeypatch):
+    import time as _t
+    from fastapi.testclient import TestClient
+    from digital_twin_api import create_app
+    from src.twin_core.twin_client import TwinForwarder
+
+    tc = TestClient(create_app(twin))
+    import requests
+    monkeypatch.setattr(requests, "post", lambda url, json, timeout: tc.post(
+        url.replace("http://twin", ""), json=json))
+    fwd = TwinForwarder("http://twin", min_interval_s=0.0)
+    lat, lon = twin.state.grid.center_latlon()
+    assert fwd({"crop_stress_score": 0.9, "quality_score": 1.0, "model_confidence": 1.0,
+                "heatmap_rgb": "dropped"}, {"lat": lat, "lon": lon, "alt": 300.0})
+    for _ in range(50):
+        if fwd.sent:
+            break
+        _t.sleep(0.05)
+    assert fwd.stats()["sent"] == 1 and fwd.failed == 0
+    assert any(e["type"] == "twin.observed" for e in twin.events)

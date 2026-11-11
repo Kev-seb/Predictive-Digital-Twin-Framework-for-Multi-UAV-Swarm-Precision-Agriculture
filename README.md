@@ -513,6 +513,20 @@ Twin endpoints:
 | `POST` | `/twin/stage` | Set the paddy growth stage |
 | `GET` | `/twin/history`, `/twin/events` | Daily history and event log |
 | `WS` | `/ws/twin` | Live event stream for UE5 and the three.js view |
+| `POST` | `/twin/ingest/rgb` | RGB AI result + telemetry → assimilated point observation |
+| `POST` | `/twin/ingest/multispectral` | 4-band reflectance → assimilated ndvi / moisture / nitrogen |
+
+Simulation endpoints (the hidden "physical" field the twin tracks):
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/sim/reset` | New virtual field with a hidden outbreak and dry patch |
+| `POST` | `/sim/advance` | Advance truth (actual weather) and twin (forecast) together |
+| `POST` | `/sim/drone-pass` | Serpentine RGB pass, every frame assimilated |
+| `POST` | `/sim/survey` | Multispectral survey, assimilated |
+| `GET` | `/sim/error` | Twin vs truth: RMSE, bias, 95% interval coverage |
+
+Validate the twin offline: `python scripts/run_twin_osse.py --days 21`.
 
 ### 5.4 Run the Mobile API (companion app backend)
 

@@ -29,7 +29,17 @@ Twin routes:
   POST   /twin/stage               Set the paddy growth stage
   GET    /twin/history             Daily history (mean + std per layer)
   GET    /twin/events              Recent twin events
+  POST   /twin/ingest/rgb          RGB AI result + telemetry -> point observation
+  POST   /twin/ingest/multispectral 4-band reflectance -> raster observations
   WS     /ws/twin                  Live event stream (UE5 / three.js)
+
+Simulation routes (hidden "physical" field + sensors, see virtual_field.py):
+  POST   /sim/reset                New virtual field (hidden outbreak, dry patch)
+  POST   /sim/advance              Advance truth and twin together
+  POST   /sim/drone-pass           Serpentine drone RGB pass -> assimilated
+  POST   /sim/survey               Multispectral survey -> assimilated
+  GET    /sim/error                Twin vs truth: RMSE, bias, 95% coverage
+  GET    /sim/truth/layers/{layer} Ground-truth layer (for debugging / UE5 A/B)
 ================================================================
 """
 
@@ -48,6 +58,11 @@ from pydantic import BaseModel, Field
 
 from src.config.config import settings
 from src.twin_core import LAYERS, DigitalTwin, FieldGrid
+from src.twin_core.ingest import ingest_multispectral, ingest_rgb_result
+from src.twin_core.virtual_field import VirtualField, serpentine_waypoints
+from src.twin_core.weather_feed import get_weather
+
+WeatherSource = Literal["manual", "synthetic", "openmeteo", "auto"]
 
 UE5_GRID = settings.twin_ue5_grid
 NUM_INSTANCES = UE5_GRID * UE5_GRID
@@ -84,7 +99,49 @@ class Intervention(BaseModel):
 class StepRequest(BaseModel):
     days:          int = Field(1, ge=1, le=120)
     weather:       Optional[List[Dict[str, float]] | Dict[str, float]] = None
+    weather_source: WeatherSource = Field(
+        "manual", description="manual = use `weather` (or defaults); otherwise fetch/generate it")
     interventions: List[Intervention] = []
+
+
+class RGBIngest(BaseModel):
+    result:    Dict[str, Any] = Field(..., description="RGBInferenceResult.to_dict()")
+    telemetry: Dict[str, Any] = Field(..., description="lat, lon, alt (m above canopy)")
+    source:    str = "drone_rgb"
+    frame_width:  int = Field(640, gt=0)
+    frame_height: int = Field(480, gt=0)
+
+
+class MultispectralIngest(BaseModel):
+    green:    List[List[Optional[float]]]
+    red:      List[List[Optional[float]]]
+    red_edge: List[List[Optional[float]]]
+    nir:      List[List[Optional[float]]]
+    source:   str = "multispectral"
+
+
+class SimReset(BaseModel):
+    seed:   int = 42
+    outbreaks: Optional[List[Dict[str, float]]] = Field(
+        None, description="[{row, col, radius, load}] in twin grid cells; default = one hidden outbreak")
+    reset_twin: bool = True
+
+
+class SimAdvance(BaseModel):
+    days:           int = Field(1, ge=1, le=60)
+    weather_source: Literal["synthetic", "openmeteo", "auto"] = "synthetic"
+    interventions:  List[Intervention] = []
+
+
+class SimDronePass(BaseModel):
+    altitude_m:     float = Field(10.0, gt=0, le=120)
+    lane_spacing_m: float = Field(10.0, gt=0)
+    step_m:         float = Field(5.0, gt=0)
+
+
+class SimSurvey(BaseModel):
+    coverage: float = Field(0.9, gt=0, le=1.0)
+    noise:    float = Field(0.01, ge=0, le=0.2)
 
 
 class PointObservation(BaseModel):
@@ -131,12 +188,26 @@ def _default_twin() -> DigitalTwin:
 
 
 def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
-    ctx: Dict[str, Any] = {"twin": twin, "anomalies": [], "ue5_snapshot": None}
+    ctx: Dict[str, Any] = {"twin": twin, "anomalies": [], "ue5_snapshot": None, "virtual": None}
 
     def get_twin() -> DigitalTwin:
         if ctx["twin"] is None:
             ctx["twin"] = _default_twin()
         return ctx["twin"]
+
+    def get_virtual() -> VirtualField:
+        if ctx["virtual"] is None:
+            twin = get_twin()
+            ctx["virtual"] = VirtualField(twin.state.grid, propagation_model=twin.propagation_model,
+                                          zone_layout=twin.zone_layout)
+        return ctx["virtual"]
+
+    def forecast(source: str, days: int, start_day: int) -> tuple:
+        lat, lon = get_twin().state.grid.center_latlon()
+        try:
+            return get_weather(lat, lon, days, source=source, start_day=start_day)
+        except Exception as e:
+            raise HTTPException(502, f"Weather source '{source}' unavailable: {e}")
 
     # ---------------- UE5-resolution helpers ----------------
     def ue5_grids() -> Dict[str, np.ndarray]:
@@ -342,10 +413,95 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
     def twin_step(req: StepRequest):
         twin = get_twin()
         _check_zones(twin, req.interventions)
-        result = twin.step(days=req.days, weather=req.weather,
+        weather, used = req.weather, "manual"
+        if req.weather_source != "manual":
+            weather, used = forecast(req.weather_source, req.days, twin.state.sim_day + 1)
+        result = twin.step(days=req.days, weather=weather,
                            interventions=[i.model_dump() for i in req.interventions])
         result["new_anomalies"] = detect_anomalies()
+        result["weather_source"] = used
         return result
+
+    @app.post("/twin/ingest/rgb", summary="Assimilate an RGB AI result at the drone/phone position")
+    def twin_ingest_rgb(req: RGBIngest):
+        return ingest_rgb_result(get_twin(), req.result, req.telemetry, req.source,
+                                 (req.frame_width, req.frame_height))
+
+    @app.post("/twin/ingest/multispectral", summary="Assimilate 4-band reflectance over the field")
+    def twin_ingest_multispectral(req: MultispectralIngest):
+        bands = {k: np.array([[np.nan if v is None else v for v in row] for row in getattr(req, k)],
+                             dtype=np.float32) for k in ("green", "red", "red_edge", "nir")}
+        shapes = {b.shape for b in bands.values()}
+        if len(shapes) != 1 or bands["nir"].ndim != 2 or bands["nir"].size == 0:
+            raise HTTPException(400, "All four bands must be non-empty 2D lists of the same shape")
+        return {"results": ingest_multispectral(get_twin(), bands, req.source)}
+
+    # ============================================================
+    # SIMULATION ROUTES (virtual physical field)
+    # ============================================================
+
+    @app.post("/sim/reset", summary="Create a new hidden virtual field")
+    def sim_reset(req: SimReset):
+        twin = get_twin()
+        if req.reset_twin:
+            twin.reset()
+            ctx["anomalies"].clear()
+            ctx["ue5_snapshot"] = ue5_grids()
+        ctx["virtual"] = VirtualField(twin.state.grid, seed=req.seed, outbreaks=req.outbreaks,
+                                      propagation_model=twin.propagation_model,
+                                      zone_layout=twin.zone_layout)
+        return {"status": "ok", "seed": req.seed, "error": ctx["virtual"].twin_error(twin)}
+
+    @app.post("/sim/advance", summary="Advance the virtual field and the twin together")
+    def sim_advance(req: SimAdvance):
+        twin, vf = get_twin(), get_virtual()
+        _check_zones(twin, req.interventions)
+        weather, used = forecast(req.weather_source, req.days, vf.sim_day + 1)
+        plan = [i.model_dump() for i in req.interventions]
+        actual = vf.advance(req.days, weather, plan)        # truth gets the real weather
+        result = twin.step(days=req.days, weather=weather, interventions=plan)  # twin gets the forecast
+        return {"sim_day": twin.state.sim_day, "truth_day": vf.sim_day, "weather_source": used,
+                "forecast": weather, "actual_weather": actual,
+                "new_anomalies": detect_anomalies(), "logs": result["logs"],
+                "error": vf.twin_error(twin)}
+
+    @app.post("/sim/drone-pass", summary="Fly a serpentine RGB pass and assimilate every frame")
+    def sim_drone_pass(req: SimDronePass):
+        twin, vf = get_twin(), get_virtual()
+        before = vf.twin_error(twin)
+        used = 0
+        for lat, lon in serpentine_waypoints(twin.state.grid, req.lane_spacing_m, req.step_m):
+            frame = vf.drone_camera(lat, lon, alt=req.altitude_m)
+            if frame and ingest_rgb_result(twin, frame, {"lat": lat, "lon": lon,
+                                                         "alt": req.altitude_m})["assimilated"]:
+                used += 1
+        detect_anomalies()
+        return {"frames_assimilated": used, "error_before": before, "error_after": vf.twin_error(twin)}
+
+    @app.post("/sim/survey", summary="Multispectral survey of the virtual field, assimilated")
+    def sim_survey(req: SimSurvey):
+        twin, vf = get_twin(), get_virtual()
+        before = vf.twin_error(twin)
+        ingest_multispectral(twin, vf.multispectral_survey(noise=req.noise, coverage=req.coverage))
+        detect_anomalies()
+        return {"error_before": before, "error_after": vf.twin_error(twin)}
+
+    @app.get("/sim/error", summary="Twin vs ground truth")
+    def sim_error():
+        twin, vf = get_twin(), get_virtual()
+        return {"sim_day": twin.state.sim_day, "truth_day": vf.sim_day, "error": vf.twin_error(twin)}
+
+    @app.get("/sim/truth/layers/{layer}", summary="Ground-truth layer of the virtual field")
+    def sim_truth_layer(layer: str, rows: Optional[int] = None, cols: Optional[int] = None):
+        if layer not in LAYERS:
+            raise HTTPException(404, f"Unknown layer '{layer}'. Expected one of {list(LAYERS)}.")
+        s = get_virtual().truth.state
+        rows, cols = rows or s.grid.rows, cols or s.grid.cols
+        if not (1 <= rows <= 500 and 1 <= cols <= 500):
+            raise HTTPException(400, "rows and cols must be between 1 and 500")
+        arr = s.resample(layer, rows, cols)
+        return {"layer": layer, "rows": rows, "cols": cols, "truth_day": s.sim_day,
+                "values": np.round(arr.astype(np.float64), 5).tolist()}
 
     @app.post("/twin/observe/point", summary="Assimilate a geotagged reading")
     def twin_observe_point(obs: PointObservation):

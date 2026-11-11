@@ -51,14 +51,35 @@ Most parts existed, but they weren't connected:
   - New `/twin/*` routes and the `/ws/twin` stream.
 - [ ] Point `mobile_api_server.py` (`/api/field/state`, `/api/field/scenario/state`) and the dashboard's twin tab at `DigitalTwin` instead of `FieldDigitalTwin`.
 
-### Phase 2: Live sync and assimilation (in progress)
+### Phase 2: Live sync and assimilation ✅ (done, except the EnKF upgrade)
 - [x] Per-cell Kalman filter (`src/twin_core/assimilation.py`): process noise per day, observation noise per sensor, and point observations with a distance-weighted footprint.
 - [x] Stress is diagnostic, derived from NDVI and fungus. A stress reading is assimilated as the NDVI it implies, so the simulator doesn't discard it.
-- [ ] Ingestion adapters:
-  - GeoTIFF survey → indices → `observe_grid`
-  - simulated drone camera / RGB AI result → `observe_point`
-- [ ] Twin clock driven by Open-Meteo daily forecasts (`src/weather/openmeteo_client.py`).
+- [x] Ingestion adapters (`src/twin_core/ingest.py`):
+  - RGB AI result + telemetry → point observation. Stress comes from `crop_stress_score`; fungus from disease-box coverage. The footprint is sized by altitude, and the variance by model confidence and image quality.
+  - 4-band reflectance → NDVI / NDWI / CIre → ndvi, moisture, nitrogen.
+- [x] Weather forcing (`src/twin_core/weather_feed.py`): Open-Meteo daily forecast, or a seeded monsoon generator offline. Selected per step with `weather_source`.
+- [x] Virtual physical field (`src/twin_core/virtual_field.py`):
+  - hidden ground truth with a fungal outbreak and a dry patch, driven by the *actual* weather (forecast plus error)
+  - simulated drone camera and multispectral sensors
+  - `twin_error()` scoring
+- [x] API: `/twin/ingest/rgb`, `/twin/ingest/multispectral`, and `/sim/reset|advance|drone-pass|survey|error|truth/layers`.
+- [x] Live pipeline: `LiveFieldController.set_twin_sink()` + `TwinForwarder` (`src/twin_core/twin_client.py`) forward every accepted, geotagged inference from the mobile API to the twin API. It's non-blocking and can be switched off with `UAV_TWIN_FORWARD_LIVE=false`.
 - [ ] Upgrade to an ensemble Kalman filter over the simulator, so moisture and nitrogen get updated through their correlation with NDVI.
+- [ ] Point `mobile_api_server.py` `/api/field/state` at the twin API instead of `FieldDigitalTwin` survey files.
+
+#### Validation result (`python scripts/run_twin_osse.py --days 21`)
+
+Setup: a hidden outbreak and a dry patch, a drone RGB pass every 3 days (10 m altitude, 200 frames), and a multispectral survey every 7 days with 90% coverage. Values are RMSE against the hidden truth on day 21:
+
+| Layer | Model-only twin | Assimilating twin | 95% interval coverage |
+|---|---|---|---|
+| Stress | 0.083 | **0.017** | 0.97 |
+| NDVI | 0.117 | **0.021** | 0.99 |
+| Fungus | 0.075 | **0.030** | 0.98 |
+| Nitrogen | 0.028 | **0.006** | 1.00 |
+| Moisture | 0.003 | 0.001 | 1.00 (uninformative: see Phase 5) |
+
+Coverage near 1.0 means the twin's uncertainty is honest, if slightly conservative. Process noise can be tuned down in Phase 5.
 
 ### Phase 3: Swarm as first-class assets
 - [ ] `DroneRegistry` with N drones and one interface for `UAVFlightDynamicsSimulator` and SITL (pymavlink).
@@ -72,7 +93,11 @@ Most parts existed, but they weren't connected:
 - [ ] Compare the outcome after the mission against the `what_if` prediction.
 
 ### Phase 5: Calibrate and validate
-- [ ] Fit simulator coefficients to the flight time series in `data/manifests/flight_manifest.csv`. The evapotranspiration term is a known issue: it dries a flooded paddy from 0.65 to 0.38 moisture in 7 days without rain.
+- [ ] Fit simulator coefficients to the flight time series in `data/manifests/flight_manifest.csv`. Two water-balance problems are known:
+  - Evapotranspiration dries a flooded paddy from 0.65 to 0.38 moisture in 7 days without rain.
+  - Rain adds 0.06 per mm, so one monsoon spell saturates moisture to 1.0 field-wide. Moisture then carries no information (both twins score ~0 error).
+  - A bunded paddy water-depth model (ponding, percolation, drainage) would fix both.
+- [ ] Tune process noise per layer so the twin's 95% intervals contain the truth ~95% of the time, not 97–100%.
 - [ ] Train the ConvLSTM on real flight sequences instead of synthetic history.
 - [ ] Report forecast skill: RMSE of predicted vs. observed NDVI and stress at the next flight, plus calibration of the twin's uncertainty.
 

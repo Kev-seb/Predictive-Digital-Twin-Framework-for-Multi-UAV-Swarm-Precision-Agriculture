@@ -47,10 +47,24 @@ MOBILE_APP_DIR = Path(__file__).parent.parent / "mobile" / "companion_app"
 API_PORT = 8080
 
 
+_twin_forwarder = None
+
+
 def set_controller(controller) -> None:
-    """Inject the LiveFieldController instance."""
-    global _controller
+    """Inject the LiveFieldController instance and connect it to the digital twin API."""
+    global _controller, _twin_forwarder
     _controller = controller
+    try:
+        from src.config.config import settings
+        from src.twin_core.twin_client import TwinForwarder
+
+        if _twin_forwarder is None and settings.twin_forward_live:
+            _twin_forwarder = TwinForwarder(
+                f"http://{settings.twin_api_host}:{settings.twin_api_port}", source="phone_rgb")
+        if _twin_forwarder is not None and hasattr(controller, "set_twin_sink"):
+            controller.set_twin_sink(_twin_forwarder)
+    except Exception as e:  # twin is optional for live mode
+        print(f"[MobileAPI] Digital twin forwarding disabled: {e}")
 
 
 # ── FastAPI app ────────────────────────────────────────────────────────
@@ -664,6 +678,7 @@ async def mission_status():
         "mission_id": _controller.mission_id,
         "elapsed_s": _controller.elapsed_seconds,
         "qos": _controller.qos_metrics,
+        "twin_forwarding": _twin_forwarder.stats() if _twin_forwarder else None,
     }
 
 

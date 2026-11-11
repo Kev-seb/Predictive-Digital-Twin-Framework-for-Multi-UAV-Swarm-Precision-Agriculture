@@ -96,6 +96,14 @@ class LiveFieldController:
         # Processing thread
         self._proc_thread: Optional[threading.Thread] = None
 
+        # Optional digital twin sink: callable(result_dict, telemetry_dict).
+        # Set via set_twin_sink(); see src/twin_core/twin_client.py.
+        self._twin_sink = None
+
+    def set_twin_sink(self, sink) -> None:
+        """Forward accepted, geotagged inferences to the digital twin."""
+        self._twin_sink = sink
+
     # ── Mission lifecycle ──────────────────────────────────────────
 
     def start_mission(
@@ -260,6 +268,14 @@ class LiveFieldController:
                         show_disease=True, show_weed=True, show_heatmap=False,
                     )
                     self._latest_annotated_rgb = annotated
+
+                    # Feed the digital twin (only with a GPS fix)
+                    tele = self._latest_tele
+                    if self._twin_sink is not None and tele and (tele.lat or tele.lon):
+                        try:
+                            self._twin_sink(result.to_dict(), tele.to_dict())
+                        except Exception:
+                            pass
 
                 # Store result
                 self._latest_result = result
