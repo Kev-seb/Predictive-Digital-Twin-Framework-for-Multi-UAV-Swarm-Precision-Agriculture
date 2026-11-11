@@ -101,6 +101,7 @@ class AppSettings(BaseSettings):
     twin_cell_size_m: float = 2.5      # 40 x 2.5 m = 100 m, ~1 ha
     twin_ue5_grid:    int   = 20       # UE5 HISM grid is 20 x 20
     twin_propagation_model: Literal["baseline", "pde", "hybrid", "gnn"] = "pde"
+    twin_swarm_size:  int   = 3        # simulated drones in the twin's fleet
     twin_forward_live: bool = True     # mobile API forwards live inferences to the twin
     twin_storage_dir: Path  = Path(__file__).resolve().parents[2] / "outputs" / "twin_core"
 

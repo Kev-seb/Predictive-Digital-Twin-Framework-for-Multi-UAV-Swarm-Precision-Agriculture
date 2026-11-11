@@ -40,6 +40,13 @@ Simulation routes (hidden "physical" field + sensors, see virtual_field.py):
   POST   /sim/survey               Multispectral survey -> assimilated
   GET    /sim/error                Twin vs truth: RMSE, bias, 95% coverage
   GET    /sim/truth/layers/{layer} Ground-truth layer (for debugging / UE5 A/B)
+  POST   /sim/mission              Plan + fly a fleet mission (scout / spray / auto)
+
+Swarm routes (N-drone fleet, see swarm.py):
+  GET    /swarm/state              Drone positions (dashboard /swarm format)
+  POST   /swarm/drones             Add a drone
+  DELETE /swarm/drones/{drone_id}  Remove a drone
+  POST   /swarm/plan               Allocate scout / spray tasks without flying
 ================================================================
 """
 
@@ -59,6 +66,7 @@ from pydantic import BaseModel, Field
 from src.config.config import settings
 from src.twin_core import LAYERS, DigitalTwin, FieldGrid
 from src.twin_core.ingest import ingest_multispectral, ingest_rgb_result
+from src.twin_core.swarm import Fleet, allocate, tasks_from_twin
 from src.twin_core.virtual_field import VirtualField, serpentine_waypoints
 from src.twin_core.weather_feed import get_weather
 
@@ -139,6 +147,19 @@ class SimDronePass(BaseModel):
     step_m:         float = Field(5.0, gt=0)
 
 
+class MissionRequest(BaseModel):
+    kind: Literal["scout", "spray", "auto"] = Field(
+        "scout", description="auto = scout, then spray zones the updated twin flags")
+    fungus_threshold: float = Field(0.2, ge=0.0, le=1.0)
+    dose_l_per_ha:    float = Field(25.0, gt=0.0, le=200.0)
+    zones:            Optional[List[int]] = None
+    include_track:    bool = False
+
+
+class AddDrone(BaseModel):
+    drone_id: str = Field(..., min_length=1, max_length=40)
+
+
 class SimSurvey(BaseModel):
     coverage: float = Field(0.9, gt=0, le=1.0)
     noise:    float = Field(0.01, ge=0, le=0.2)
@@ -188,7 +209,8 @@ def _default_twin() -> DigitalTwin:
 
 
 def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
-    ctx: Dict[str, Any] = {"twin": twin, "anomalies": [], "ue5_snapshot": None, "virtual": None}
+    ctx: Dict[str, Any] = {"twin": twin, "anomalies": [], "ue5_snapshot": None, "virtual": None,
+                           "fleet": None, "pending_interventions": []}
 
     def get_twin() -> DigitalTwin:
         if ctx["twin"] is None:
@@ -201,6 +223,22 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
             ctx["virtual"] = VirtualField(twin.state.grid, propagation_model=twin.propagation_model,
                                           zone_layout=twin.zone_layout)
         return ctx["virtual"]
+
+    def get_fleet() -> Fleet:
+        if ctx["fleet"] is None:
+            ctx["fleet"] = Fleet.for_field(get_twin().state.grid, settings.twin_swarm_size)
+        return ctx["fleet"]
+
+    def plan_mission(kind: str, req: "MissionRequest"):
+        fleet, twin = get_fleet(), get_twin()
+        if req.zones:
+            bad = [z for z in req.zones if z not in twin.zone_names]
+            if bad:
+                raise HTTPException(400, f"Unknown zone_id(s) {bad}. Valid: {sorted(twin.zone_names)}")
+        tasks = tasks_from_twin(twin, kind, fleet.frame, fleet.spec,
+                                fungus_threshold=req.fungus_threshold,
+                                dose_l_per_ha=req.dose_l_per_ha, zones=req.zones)
+        return tasks, allocate(tasks, fleet.drone_info())
 
     def forecast(source: str, days: int, start_day: int) -> tuple:
         lat, lon = get_twin().state.grid.center_latlon()
@@ -447,6 +485,7 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
             twin.reset()
             ctx["anomalies"].clear()
             ctx["ue5_snapshot"] = ue5_grids()
+        ctx["pending_interventions"] = []
         ctx["virtual"] = VirtualField(twin.state.grid, seed=req.seed, outbreaks=req.outbreaks,
                                       propagation_model=twin.propagation_model,
                                       zone_layout=twin.zone_layout)
@@ -458,9 +497,15 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
         _check_zones(twin, req.interventions)
         weather, used = forecast(req.weather_source, req.days, vf.sim_day + 1)
         plan = [i.model_dump() for i in req.interventions]
+        # Sprays flown by the fleet since the last advance take effect on day 1.
+        flown = [{"day": 1, "zone_id": p["zone_id"], "type": p["type"]}
+                 for p in ctx["pending_interventions"]]
+        ctx["pending_interventions"] = []
+        plan += flown
         actual = vf.advance(req.days, weather, plan)        # truth gets the real weather
         result = twin.step(days=req.days, weather=weather, interventions=plan)  # twin gets the forecast
         return {"sim_day": twin.state.sim_day, "truth_day": vf.sim_day, "weather_source": used,
+                "applied_fleet_interventions": flown,
                 "forecast": weather, "actual_weather": actual,
                 "new_anomalies": detect_anomalies(), "logs": result["logs"],
                 "error": vf.twin_error(twin)}
@@ -485,6 +530,67 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
         ingest_multispectral(twin, vf.multispectral_survey(noise=req.noise, coverage=req.coverage))
         detect_anomalies()
         return {"error_before": before, "error_after": vf.twin_error(twin)}
+
+    @app.post("/sim/mission", summary="Plan and fly a fleet mission over the virtual field")
+    def sim_mission(req: MissionRequest):
+        twin, vf, fleet = get_twin(), get_virtual(), get_fleet()
+        if not fleet.drones:
+            raise HTTPException(409, "Fleet has no drones")
+        before = vf.twin_error(twin)
+        assimilated = {"n": 0}
+
+        def on_capture(drone_id: str, lat: float, lon: float, alt: float) -> None:
+            frame = vf.drone_camera(lat, lon, alt)
+            if frame and ingest_rgb_result(twin, frame, {"lat": lat, "lon": lon, "alt": alt})["assimilated"]:
+                assimilated["n"] += 1
+
+        wind = twin.state.last_weather or None
+        reports = []
+        for kind in (("scout", "spray") if req.kind == "auto" else (req.kind,)):
+            tasks, plan = plan_mission(kind, req)
+            report = fleet.execute(plan, on_capture=on_capture if kind == "scout" else None, wind=wind)
+            ctx["pending_interventions"].extend(report["completed_sprays"])
+            if not req.include_track:
+                report.pop("track")
+            reports.append({"kind": kind, "plan": plan.to_dict(), "report": report})
+        detect_anomalies()
+        summary = {"kind": req.kind, "frames_assimilated": assimilated["n"],
+                   "sprays_queued": [p["zone_id"] for p in ctx["pending_interventions"]]}
+        twin._emit("swarm.mission", summary)
+        return {**summary, "missions": reports, "error_before": before,
+                "error_after": vf.twin_error(twin),
+                "pending_interventions": ctx["pending_interventions"]}
+
+    # ============================================================
+    # SWARM ROUTES
+    # ============================================================
+
+    @app.get("/swarm/state", summary="Fleet positions and status")
+    def swarm_state():
+        return {**get_fleet().snapshot(), "pending_interventions": ctx["pending_interventions"]}
+
+    @app.post("/swarm/drones", summary="Add a drone to the fleet")
+    def swarm_add(req: AddDrone):
+        try:
+            get_fleet().add_drone(req.drone_id)
+        except ValueError as e:
+            raise HTTPException(409, str(e))
+        return {"drones": sorted(get_fleet().drones)}
+
+    @app.delete("/swarm/drones/{drone_id}", summary="Remove a drone from the fleet")
+    def swarm_remove(drone_id: str):
+        try:
+            get_fleet().remove_drone(drone_id)
+        except KeyError:
+            raise HTTPException(404, f"Drone '{drone_id}' not found")
+        return {"drones": sorted(get_fleet().drones)}
+
+    @app.post("/swarm/plan", summary="Allocate tasks to the fleet without flying")
+    def swarm_plan(req: MissionRequest):
+        if req.kind == "auto":
+            raise HTTPException(400, "Plan 'scout' or 'spray'; 'auto' is only for /sim/mission")
+        tasks, plan = plan_mission(req.kind, req)
+        return {"tasks": [t.to_dict() for t in tasks], **plan.to_dict()}
 
     @app.get("/sim/error", summary="Twin vs ground truth")
     def sim_error():

@@ -338,3 +338,109 @@ def test_twin_forwarder_posts_to_api(twin, monkeypatch):
         _t.sleep(0.05)
     assert fwd.stats()["sent"] == 1 and fwd.failed == 0
     assert any(e["type"] == "twin.observed" for e in twin.events)
+
+
+# ------------------------------------------------------------------- swarm
+from src.twin_core.swarm import (  # noqa: E402
+    Fleet, LocalFrame, Task, allocate, lawnmower, tasks_from_twin,
+)
+
+
+def test_local_frame_round_trip():
+    f = LocalFrame(10.0, 78.0)
+    lat, lon = f.to_latlon(30.0, -20.0)
+    x, y = f.to_local(lat, lon)
+    assert x == pytest.approx(30.0, abs=1e-6) and y == pytest.approx(-20.0, abs=1e-6)
+
+
+def test_lawnmower_alternates_lanes():
+    pts = lawnmower((0.0, 50.0, 0.0, 20.0), spacing=10.0)
+    assert len(pts) == 4
+    assert pts[0][0] < pts[1][0] and pts[2][0] > pts[3][0]     # serpentine
+    assert all(0.0 <= x <= 50.0 and 0.0 <= y <= 20.0 for x, y in pts)
+
+
+def test_fleet_registry(grid):
+    fleet = Fleet.for_field(grid, 3)
+    assert sorted(fleet.drones) == ["drone_01", "drone_02", "drone_03"]
+    assert len(set(fleet.pads.values())) == 3
+    fleet.remove_drone("drone_02")
+    fleet.add_drone("drone_99")
+    assert len(set(fleet.pads.values())) == 3
+    with pytest.raises(ValueError):
+        fleet.add_drone("drone_99")
+    snap = fleet.snapshot()
+    assert set(snap["drones"]) == {"drone_01", "drone_03", "drone_99"}
+    assert {"lat", "lon", "alt", "battery", "is_spraying"} <= set(snap["drones"]["drone_01"])
+
+
+def test_allocation_balances_and_respects_limits(twin):
+    fleet = Fleet.for_field(twin.state.grid, 3)
+    tasks = tasks_from_twin(twin, "scout", fleet.frame)
+    assert len(tasks) == 16
+    three = allocate(tasks, fleet.drone_info())
+    one = allocate(tasks, {"d": {"home": (0.0, 0.0), "battery": 100.0, "tank_kg": 10.0}})
+    assert not three.unassigned and not one.unassigned
+    assert three.makespan_s < 0.5 * one.makespan_s
+    assert sum(len(a.tasks) for a in three.assignments.values()) == 16
+
+    big = Task("spray-big", "spray", 0, [(0.0, 20.0), (40.0, 20.0)], priority=1.0, payload_kg=12.0)
+    assert allocate([big], fleet.drone_info()).unassigned == [big]          # exceeds tank
+    weak = {"w": {"home": (0.0, 0.0), "battery": 36.0, "tank_kg": 10.0}}
+    assert allocate(tasks, weak).unassigned                                  # battery reserve
+
+
+def test_fleet_scout_mission_feeds_twin(grid):
+    vf = VirtualField(grid, seed=2)
+    twin = DigitalTwin("t", grid=grid)
+    fleet = Fleet.for_field(grid, 3)
+    plan = allocate(tasks_from_twin(twin, "scout", fleet.frame), fleet.drone_info())
+    before = vf.twin_error(twin)["fungus"]["rmse"]
+
+    def capture(_d, lat, lon, alt):
+        frame = vf.drone_camera(lat, lon, alt)
+        if frame:
+            ingest_rgb_result(twin, frame, {"lat": lat, "lon": lon, "alt": alt})
+
+    rep = fleet.execute(plan, on_capture=capture)
+    assert not rep["timed_out"]
+    for st in rep["drones"].values():
+        assert st["completed"] and st["captures"] > 0
+        assert st["flight_s"] == pytest.approx(st["est_time_s"], rel=0.3)   # planner is honest
+    assert vf.twin_error(twin)["fungus"]["rmse"] < 0.7 * before
+    for s in fleet.snapshot()["drones"].values():
+        assert s["alt"] < 1.5                                                 # back on the pad
+
+
+def test_fleet_spray_mission_doses_and_reports(grid):
+    vf = VirtualField(grid, seed=2)
+    fleet = Fleet.for_field(grid, 2)
+    tasks = tasks_from_twin(vf.truth, "spray", fleet.frame, fungus_threshold=0.15)
+    assert tasks and all(t.payload_kg > 0 for t in tasks)
+    rep = fleet.execute(allocate(tasks, fleet.drone_info()))
+    assert {s["zone_id"] for s in rep["completed_sprays"]} == {t.zone_id for t in tasks}
+    for s in rep["completed_sprays"]:
+        assert s["applied_kg"] == pytest.approx(s["planned_kg"], rel=0.3)
+        assert s["applied_kg"] <= s["planned_kg"] + 1e-6
+
+
+def test_api_swarm_and_closed_loop(client):
+    client.post("/sim/reset", json={"seed": 4})
+    assert len(client.get("/swarm/state").json()["drones"]) == 3
+    assert client.post("/swarm/drones", json={"drone_id": "drone_04"}).status_code == 200
+    assert client.post("/swarm/drones", json={"drone_id": "drone_04"}).status_code == 409
+    assert client.delete("/swarm/drones/drone_04").status_code == 200
+    assert client.delete("/swarm/drones/nope").status_code == 404
+    plan = client.post("/swarm/plan", json={"kind": "scout"}).json()
+    assert len(plan["tasks"]) == 16 and not plan["unassigned"]
+    assert client.post("/swarm/plan", json={"kind": "scout", "zones": [99]}).status_code == 400
+
+    r = client.post("/sim/mission", json={"kind": "auto", "fungus_threshold": 0.15}).json()
+    assert r["frames_assimilated"] > 0
+    assert r["error_after"]["fungus"]["rmse"] < r["error_before"]["fungus"]["rmse"]
+    assert [m["kind"] for m in r["missions"]] == ["scout", "spray"]
+    queued = r["sprays_queued"]
+    assert queued
+    adv = client.post("/sim/advance", json={"days": 1}).json()
+    assert sorted(i["zone_id"] for i in adv["applied_fleet_interventions"]) == sorted(queued)
+    assert client.get("/swarm/state").json()["pending_interventions"] == []

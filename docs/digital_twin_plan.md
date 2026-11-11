@@ -81,16 +81,39 @@ Setup: a hidden outbreak and a dry patch, a drone RGB pass every 3 days (10 m al
 
 Coverage near 1.0 means the twin's uncertainty is honest, if slightly conservative. Process noise can be tuned down in Phase 5.
 
-### Phase 3: Swarm as first-class assets
-- [ ] `DroneRegistry` with N drones and one interface for `UAVFlightDynamicsSimulator` and SITL (pymavlink).
-- [ ] Remove the `drone_alpha` / `drone_beta` hardcoding in `dashboard.py`.
-- [ ] Zone-to-drone allocation that accounts for battery, spray payload and distance.
+### Phase 3: Swarm as first-class assets ✅ (done, except the dashboard migration)
+- [x] `Fleet` (`src/twin_core/swarm.py`): any number of `UAVFlightDynamicsSimulator` drones sharing one `shared_state`, so the existing potential-field collision avoidance works fleet-wide. Includes add/remove, launch pads, battery swap and tank refill.
+- [x] Task generation from the twin:
+  - **scout:** one lawn-mower task per zone; the most uncertain zones go first.
+  - **spray:** zones above a fungal-load threshold; the dose scales with load.
+- [x] Greedy min-makespan allocation that respects a 35% battery reserve and tank capacity. Infeasible tasks are returned as `unassigned`. Planned times match flown physics within ~5–10%.
+- [x] Execution in 6-DOF physics at 20 Hz:
+  - transit altitudes are layered per drone
+  - camera captures every 5 m
+  - spray flow is duty-cycled to apply the planned dose
+  - the battery failsafe aborts the mission and flies the drone home
+- [x] API: `/swarm/state`, `/swarm/drones`, `/swarm/plan`, `/sim/mission`.
+- [ ] Remove the `drone_alpha` / `drone_beta` hardcoding in `dashboard.py`. The fleet can feed it: `/swarm/state` returns the same shape as the dashboard's `/swarm` endpoint.
 
-### Phase 4: Close the loop (SITL)
-- [ ] Decision → mission → execution → verification:
-  - treatment optimizer → QGC mission → MAVLink upload to ArduPilot SITL → fly
-  - each flown cell becomes an observation; the treatment goes into the twin as an intervention
+### Phase 4: Close the loop (in progress)
+- [x] Closed loop in simulation: scout → assimilate → spray the zones the twin flags → completed sprays become interventions on the next simulated day, for both the hidden field and the twin (`/sim/mission` + `/sim/advance`).
+- [ ] Execute the same plans on ArduPilot SITL: QGC mission → MAVLink upload → fly, with telemetry replacing the in-process physics.
 - [ ] Compare the outcome after the mission against the `what_if` prediction.
+
+#### Closed-loop result (`python scripts/run_twin_osse.py --closed-loop --days 21 --fleet 3`)
+
+A 3-drone fleet scouts every 3 days. The twin-driven run also sprays zones whose fungal load is above 0.2. It is compared with an identical run that only scouts.
+
+| Day 21, hidden field | Scout only | Twin-driven spraying |
+|---|---|---|
+| Peak fungal load | 0.486 | **0.308** (−37%) |
+| Mean fungal load | 0.081 | **0.073** |
+| Mean NDVI | 0.586 | **0.592** |
+| Fungicide used | 0 | 2.9 kg (2 zone sprays) |
+
+Caveats, both for Phase 5:
+- The outbreak shrinks on its own (0.61 → 0.49), so the disease model under-spreads and the value of spraying is understated.
+- NDVI declines in both runs, which is unrealistic for a vegetative paddy.
 
 ### Phase 5: Calibrate and validate
 - [ ] Fit simulator coefficients to the flight time series in `data/manifests/flight_manifest.csv`. Two water-balance problems are known:
@@ -98,6 +121,8 @@ Coverage near 1.0 means the twin's uncertainty is honest, if slightly conservati
   - Rain adds 0.06 per mm, so one monsoon spell saturates moisture to 1.0 field-wide. Moisture then carries no information (both twins score ~0 error).
   - A bunded paddy water-depth model (ponding, percolation, drainage) would fix both.
 - [ ] Tune process noise per layer so the twin's 95% intervals contain the truth ~95% of the time, not 97–100%.
+- [ ] Disease dynamics: the PDE outbreak decays under humid monsoon weather. Check the growth rate against blast/sheath-blight literature.
+- [ ] Crop growth: NDVI falls ~0.11 in 21 vegetative days without stress. The nitrogen uptake and growth terms need fitting.
 - [ ] Train the ConvLSTM on real flight sequences instead of synthetic history.
 - [ ] Report forecast skill: RMSE of predicted vs. observed NDVI and stress at the next flight, plus calibration of the twin's uncertainty.
 

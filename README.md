@@ -526,7 +526,25 @@ Simulation endpoints (the hidden "physical" field the twin tracks):
 | `POST` | `/sim/survey` | Multispectral survey, assimilated |
 | `GET` | `/sim/error` | Twin vs truth: RMSE, bias, 95% interval coverage |
 
-Validate the twin offline: `python scripts/run_twin_osse.py --days 21`.
+| `POST` | `/sim/mission` | Plan and fly a fleet mission (`scout`, `spray` or `auto`); sprays apply on the next `/sim/advance` |
+
+Swarm endpoints (N-drone fleet in 6-DOF flight physics):
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/swarm/state` | Drone positions, battery, spray state (dashboard `/swarm` format) |
+| `POST` / `DELETE` | `/swarm/drones` | Add or remove drones (fleet size: `UAV_TWIN_SWARM_SIZE`) |
+| `POST` | `/swarm/plan` | Allocate scout / spray tasks under battery and tank limits |
+
+Validate the twin offline:
+
+```bash
+python scripts/run_twin_osse.py --days 21
+```
+
+```bash
+python scripts/run_twin_osse.py --closed-loop --days 21 --fleet 3
+```
 
 ### 5.4 Run the Mobile API (companion app backend)
 
