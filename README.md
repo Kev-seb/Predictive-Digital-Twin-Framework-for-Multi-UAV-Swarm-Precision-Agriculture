@@ -558,10 +558,15 @@ Scan the QR code from the dashboard to open the companion app on your phone.
 
 ### 5.5 Unreal Engine 5 / Unity Digital Twin Bridge
 
-1. Start `digital_twin_api.py` on the same machine as UE5.
-2. In UE5, add `src/unity_integration/UnityBridgeClient.cs` (or the Blueprint equivalent) to your level Actor.
-3. Set `ApiBaseUrl = "http://127.0.0.1:8008"` in the component.
-4. The C# client polls `/field/status` every 500 ms and updates the HISM material parameters (`NDVI`, `StressLevel`, `GrowthStage`) per-instance on the GPU.
+**UE5 (recommended):** install the `TwinStream` plugin from `src/ue5_integration/`. It subscribes to `/ws/field`, so the twin pushes 20 × 20 field snapshots (NDVI, stress, uncertainty, moisture, fungus, anomalies) and drone mission tracks as they change. It writes them into the HISM's per-instance custom data for `M_RiceCrop`. Setup, material slots and the message schema are in [`src/ue5_integration/README.md`](src/ue5_integration/README.md).
+
+Check the stream without UE5:
+
+```bash
+python scripts/twin_stream_client.py --heatmap
+```
+
+**Polling (legacy):** `/field/status` keeps its original contract, so `src/unity_integration/UnityBridgeClient.cs` and existing Blueprints that poll it still work.
 
 ### 5.6 Research Pipeline
 

@@ -32,6 +32,8 @@ Twin routes:
   POST   /twin/ingest/rgb          RGB AI result + telemetry -> point observation
   POST   /twin/ingest/multispectral 4-band reflectance -> raster observations
   WS     /ws/twin                  Live event stream (UE5 / three.js)
+  WS     /ws/field                 UE5 stream: coalesced 20x20 snapshots + drone tracks
+                                   (see src/ue5_integration/README.md for the schema)
 
 Simulation routes (hidden "physical" field + sensors, see virtual_field.py):
   POST   /sim/reset                New virtual field (hidden outbreak, dry patch)
@@ -218,7 +220,8 @@ def _default_twin() -> DigitalTwin:
 
 def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
     ctx: Dict[str, Any] = {"twin": twin, "anomalies": [], "ue5_snapshot": None, "virtual": None,
-                           "fleet": None, "pending_interventions": []}
+                           "fleet": None, "pending_interventions": [], "field_listeners": set(),
+                           "last_track": None}
 
     def get_twin() -> DigitalTwin:
         if ctx["twin"] is None:
@@ -256,6 +259,58 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
             return get_weather(lat, lon, days, source=source, start_day=start_day)
         except Exception as e:
             raise HTTPException(502, f"Weather source '{source}' unavailable: {e}")
+
+    # ---------------- UE5 stream helpers ----------------
+    def notify_field_listeners(message: Optional[Dict[str, Any]] = None) -> None:
+        for listener in list(ctx["field_listeners"]):
+            listener(message)
+
+    def publish_track(kind: str, track: Dict[str, List[List[float]]]) -> None:
+        """Convert a mission track to UE5 grid coordinates and push it to /ws/field clients."""
+        grid = get_twin().state.grid
+        h_m, w_m = grid.rows * grid.cell_size_m, grid.cols * grid.cell_size_m
+        drones = {}
+        for d_id, samples in track.items():
+            pts = []
+            for t, lat, lon, alt, spraying in samples:
+                east, south = grid.latlon_to_local_m(lat, lon)
+                pts.append([t, round(south / h_m * UE5_GRID, 3), round(east / w_m * UE5_GRID, 3),
+                            alt, spraying])
+            drones[d_id] = pts
+        msg = {"type": "swarm.track", "kind": kind, "sim_day": get_twin().state.sim_day,
+               "fields": ["t_s", "row", "col", "alt_m", "spraying"], "drones": drones}
+        ctx["last_track"] = msg
+        notify_field_listeners(msg)
+
+    def field_snapshot(seq: int) -> Dict[str, Any]:
+        twin = get_twin()
+        with twin._lock:
+            s = twin.state
+            g = ue5_grids()
+            flat = lambda a: np.round(np.asarray(a, dtype=np.float64), 4).ravel().tolist()  # noqa: E731
+            water = (s.resample_aux("water_mm", UE5_GRID, UE5_GRID)
+                     if "water_mm" in s.aux else np.zeros((UE5_GRID, UE5_GRID)))
+            zones = np.asarray(twin.zone_labels)
+            r_idx = (np.arange(UE5_GRID) * s.grid.rows // UE5_GRID) + s.grid.rows // (2 * UE5_GRID)
+            c_idx = (np.arange(UE5_GRID) * s.grid.cols // UE5_GRID) + s.grid.cols // (2 * UE5_GRID)
+            anomalies = sorted({a["index"] for a in ctx["anomalies"] if a["day"] == s.sim_day})
+            return {
+                "type": "field.snapshot", "seq": seq, "field_id": twin.field_id,
+                "sim_day": s.sim_day, "growth_stage": s.growth_stage,
+                "gdd": round(float(s.scalars.get("gdd", 0.0)), 1),
+                "grid": {"rows": UE5_GRID, "cols": UE5_GRID,
+                         "cell_size_m": round(s.grid.rows * s.grid.cell_size_m / UE5_GRID, 3),
+                         "origin_lat": s.grid.origin_lat, "origin_lon": s.grid.origin_lon},
+                "ndvi": flat(np.clip(g["ndvi"], 0.0, 1.0)),
+                "stress": flat(g["stress"]),
+                "stress_std": flat(g["stress_std"]),
+                "moisture": flat(g["moisture"]),
+                "fungus": flat(s.resample("fungus", UE5_GRID, UE5_GRID)),
+                "water_mm": flat(water),
+                "zone": zones[np.ix_(r_idx, c_idx)].ravel().astype(int).tolist(),
+                "anomalies": anomalies,
+                "pending_sprays": [p["zone_id"] for p in ctx["pending_interventions"]],
+            }
 
     # ---------------- UE5-resolution helpers ----------------
     def ue5_grids() -> Dict[str, np.ndarray]:
@@ -561,6 +616,7 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
             tasks, plan = plan_mission(kind, req)
             report = fleet.execute(plan, on_capture=on_capture if kind == "scout" else None, wind=wind)
             ctx["pending_interventions"].extend(report["completed_sprays"])
+            publish_track(kind, report["track"])
             if not req.include_track:
                 report.pop("track")
             reports.append({"kind": kind, "plan": plan.to_dict(), "report": report})
@@ -687,6 +743,68 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
             pass
         finally:
             unsubscribe()
+
+    @app.websocket("/ws/field")
+    async def ws_field(ws: WebSocket, min_interval_s: float = 0.25):
+        """
+        UE5 stream. Sends a full field.snapshot on connect and whenever the
+        twin changes (coalesced to at most one per ``min_interval_s``), and
+        swarm.track after each fleet mission. The client may send
+        {"type": "snapshot"} to request a snapshot immediately.
+        """
+        await ws.accept()
+        loop = asyncio.get_running_loop()
+        dirty = asyncio.Event()
+        outbox: asyncio.Queue = asyncio.Queue(maxsize=16)
+
+        def on_twin_event(_event: Dict[str, Any]) -> None:
+            loop.call_soon_threadsafe(dirty.set)
+
+        def on_message(message: Optional[Dict[str, Any]]) -> None:
+            def _put() -> None:
+                if message is None:
+                    dirty.set()
+                elif not outbox.full():
+                    outbox.put_nowait(message)
+            loop.call_soon_threadsafe(_put)
+
+        unsubscribe = get_twin().subscribe(on_twin_event)
+        ctx["field_listeners"].add(on_message)
+        seq = 0
+
+        async def sender() -> None:
+            nonlocal seq
+            await ws.send_json(field_snapshot(seq))
+            if ctx["last_track"] is not None:
+                await ws.send_json(ctx["last_track"])
+            while True:
+                waiters = [asyncio.ensure_future(dirty.wait()), asyncio.ensure_future(outbox.get())]
+                done, pending = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+                for w in pending:
+                    w.cancel()
+                for w in done:
+                    if w is waiters[1]:
+                        await ws.send_json(_jsonable(w.result()))
+                if dirty.is_set():
+                    await asyncio.sleep(min_interval_s)   # coalesce bursts of updates
+                    dirty.clear()
+                    seq += 1
+                    await ws.send_json(field_snapshot(seq))
+
+        async def receiver() -> None:
+            while True:
+                msg = await ws.receive_json()
+                if isinstance(msg, dict) and msg.get("type") == "snapshot":
+                    dirty.set()
+
+        tasks = [asyncio.ensure_future(sender()), asyncio.ensure_future(receiver())]
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in tasks:
+                t.cancel()
+            unsubscribe()
+            ctx["field_listeners"].discard(on_message)
 
     return app
 

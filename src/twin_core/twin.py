@@ -160,6 +160,7 @@ class DigitalTwin:
         self._sim = None        # built lazily (the legacy model imports torch)
         self._sim_state = None  # the FieldState object the model is bound to
         self._model()           # initialise process state (water, GDD, stage)
+        self._refresh_stress()  # stress is derived: make it consistent from the start
 
     # ================================================================ setup
     @classmethod

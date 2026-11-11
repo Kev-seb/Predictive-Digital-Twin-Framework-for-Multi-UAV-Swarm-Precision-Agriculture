@@ -226,6 +226,11 @@ class FieldState:
             cnt[rr, cc] = 1.0
         return (out / cnt).astype(np.float32)
 
+    def resample_aux(self, name: str, rows: int, cols: int) -> np.ndarray:
+        """Area-average an auxiliary process layer (e.g. water_mm) like resample()."""
+        tmp = FieldState(grid=self.grid, mean={"_": self.aux[name]}, var={"_": self.aux[name]})
+        return tmp.resample("_", rows, cols)
+
     def summary(self) -> Dict[str, object]:
         layers = {}
         for name in LAYERS:

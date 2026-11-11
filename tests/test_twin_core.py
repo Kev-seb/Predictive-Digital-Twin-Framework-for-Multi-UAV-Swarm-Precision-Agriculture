@@ -592,3 +592,52 @@ def test_ndvi_curve_fit_recovers_parameters():
     assert fitted.ndvi_max == pytest.approx(0.8, abs=0.03)
     assert fitted.ndvi_rise_mid_gdd == pytest.approx(600.0, rel=0.1)
     assert fit_ndvi_curve([(0, 0.3)], PaddyParams())[1]["fitted"] is False
+
+
+# ------------------------------------------------------------ UE5 stream
+def _receive_until(ws, msg_type, limit=50):
+    for _ in range(limit):
+        msg = ws.receive_json()
+        if msg["type"] == msg_type:
+            return msg
+    raise AssertionError(f"no {msg_type} message in {limit} messages")
+
+
+def test_ws_field_snapshot_schema(client):
+    with client.websocket_connect("/ws/field") as ws:
+        snap = ws.receive_json()
+        assert snap["type"] == "field.snapshot" and snap["seq"] == 0
+        assert snap["grid"]["rows"] == snap["grid"]["cols"] == 20
+        for key in ("ndvi", "stress", "stress_std", "moisture", "fungus", "water_mm", "zone"):
+            assert len(snap[key]) == 400, key
+        assert all(0.0 <= v <= 1.0 for v in snap["ndvi"])
+        assert set(snap["zone"]) == set(range(16))
+        assert snap["growth_stage"] == "Vegetative" and snap["gdd"] > 0
+
+
+def test_ws_field_pushes_on_change_and_coalesces(client):
+    with client.websocket_connect("/ws/field") as ws:
+        first = ws.receive_json()
+        client.post("/twin/step", json={"days": 1})
+        nxt = _receive_until(ws, "field.snapshot")
+        assert nxt["seq"] > first["seq"] and nxt["sim_day"] == first["sim_day"] + 1
+        ws.send_json({"type": "snapshot"})
+        again = _receive_until(ws, "field.snapshot")
+        assert again["seq"] > nxt["seq"]
+
+
+def test_ws_field_streams_swarm_track(client):
+    client.post("/sim/reset", json={"seed": 4})
+    with client.websocket_connect("/ws/field") as ws:
+        ws.receive_json()
+        client.post("/sim/mission", json={"kind": "scout"})
+        track = _receive_until(ws, "swarm.track")
+        assert track["fields"] == ["t_s", "row", "col", "alt_m", "spraying"]
+        assert len(track["drones"]) == 3
+        pts = [p for d in track["drones"].values() for p in d]
+        inside = [p for p in pts if 0 <= p[1] < 20 and 0 <= p[2] < 20]
+        assert len(inside) > 0.6 * len(pts)          # mostly over the field
+        assert max(p[3] for p in pts) > 8.0           # flew at scout altitude
+    with client.websocket_connect("/ws/field") as ws:  # late joiners get the last track
+        ws.receive_json()
+        assert ws.receive_json()["type"] == "swarm.track"

@@ -158,9 +158,14 @@ Moisture is now informative: the hidden leaky patch drains between canal turns.
 | Mean NDVI | 0.788 | **0.799** |
 | Fungicide | 0 | 3.7 kg, 2 zones, day 3 |
 
-### Phase 6: Visualization
-- [ ] UE5 subscribes to `/ws/twin` instead of polling; drive HISM material parameters from `ndvi`, `stress` and `stress_std`.
-- [ ] three.js view reads drone positions from the drone registry and field layers from `/twin/layers/*`.
+### Phase 6: Visualization (in progress)
+- [x] `/ws/field`: a UE5-oriented push stream.
+  - It sends coalesced 20 × 20 snapshots (≤ 4 per second) as flat arrays: NDVI, stress, stress std, moisture, fungus, water depth, zone, today's anomalies and pending sprays.
+  - It sends drone mission tracks in grid coordinates; clients that join late get the last track.
+  - Covered by tests; `scripts/twin_stream_client.py` is a reference client.
+- [x] `TwinStream` UE5 plugin (`src/ue5_integration/`): `UTwinStreamComponent` auto-reconnects, parses messages into Blueprint structs and events, writes HISM per-instance custom data (slots 0–5), and provides `SampleTrack` / `GridToLocal` helpers for replaying drone tracks. **Not yet compiled in a UE5 project.**
+- [ ] Build the plugin in the UE5 project, then wire `M_RiceCrop` to the custom-data slots and the drone actors to `OnSwarmTrack`.
+- [ ] three.js view: read drone positions from `/swarm/state` and field layers from `/twin/layers/*`.
 
 ## Done when
 

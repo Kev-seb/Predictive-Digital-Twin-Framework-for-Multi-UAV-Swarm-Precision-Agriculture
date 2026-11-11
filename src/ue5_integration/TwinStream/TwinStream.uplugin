@@ -1,0 +1,17 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "Twin Stream",
+	"Description": "Live link to the paddy field digital twin API (/ws/field): field snapshots for the HISM grid and drone mission tracks.",
+	"Category": "Digital Twin",
+	"CanContainContent": false,
+	"IsBetaVersion": true,
+	"Modules": [
+		{
+			"Name": "TwinStream",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	]
+}
