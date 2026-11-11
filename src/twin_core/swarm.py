@@ -385,6 +385,7 @@ class Fleet:
         sprayed_time: Dict[str, float] = {k: 0.0 for k in duty}
         track: Dict[str, List[List[float]]] = {d: [] for d in ids}
         completed_sprays: List[Dict[str, Any]] = []
+        captures: List[List[Any]] = []          # [t_s, drone_id, lat, lon, alt]
         proximity_events = 0
         t, next_track = 0.0, 0.0
 
@@ -426,8 +427,9 @@ class Fleet:
                     if since_capture[d] >= self.spec.capture_spacing_m:
                         since_capture[d] = 0.0
                         stats[d]["captures"] += 1
+                        lat, lon = self.frame.to_latlon(float(sim.pos[0]), float(sim.pos[1]))
+                        captures.append([round(t, 2), d, lat, lon, round(float(sim.pos[2]), 2)])
                         if on_capture is not None:
-                            lat, lon = self.frame.to_latlon(float(sim.pos[0]), float(sim.pos[1]))
                             on_capture(d, lat, lon, float(sim.pos[2]))
                 landing = idx[d] == len(legs[d]) - 1
                 tol = 0.6 if landing else arrive_m      # touch-down needs to be precise
@@ -471,4 +473,5 @@ class Fleet:
             "unassigned": [task.task_id for task in plan.unassigned],
             "proximity_events": proximity_events,
             "track": track,
+            "captures": captures,
         }

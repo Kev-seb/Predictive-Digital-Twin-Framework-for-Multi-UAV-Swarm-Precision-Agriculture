@@ -216,6 +216,14 @@ void UTwinStreamComponent::HandleMessage(const FString& Text)
 	{
 		HandleTrack(Json);
 	}
+	else if (Type == TEXT("swarm.positions"))
+	{
+		HandlePositions(Json);
+	}
+	else if (Type == TEXT("twin.status"))
+	{
+		HandleStatus(Json);
+	}
 }
 
 void UTwinStreamComponent::HandleSnapshot(const TSharedPtr<FJsonObject>& Json)
@@ -247,11 +255,18 @@ void UTwinStreamComponent::HandleSnapshot(const TSharedPtr<FJsonObject>& Json)
 	ReadInts(Json, TEXT("zone"), S.Zone);
 	ReadInts(Json, TEXT("anomalies"), S.Anomalies);
 	ReadInts(Json, TEXT("pending_sprays"), S.PendingSprays);
+	ReadFloats(Json, TEXT("truth_ndvi"), S.TruthNdvi);
+	ReadFloats(Json, TEXT("truth_stress"), S.TruthStress);
+	ReadFloats(Json, TEXT("truth_fungus"), S.TruthFungus);
 
 	LatestSnapshot = MoveTemp(S);
 	if (TargetInstances)
 	{
 		ApplySnapshotToInstances(TargetInstances, LatestSnapshot);
+	}
+	if (TruthInstances && LatestSnapshot.TruthStress.Num() > 0)
+	{
+		ApplyTruthToInstances(TruthInstances, LatestSnapshot);
 	}
 	OnFieldSnapshot.Broadcast(LatestSnapshot);
 }
@@ -293,6 +308,60 @@ void UTwinStreamComponent::HandleTrack(const TSharedPtr<FJsonObject>& Json)
 		}
 	}
 	OnSwarmTrack.Broadcast(Kind, SimDay, Tracks);
+}
+
+void UTwinStreamComponent::HandlePositions(const TSharedPtr<FJsonObject>& Json)
+{
+	const float TimeS = static_cast<float>(TwinStream::ReadNumber(Json, TEXT("t_s")));
+	TArray<FTwinDronePosition> Drones;
+	const TSharedPtr<FJsonObject>* Obj = nullptr;
+	if (Json->TryGetObjectField(TEXT("drones"), Obj) && Obj && Obj->IsValid())
+	{
+		for (const auto& Pair : (*Obj)->Values)
+		{
+			// [row, col, alt_m, spraying, heading_deg | null]
+			if (!Pair.Value.IsValid())
+			{
+				continue;
+			}
+			const TArray<TSharedPtr<FJsonValue>>& F = Pair.Value->AsArray();
+			if (F.Num() < 5)
+			{
+				continue;
+			}
+			FTwinDronePosition P;
+			P.DroneId = Pair.Key;
+			P.Row = static_cast<float>(F[0]->AsNumber());
+			P.Col = static_cast<float>(F[1]->AsNumber());
+			P.AltM = static_cast<float>(F[2]->AsNumber());
+			P.bSpraying = F[3]->AsNumber() > 0.5;
+			P.bHasHeading = F[4].IsValid() && F[4]->Type == EJson::Number;
+			P.HeadingDeg = P.bHasHeading ? static_cast<float>(F[4]->AsNumber()) : 0.f;
+			Drones.Add(P);
+		}
+	}
+	OnDronePositions.Broadcast(TimeS, Drones);
+}
+
+void UTwinStreamComponent::HandleStatus(const TSharedPtr<FJsonObject>& Json)
+{
+	FString Phase, Text;
+	Json->TryGetStringField(TEXT("phase"), Phase);
+	Json->TryGetStringField(TEXT("text"), Text);
+	LatestStatusText = Text;
+	OnStatus.Broadcast(Phase, Text, static_cast<int32>(TwinStream::ReadNumber(Json, TEXT("sim_day"))));
+}
+
+void UTwinStreamComponent::ApplyTruthToInstances(UInstancedStaticMeshComponent* Instances,
+	const FTwinFieldSnapshot& Snapshot)
+{
+	FTwinFieldSnapshot Truth = Snapshot;
+	Truth.Ndvi = Snapshot.TruthNdvi;
+	Truth.Stress = Snapshot.TruthStress;
+	Truth.Fungus = Snapshot.TruthFungus;
+	Truth.StressStd.Init(0.f, Snapshot.TruthStress.Num());   // reality has no uncertainty
+	Truth.Anomalies.Reset();
+	ApplySnapshotToInstances(Instances, Truth);
 }
 
 void UTwinStreamComponent::ApplySnapshotToInstances(UInstancedStaticMeshComponent* Instances,

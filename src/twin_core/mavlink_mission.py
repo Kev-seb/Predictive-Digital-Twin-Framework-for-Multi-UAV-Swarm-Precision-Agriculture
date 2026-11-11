@@ -419,7 +419,7 @@ def execute_plan_mavlink(
     unassigned, track) plus per-drone ``mission_items`` and ``connection``.
     """
     lock = threading.Lock()
-    report: Dict[str, Any] = {"drones": {}, "completed_sprays": [], "track": {},
+    report: Dict[str, Any] = {"drones": {}, "completed_sprays": [], "track": {}, "captures": [],
                               "unassigned": [t.task_id for t in plan.unassigned],
                               "backend": "mavlink", "errors": {}}
 
@@ -430,7 +430,7 @@ def execute_plan_mavlink(
         kind_of = {seq: (it.task_id, it.kind) for seq, it in enumerate(mission.items) if it.kind}
         spray_span = mission.spray_span   # pump time is attributed to the task flying it
         state = {"last": None, "since": 0.0, "dist": 0.0, "captures": 0, "spray_kg": {},
-                 "pump_s": {}, "t_last": None, "track": []}
+                 "pump_s": {}, "t_last": None, "track": [], "capture_log": []}
         link = None
         try:
             link = VehicleLink(connections[drone_id], timeout_s=timeout_s)
@@ -448,6 +448,7 @@ def execute_plan_mavlink(
                         if state["since"] >= capture_spacing_m:
                             state["since"] = 0.0
                             state["captures"] += 1
+                            state["capture_log"].append([round(now, 2), drone_id, lat, lon, round(alt, 2)])
                             if on_capture is not None:
                                 on_capture(drone_id, lat, lon, alt)
                 if pump_frac > 0 and state["t_last"] is not None:
@@ -482,6 +483,7 @@ def execute_plan_mavlink(
                     "est_time_s": round(assignment.est_time_s, 1)}
                 report["completed_sprays"].extend(sprays)
                 report["track"][drone_id] = [[round(p[0] - t0, 2)] + p[1:] for p in state["track"]]
+                report["captures"].extend([[round(c[0] - t0, 2)] + c[1:] for c in state["capture_log"]])
         except Exception as e:
             with lock:
                 report["errors"][drone_id] = f"{type(e).__name__}: {e}"

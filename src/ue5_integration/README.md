@@ -50,7 +50,49 @@ Showing uncertainty (index 2) is what makes this a twin rather than a heat map: 
 
 `GridToLocal` returns centimetres with X = east (col), Y = south (row) and Z = up. Place the field mesh so the grid's north-west corner sits at the actor origin. The centre of instance (r, c) is `GridToLocal(r + 0.5, c + 0.5, 0, CellSizeM)`.
 
-## 5. Message schema (`/ws/field`)
+## 5. Demo for presentations
+
+Demo mode runs the whole digital-twin story automatically, paced for an audience. With the default settings (15 days, 3 s per day, drones replayed at 6×), it takes about 6–8 minutes.
+
+1. **Day 0:** the twin starts from its prior, and a fungal outbreak is hidden in the "real" field.
+2. **Days 1–3:** the crop grows and the disease spreads unseen.
+3. **Day 3, scouting:** the drones take off and fly over the field. **The twin's field changes colour under the drones as they pass**, because each camera frame is assimilated live, and the outbreak appears.
+4. **Decision:** the twin flags the infected zones.
+5. **Spraying:** the drones fly back over those zones with their spray on.
+6. **Following days:** the fungicide takes effect, and later scouting confirms the recovery.
+
+Start the API, then the demo:
+
+```bash
+python digital_twin_api.py
+```
+
+```bash
+curl -X POST localhost:8008/demo/start -H 'content-type: application/json' -d '{}'
+```
+
+Optional settings: `{"days": 15, "day_seconds": 3, "scout_every": 3, "playback_speed": 6, "seed": 7}`. Add `"backend": "mavlink"` to fly it on ArduPilot SITL. `POST /demo/stop` stops it; `GET /demo/status` shows the current phase.
+
+### Blueprint setup (one level)
+
+1. **Twin field:** your rice HISM (20 × 20 instances, `M_RiceCrop`) on an actor with a **Twin Stream** component. In *BeginPlay*, set `TargetInstances` to the HISM.
+2. **Reality field (optional, recommended):** duplicate the field actor a few metres to the side, then set the component's `TruthInstances` to that copy's HISM. Both fields use the same material slots. Audiences see the twin start "clean", then match reality once the drones have flown. That convergence is what makes it a digital twin rather than an animation.
+3. **Drones:** bind **OnDronePositions(TimeS, Drones)**. For each `FTwinDronePosition`:
+   - find or spawn a drone actor keyed by `DroneId` (keep a `Map<String, Actor>`)
+   - `SetActorLocation(FieldOrigin + GridToLocal(Row, Col, AltM, Snapshot.CellSizeM))`
+   - if `bHasHeading`, `SetActorRotation(Yaw = HeadingToYaw(HeadingDeg))`
+   - activate or deactivate a spray Niagara system from `bSpraying`
+
+   Updates arrive at about 10 Hz. Use `VInterpTo` or `RInterpTo` in Tick for smooth motion.
+4. **Captions:** bind **OnStatus(Phase, Text, SimDay)** to a UMG text block. You can also switch camera shots on `Phase`:
+   - `scout`: follow the drones
+   - `decide`: top-down view of the field
+   - `spray`: close-up
+5. **Uncertainty:** in `M_RiceCrop`, use custom-data slot 2 (stress std) to desaturate or overlay a hatch pattern. On day 0 the whole twin field looks uncertain, and it sharpens where the drones have flown.
+
+`GridToLocal` places row 0 / col 0 at the field actor's origin, which should be the north-west corner. The grid is 20 cells of 5 m (100 m × 100 m). The launch pads sit just south of the field, at row ≈ 21.
+
+## 6. Message schema (`/ws/field`)
 
 Messages are JSON text frames.
 
@@ -75,6 +117,26 @@ Messages are JSON text frames.
  "drones": {"drone_01": [[0.0, 20.9, 10.0, 0.5, 0], ...], ...}}
 ```
 
+**`swarm.positions`** is sent at about 10 Hz while a demo replays a mission:
+
+```jsonc
+{"type": "swarm.positions", "t_s": 42.5, "fields": ["row", "col", "alt_m", "spraying", "heading_deg"],
+ "drones": {"drone_01": [6.12, 11.03, 10.0, 0, 90.0], ...}}
+```
+
+`heading_deg` is `null` while a drone hovers.
+
+**`twin.status`** is sent on each demo step:
+
+```jsonc
+{"type": "twin.status", "phase": "scout", "text": "Day 3: drones scouting the field; ...",
+ "sim_day": 3, "error": {"stress": 0.06, "fungus": 0.078, "ndvi": 0.04}}
+```
+
+`error` is the twin's RMSE against the hidden reality.
+
+In simulation, **`field.snapshot`** also carries `truth_ndvi`, `truth_stress` and `truth_fungus`, each 400 floats.
+
 **Client → server:** `{"type": "snapshot"}` requests a snapshot immediately.
 
 To check the stream without UE5:
@@ -83,7 +145,7 @@ To check the stream without UE5:
 python scripts/twin_stream_client.py --heatmap
 ```
 
-## 6. Driving the twin from UE5
+## 7. Driving the twin from UE5
 
 The component is read-only. To advance or act on the twin from UE5 (UI buttons, a sequencer), call the REST API with the HTTP module or the VaRest plugin:
 

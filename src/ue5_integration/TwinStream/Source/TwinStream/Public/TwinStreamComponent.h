@@ -12,6 +12,9 @@
 //   slot 4  Fungus      [0, 1]  fraction of infected tissue
 //   slot 5  Anomaly     1 if the cell was flagged on the current day, else 0
 //
+// Demo mode (POST /demo/start) also streams live drone poses (OnDronePositions),
+// story captions (OnStatus) and the hidden reality (TruthInstances / Truth* arrays).
+//
 // Instance index = row * Cols + col, row 0 = north edge, col 0 = west edge
 // (the same convention as /field/status).
 
@@ -54,6 +57,28 @@ struct TWINSTREAM_API FTwinFieldSnapshot
 	// Instance indices flagged today, and zones with sprays queued for the next day.
 	UPROPERTY(BlueprintReadOnly, Category = "Digital Twin") TArray<int32> Anomalies;
 	UPROPERTY(BlueprintReadOnly, Category = "Digital Twin") TArray<int32> PendingSprays;
+
+	// Hidden "reality" of the simulated field (only while the virtual field runs),
+	// for twin-vs-reality views. Empty otherwise.
+	UPROPERTY(BlueprintReadOnly, Category = "Digital Twin") TArray<float> TruthNdvi;
+	UPROPERTY(BlueprintReadOnly, Category = "Digital Twin") TArray<float> TruthStress;
+	UPROPERTY(BlueprintReadOnly, Category = "Digital Twin") TArray<float> TruthFungus;
+};
+
+/** Live drone pose while a mission plays back (swarm.positions, ~10 Hz). */
+USTRUCT(BlueprintType)
+struct TWINSTREAM_API FTwinDronePosition
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Digital Twin") FString DroneId;
+	UPROPERTY(BlueprintReadOnly, Category = "Digital Twin") float Row = 0.f;
+	UPROPERTY(BlueprintReadOnly, Category = "Digital Twin") float Col = 0.f;
+	UPROPERTY(BlueprintReadOnly, Category = "Digital Twin") float AltM = 0.f;
+	UPROPERTY(BlueprintReadOnly, Category = "Digital Twin") bool bSpraying = false;
+	/** Compass heading (0 = north, 90 = east); valid when bHasHeading. */
+	UPROPERTY(BlueprintReadOnly, Category = "Digital Twin") float HeadingDeg = 0.f;
+	UPROPERTY(BlueprintReadOnly, Category = "Digital Twin") bool bHasHeading = false;
 };
 
 USTRUCT(BlueprintType)
@@ -82,6 +107,10 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnTwinFieldSnapshot, const FTwinFie
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FOnTwinSwarmTrack, const FString&, MissionKind, int32, SimDay,
 	const TArray<FTwinDroneTrack>&, Tracks);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnTwinConnectionChanged, bool, bConnected);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnTwinDronePositions, float, TimeS,
+	const TArray<FTwinDronePosition>&, Drones);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FOnTwinStatus, const FString&, Phase, const FString&, Text,
+	int32, SimDay);
 
 UCLASS(ClassGroup = (DigitalTwin), meta = (BlueprintSpawnableComponent))
 class TWINSTREAM_API UTwinStreamComponent : public UActorComponent
@@ -114,6 +143,21 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Digital Twin")
 	FOnTwinConnectionChanged OnConnectionChanged;
 
+	/** Live drone poses during demo / mission playback (~10 Hz). */
+	UPROPERTY(BlueprintAssignable, Category = "Digital Twin")
+	FOnTwinDronePositions OnDronePositions;
+
+	/** Story captions from demo mode, e.g. "Day 6: drones scouting the field". */
+	UPROPERTY(BlueprintAssignable, Category = "Digital Twin")
+	FOnTwinStatus OnStatus;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Digital Twin")
+	FString LatestStatusText;
+
+	/** Optional second field showing the hidden reality (same slots as TargetInstances). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Digital Twin")
+	TObjectPtr<UInstancedStaticMeshComponent> TruthInstances;
+
 	UPROPERTY(BlueprintReadOnly, Category = "Digital Twin")
 	FTwinFieldSnapshot LatestSnapshot;
 
@@ -135,6 +179,17 @@ public:
 	static void ApplySnapshotToInstances(UInstancedStaticMeshComponent* Instances, const FTwinFieldSnapshot& Snapshot);
 
 	/**
+	 * Write the hidden reality into the same slots (0 NDVI, 1 stress, 2 = 0 uncertainty,
+	 * 3 twin moisture, 4 fungus, 5 = 0), so one crop material renders both fields.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Digital Twin")
+	static void ApplyTruthToInstances(UInstancedStaticMeshComponent* Instances, const FTwinFieldSnapshot& Snapshot);
+
+	/** UE yaw (degrees) for a compass heading, in the GridToLocal frame (X = east, Y = south). */
+	UFUNCTION(BlueprintPure, Category = "Digital Twin")
+	static float HeadingToYaw(float HeadingDeg) { return HeadingDeg - 90.f; }
+
+	/**
 	 * Field-local position in cm from continuous grid coordinates: X = east (col), Y = south (row),
 	 * Z = up. Use (Row + 0.5, Col + 0.5) for the centre of instance (Row, Col).
 	 */
@@ -153,6 +208,8 @@ private:
 	void HandleMessage(const FString& Text);
 	void HandleSnapshot(const TSharedPtr<FJsonObject>& Json);
 	void HandleTrack(const TSharedPtr<FJsonObject>& Json);
+	void HandlePositions(const TSharedPtr<FJsonObject>& Json);
+	void HandleStatus(const TSharedPtr<FJsonObject>& Json);
 	void SetConnected(bool bNewConnected);
 	void ScheduleReconnect();
 	void ReleaseSocket();

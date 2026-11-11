@@ -6,7 +6,7 @@ will receive, without UE5:
 
     python digital_twin_api.py                       # terminal 1
     python scripts/twin_stream_client.py --heatmap   # terminal 2
-    curl -X POST localhost:8008/sim/advance -H 'content-type: application/json' -d '{"days": 3}'
+    curl -X POST localhost:8008/demo/start -H 'content-type: application/json' -d '{}'
 
 Prints one line per message and, with --heatmap, an ASCII stress map of the
 20 x 20 grid (row 0 = north edge, as in the UE5 HISM grid).
@@ -40,6 +40,14 @@ def describe(msg: dict, show_heatmap: bool) -> str:
         if show_heatmap:
             out += "\n" + heatmap(msg["stress"], msg["grid"]["rows"], msg["grid"]["cols"])
         return out
+    if msg["type"] == "twin.status":
+        err = msg.get("error") or {}
+        e = f"  [twin vs truth RMSE: fungus {err['fungus']:.3f}]" if err else ""
+        return f"[status:{msg['phase']}] {msg['text']}{e}"
+    if msg["type"] == "swarm.positions":
+        parts = [f"{d} r{p[0]:.1f} c{p[1]:.1f} {p[2]:.0f}m{' SPRAY' if p[3] else ''}"
+                 for d, p in msg["drones"].items()]
+        return f"[drones t={msg['t_s']:.0f}s] " + " | ".join(parts)
     if msg["type"] == "swarm.track":
         parts = [f"{d}: {len(p)} samples, {sum(s[4] for s in p)} spraying"
                  for d, p in msg["drones"].items()]
@@ -52,9 +60,15 @@ async def main(url: str, show_heatmap: bool, count: int) -> None:
 
     async with websockets.connect(url, max_size=2 ** 22) as ws:
         print(f"connected to {url}")
-        n = 0
+        n, last_pos = 0, 0.0
         async for raw in ws:
-            print(describe(json.loads(raw), show_heatmap), flush=True)
+            msg = json.loads(raw)
+            if msg["type"] == "swarm.positions":   # 10 Hz: print about once a second
+                now = asyncio.get_running_loop().time()
+                if now - last_pos < 1.0:
+                    continue
+                last_pos = now
+            print(describe(msg, show_heatmap), flush=True)
             n += 1
             if count and n >= count:
                 break

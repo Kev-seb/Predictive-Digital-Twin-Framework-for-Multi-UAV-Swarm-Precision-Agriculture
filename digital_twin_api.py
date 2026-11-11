@@ -52,12 +52,19 @@ Swarm routes (N-drone fleet, see swarm.py):
   POST   /swarm/plan               Allocate scout / spray tasks without flying
   POST   /swarm/mission-files      Planned missions as QGC WPL 110 (.waypoints) per drone
   GET    /swarm/sitl-homes         Launch commands for one ArduCopter SITL instance per drone
+
+Demo mode (paced closed loop for live UE5 presentations):
+  POST   /demo/start               Run the story: outbreak -> scout -> decide -> spray -> recovery
+  POST   /demo/stop                Stop it
+  GET    /demo/status              Current phase
+  (streams swarm.positions at 10 Hz and twin.status captions on /ws/field)
 ================================================================
 """
 
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Literal, Optional
@@ -167,6 +174,16 @@ class MissionRequest(BaseModel):
                                "(UAV_TWIN_MAVLINK_MODE: emulated vehicles or ArduPilot SITL)")
 
 
+class DemoRequest(BaseModel):
+    seed:           int = 7
+    days:           int = Field(15, ge=1, le=120)
+    day_seconds:    float = Field(3.0, ge=0.0, le=120.0, description="wall seconds per simulated day")
+    scout_every:    int = Field(3, ge=1, le=30, description="scout every N days (sprays follow if needed)")
+    playback_speed: float = Field(6.0, gt=0.0, le=1000.0, description="simulated seconds per wall second while drones fly")
+    backend:        Literal["physics", "mavlink"] = "physics"
+    fungus_threshold: float = Field(0.15, ge=0.0, le=1.0)
+
+
 class AddDrone(BaseModel):
     drone_id: str = Field(..., min_length=1, max_length=40)
 
@@ -228,7 +245,8 @@ def _default_twin() -> DigitalTwin:
 def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
     ctx: Dict[str, Any] = {"twin": twin, "anomalies": [], "ue5_snapshot": None, "virtual": None,
                            "fleet": None, "pending_interventions": [], "field_listeners": set(),
-                           "last_track": None, "mavlink": None}
+                           "last_track": None, "mavlink": None,
+                           "demo": {"task": None, "phase": "idle", "text": "", "day": 0, "error": None}}
 
     def get_twin() -> DigitalTwin:
         if ctx["twin"] is None:
@@ -339,7 +357,18 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
                 "zone": zones[np.ix_(r_idx, c_idx)].ravel().astype(int).tolist(),
                 "anomalies": anomalies,
                 "pending_sprays": [p["zone_id"] for p in ctx["pending_interventions"]],
+                **truth_layers(flat),
             }
+
+    def truth_layers(flat) -> Dict[str, Any]:
+        """Hidden 'reality' of the virtual field, for twin-vs-reality views (sim only)."""
+        vf = ctx["virtual"]
+        if vf is None:
+            return {}
+        t = vf.truth.state
+        return {"truth_stress": flat(t.resample("stress", UE5_GRID, UE5_GRID)),
+                "truth_fungus": flat(t.resample("fungus", UE5_GRID, UE5_GRID)),
+                "truth_ndvi": flat(np.clip(t.resample("ndvi", UE5_GRID, UE5_GRID), 0.0, 1.0))}
 
     # ---------------- UE5-resolution helpers ----------------
     def ue5_grids() -> Dict[str, np.ndarray]:
@@ -726,6 +755,158 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
                         "command": f"sim_vehicle.py -v ArduCopter -I {i} --sysid {i + 1} "
                                    f"--custom-location={lat:.8f},{lon:.8f},0,0 --no-mavproxy"})
         return {"mode": settings.twin_mavlink_mode, "instances": out}
+
+    # ============================================================
+    # DEMO MODE
+    # ============================================================
+
+    def demo_status(phase: str, text: str) -> None:
+        d = ctx["demo"]
+        d.update(phase=phase, text=text, day=get_twin().state.sim_day)
+        notify_field_listeners({"type": "twin.status", "phase": phase, "text": text,
+                                "sim_day": d["day"], "error": vf_error_brief()})
+
+    def vf_error_brief() -> Optional[Dict[str, float]]:
+        if ctx["virtual"] is None:
+            return None
+        e = ctx["virtual"].twin_error(get_twin())
+        return {k: e[k]["rmse"] for k in ("stress", "fungus", "ndvi")}
+
+    def grid_rc(lat: float, lon: float) -> tuple:
+        grid = get_twin().state.grid
+        east, south = grid.latlon_to_local_m(lat, lon)
+        return (south / (grid.rows * grid.cell_size_m) * UE5_GRID,
+                east / (grid.cols * grid.cell_size_m) * UE5_GRID)
+
+    async def replay(report: Dict[str, Any], speed: float, ingest: bool) -> None:
+        """Re-fly a finished mission in real time: drone positions at 10 Hz, and
+        each camera frame assimilated when the replay reaches it, so the field
+        changes in UE5 as the drones pass over it."""
+        tracks = {d: t for d, t in report.get("track", {}).items() if t}
+        if not tracks:
+            return
+        captures = sorted(report.get("captures", []), key=lambda c: c[0]) if ingest else []
+        end_t = max(t[-1][0] for t in tracks.values())
+        twin, vf = get_twin(), get_virtual()
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        ci = 0
+        idx = {d: 0 for d in tracks}
+        while True:
+            sim_t = (loop.time() - start) * speed
+            drones = {}
+            for d, tr in tracks.items():
+                i = idx[d]
+                while i + 1 < len(tr) - 1 and tr[i + 1][0] <= sim_t:
+                    i += 1
+                idx[d] = i
+                a, b = tr[i], tr[min(i + 1, len(tr) - 1)]
+                f = 0.0 if b[0] <= a[0] else min(1.0, max(0.0, (sim_t - a[0]) / (b[0] - a[0])))
+                lat, lon = a[1] + f * (b[1] - a[1]), a[2] + f * (b[2] - a[2])
+                row, col = grid_rc(lat, lon)
+                r2, c2 = grid_rc(b[1], b[2])
+                r1, c1 = grid_rc(a[1], a[2])
+                yaw = math.degrees(math.atan2(c2 - c1, -(r2 - r1))) if (r2, c2) != (r1, c1) else None
+                drones[d] = [round(row, 3), round(col, 3), round(a[3] + f * (b[3] - a[3]), 2),
+                             int(a[4]), None if yaw is None else round(yaw % 360.0, 1)]
+            notify_field_listeners({"type": "swarm.positions", "t_s": round(min(sim_t, end_t), 2),
+                                    "fields": ["row", "col", "alt_m", "spraying", "heading_deg"],
+                                    "drones": drones})
+            batch = []
+            while ci < len(captures) and captures[ci][0] <= sim_t:
+                batch.append(captures[ci])
+                ci += 1
+            if batch:
+                def _ingest(items=batch):
+                    for _t, _d, lat, lon, alt in items:
+                        frame = vf.drone_camera(lat, lon, alt)
+                        if frame:
+                            ingest_rgb_result(twin, frame, {"lat": lat, "lon": lon, "alt": alt})
+                await asyncio.to_thread(_ingest)
+            if sim_t >= end_t:
+                return
+            await asyncio.sleep(0.1)
+
+    async def fly(kind: str, req: DemoRequest) -> Dict[str, Any]:
+        mreq = MissionRequest(kind=kind, backend=req.backend, fungus_threshold=req.fungus_threshold)
+        fleet = get_fleet()
+        tasks, plan = plan_mission(kind, mreq)
+        if not tasks:
+            return {"tasks": 0}
+        if req.backend == "mavlink":
+            report = await asyncio.to_thread(
+                mm.execute_plan_mavlink, plan, fleet.frame, mavlink_connections(), drone_homes(), None,
+                fleet.spec.capture_spacing_m, 60.0, 1800.0,
+                mm.lane_model_for(settings.twin_mavlink_mode, settings.twin_params_file.parent))
+        else:
+            report = await asyncio.to_thread(fleet.execute, plan, None, 0.05, 3600.0, 2.0, 0.5,
+                                             get_twin().state.last_weather or None)
+        await replay(report, req.playback_speed, ingest=(kind == "scout"))
+        ctx["pending_interventions"].extend(report["completed_sprays"])
+        publish_track(kind, report["track"])
+        detect_anomalies()
+        return {"tasks": len(tasks), "sprays": [p["zone_id"] for p in report["completed_sprays"]]}
+
+    async def run_demo(req: DemoRequest) -> None:
+        d = ctx["demo"]
+        try:
+            await asyncio.to_thread(sim_reset, SimReset(seed=req.seed))
+            demo_status("start", "Day 0: the twin starts from its prior. A fungal outbreak is hidden "
+                                 "somewhere in the real field.")
+            await asyncio.sleep(req.day_seconds)
+            for _ in range(req.days):
+                adv = await asyncio.to_thread(sim_advance, SimAdvance(days=1))
+                sprayed = [i["zone_id"] for i in adv["applied_fleet_interventions"]]
+                day = adv["sim_day"]
+                demo_status("advance", f"Day {day}: crop grows, disease spreads"
+                            + (f"; fungicide takes effect in zone(s) {sprayed}" if sprayed else "") + ".")
+                if day % req.scout_every == 0:
+                    demo_status("scout", f"Day {day}: drones scouting the field; the twin updates as they fly.")
+                    await fly("scout", req)
+                    demo_status("decide", f"Day {day}: twin re-planned from what the drones saw.")
+                    res = await fly("spray", req)
+                    if res.get("tasks"):
+                        demo_status("spray", f"Day {day}: sprayed zone(s) {res.get('sprays')}; "
+                                             "effect from tomorrow.")
+                    else:
+                        demo_status("decide", f"Day {day}: no zone above the action threshold; no spraying.")
+                await asyncio.sleep(req.day_seconds)
+            demo_status("done", f"Demo finished on day {get_twin().state.sim_day}.")
+        except asyncio.CancelledError:
+            demo_status("stopped", "Demo stopped.")
+            raise
+        except Exception as e:  # report, do not kill the server
+            d["error"] = f"{type(e).__name__}: {e}"
+            demo_status("error", d["error"])
+        finally:
+            d["task"] = None
+
+    @app.post("/demo/start", summary="Start the paced closed-loop demo for UE5")
+    async def demo_start(req: DemoRequest):
+        d = ctx["demo"]
+        if d["task"] is not None and not d["task"].done():
+            raise HTTPException(409, "A demo is already running; POST /demo/stop first")
+        d["error"] = None
+        d["task"] = asyncio.get_running_loop().create_task(run_demo(req))
+        return {"status": "started", **req.model_dump()}
+
+    @app.post("/demo/stop", summary="Stop the demo")
+    async def demo_stop():
+        task = ctx["demo"]["task"]
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        return {"status": "stopped"}
+
+    @app.get("/demo/status", summary="Demo phase and twin-vs-truth error")
+    def demo_status_route():
+        d = ctx["demo"]
+        return {"running": d["task"] is not None and not d["task"].done(), "phase": d["phase"],
+                "text": d["text"], "sim_day": d["day"], "error": d["error"],
+                "twin_error": vf_error_brief()}
 
     @app.get("/sim/error", summary="Twin vs ground truth")
     def sim_error():

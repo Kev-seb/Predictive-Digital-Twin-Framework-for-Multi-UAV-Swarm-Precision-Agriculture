@@ -570,6 +570,14 @@ Check the stream without UE5:
 python scripts/twin_stream_client.py --heatmap
 ```
 
+**Live demo for presentations:**
+
+```bash
+curl -X POST localhost:8008/demo/start -H 'content-type: application/json' -d '{}'
+```
+
+This runs the full digital-twin story with drones flying in real time. The field updates under the drones, and a twin-vs-reality view and on-screen captions are available. See *Demo for presentations* in [`src/ue5_integration/README.md`](src/ue5_integration/README.md).
+
 **Polling (legacy):** `/field/status` keeps its original contract, so `src/unity_integration/UnityBridgeClient.cs` and existing Blueprints that poll it still work.
 
 ### 5.6 Research Pipeline

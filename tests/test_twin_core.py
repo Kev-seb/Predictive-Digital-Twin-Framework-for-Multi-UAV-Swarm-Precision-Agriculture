@@ -641,3 +641,44 @@ def test_ws_field_streams_swarm_track(client):
     with client.websocket_connect("/ws/field") as ws:  # late joiners get the last track
         ws.receive_json()
         assert ws.receive_json()["type"] == "swarm.track"
+
+
+# ------------------------------------------------------------- demo mode
+def test_demo_streams_story_positions_and_truth(client):
+    seen = {"twin.status": [], "swarm.positions": 0, "field.snapshot": 0, "swarm.track": 0}
+    with client.websocket_connect("/ws/field") as ws:
+        ws.receive_json()
+        r = client.post("/demo/start", json={"days": 3, "scout_every": 3, "day_seconds": 0,
+                                             "playback_speed": 500, "seed": 7})
+        assert r.status_code == 200
+        assert client.post("/demo/start", json={}).status_code == 409      # one demo at a time
+        truth_seen = False
+        for _ in range(5000):
+            msg = ws.receive_json()
+            t = msg["type"]
+            if t == "twin.status":
+                seen[t].append(msg["phase"])
+                if msg["phase"] in ("done", "error", "stopped"):
+                    break
+            elif t in seen:
+                seen[t] += 1
+            if t == "swarm.positions":
+                d = next(iter(msg["drones"].values()))
+                assert msg["fields"] == ["row", "col", "alt_m", "spraying", "heading_deg"] and len(d) == 5
+            if t == "field.snapshot" and "truth_fungus" in msg:
+                truth_seen = len(msg["truth_fungus"]) == 400
+    assert seen["twin.status"][-1] == "done", seen["twin.status"]
+    assert {"start", "advance", "scout", "decide"} <= set(seen["twin.status"])
+    assert seen["swarm.positions"] > 5 and seen["swarm.track"] >= 1 and seen["field.snapshot"] > 2
+    assert truth_seen
+    st = client.get("/demo/status").json()
+    assert st["running"] is False and st["phase"] == "done" and st["sim_day"] == 3
+    assert st["twin_error"]["fungus"] < 0.08                              # scouting taught the twin
+
+
+def test_demo_stop(client):
+    client.post("/demo/start", json={"days": 50, "day_seconds": 5})
+    assert client.get("/demo/status").json()["running"] is True
+    client.post("/demo/stop")
+    st = client.get("/demo/status").json()
+    assert st["running"] is False and st["phase"] == "stopped"

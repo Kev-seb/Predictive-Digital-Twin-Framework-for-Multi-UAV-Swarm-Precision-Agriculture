@@ -181,7 +181,13 @@ Moisture is now informative: the hidden leaky patch drains between canal turns.
   - It sends drone mission tracks in grid coordinates; clients that join late get the last track.
   - Covered by tests; `scripts/twin_stream_client.py` is a reference client.
 - [x] `TwinStream` UE5 plugin (`src/ue5_integration/`): `UTwinStreamComponent` auto-reconnects, parses messages into Blueprint structs and events, writes HISM per-instance custom data (slots 0–5), and provides `SampleTrack` / `GridToLocal` helpers for replaying drone tracks. **Not yet compiled in a UE5 project.**
-- [ ] Build the plugin in the UE5 project, then wire `M_RiceCrop` to the custom-data slots and the drone actors to `OnSwarmTrack`.
+- [x] Demo mode for UE5 presentations (`POST /demo/start`):
+  - runs a paced story: outbreak → scout → decide → spray → recovery
+  - streams live drone poses (`swarm.positions`, 10 Hz) and captions (`twin.status`)
+  - assimilates camera frames as the replay passes them, so the field changes under the drones
+  - sends the hidden reality (`truth_*`) for a twin-vs-reality view
+  - the plugin exposes `OnDronePositions`, `OnStatus` and `TruthInstances`; the Blueprint recipe is in `src/ue5_integration/README.md`
+- [ ] Build the plugin in the UE5 project, wire `M_RiceCrop` to the custom-data slots, and drive the drone actors from `OnDronePositions`.
 - [ ] three.js view: read drone positions from `/swarm/state` and field layers from `/twin/layers/*`.
 
 ## Done when
