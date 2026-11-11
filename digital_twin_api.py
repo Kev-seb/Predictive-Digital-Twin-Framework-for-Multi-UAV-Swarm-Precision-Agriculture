@@ -42,13 +42,16 @@ Simulation routes (hidden "physical" field + sensors, see virtual_field.py):
   POST   /sim/survey               Multispectral survey -> assimilated
   GET    /sim/error                Twin vs truth: RMSE, bias, 95% coverage
   GET    /sim/truth/layers/{layer} Ground-truth layer (for debugging / UE5 A/B)
-  POST   /sim/mission              Plan + fly a fleet mission (scout / spray / auto)
+  POST   /sim/mission              Plan + fly a fleet mission (scout / spray / auto),
+                                   in flight physics or over MAVLink (emulator / ArduPilot SITL)
 
 Swarm routes (N-drone fleet, see swarm.py):
   GET    /swarm/state              Drone positions (dashboard /swarm format)
   POST   /swarm/drones             Add a drone
   DELETE /swarm/drones/{drone_id}  Remove a drone
   POST   /swarm/plan               Allocate scout / spray tasks without flying
+  POST   /swarm/mission-files      Planned missions as QGC WPL 110 (.waypoints) per drone
+  GET    /swarm/sitl-homes         Launch commands for one ArduCopter SITL instance per drone
 ================================================================
 """
 
@@ -69,6 +72,7 @@ from src.config.config import settings
 from src.twin_core import LAYERS, DigitalTwin, FieldGrid
 from src.twin_core.ingest import ingest_multispectral, ingest_rgb_result
 from src.twin_core.swarm import Fleet, allocate, tasks_from_twin
+from src.twin_core import mavlink_mission as mm
 from src.twin_core.virtual_field import VirtualField, serpentine_waypoints
 from src.twin_core.weather_feed import get_weather
 
@@ -158,6 +162,9 @@ class MissionRequest(BaseModel):
     dose_l_per_ha:    float = Field(25.0, gt=0.0, le=200.0)
     zones:            Optional[List[int]] = None
     include_track:    bool = False
+    backend: Literal["physics", "mavlink"] = Field(
+        "physics", description="physics = in-process 6-DOF fleet; mavlink = upload and fly over MAVLink "
+                               "(UAV_TWIN_MAVLINK_MODE: emulated vehicles or ArduPilot SITL)")
 
 
 class AddDrone(BaseModel):
@@ -221,7 +228,7 @@ def _default_twin() -> DigitalTwin:
 def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
     ctx: Dict[str, Any] = {"twin": twin, "anomalies": [], "ue5_snapshot": None, "virtual": None,
                            "fleet": None, "pending_interventions": [], "field_listeners": set(),
-                           "last_track": None}
+                           "last_track": None, "mavlink": None}
 
     def get_twin() -> DigitalTwin:
         if ctx["twin"] is None:
@@ -240,6 +247,28 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
         if ctx["fleet"] is None:
             ctx["fleet"] = Fleet.for_field(get_twin().state.grid, settings.twin_swarm_size)
         return ctx["fleet"]
+
+    def drone_homes() -> Dict[str, tuple]:
+        fleet = get_fleet()
+        return {d: fleet.frame.to_latlon(*fleet.pads[d]) for d in fleet.drones}
+
+    def mavlink_connections() -> Dict[str, str]:
+        """Connection per drone; starts (or restarts) the emulator fleet when needed."""
+        ids = list(get_fleet().drones)
+        if settings.twin_mavlink_connections.strip():
+            conns = [c.strip() for c in settings.twin_mavlink_connections.split(",") if c.strip()]
+            return dict(zip(ids, conns))
+        if settings.twin_mavlink_mode == "sitl":
+            return {d: f"tcp:127.0.0.1:{settings.twin_mavlink_base_port + 10 * i}" for i, d in enumerate(ids)}
+        emu = ctx["mavlink"]
+        if emu is None or list(emu.connections) != ids:
+            from src.twin_core.sim_vehicle import EmulatedFleet
+            if emu is not None:
+                emu.stop()
+            emu = EmulatedFleet(drone_homes(), base_port=settings.twin_mavlink_base_port,
+                                time_scale=settings.twin_mavlink_time_scale)
+            ctx["mavlink"] = emu
+        return dict(emu.connections)
 
     def plan_mission(kind: str, req: "MissionRequest"):
         fleet, twin = get_fleet(), get_twin()
@@ -366,6 +395,8 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
               f"day={t.state.sim_day} -> http://{settings.twin_api_host}:{settings.twin_api_port}/docs",
               flush=True)
         yield
+        if ctx["mavlink"] is not None:
+            ctx["mavlink"].stop()
 
     app = FastAPI(
         title="Paddy Field Digital Twin API",
@@ -614,14 +645,22 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
         reports = []
         for kind in (("scout", "spray") if req.kind == "auto" else (req.kind,)):
             tasks, plan = plan_mission(kind, req)
-            report = fleet.execute(plan, on_capture=on_capture if kind == "scout" else None, wind=wind)
+            if req.backend == "mavlink":
+                report = mm.execute_plan_mavlink(
+                    plan, fleet.frame, mavlink_connections(), homes=drone_homes(),
+                    on_capture=on_capture if kind == "scout" else None,
+                    capture_spacing_m=fleet.spec.capture_spacing_m)
+                if report["errors"] and not report["drones"]:
+                    raise HTTPException(502, f"MAVLink execution failed: {report['errors']}")
+            else:
+                report = fleet.execute(plan, on_capture=on_capture if kind == "scout" else None, wind=wind)
             ctx["pending_interventions"].extend(report["completed_sprays"])
             publish_track(kind, report["track"])
             if not req.include_track:
                 report.pop("track")
             reports.append({"kind": kind, "plan": plan.to_dict(), "report": report})
         detect_anomalies()
-        summary = {"kind": req.kind, "frames_assimilated": assimilated["n"],
+        summary = {"kind": req.kind, "backend": req.backend, "frames_assimilated": assimilated["n"],
                    "sprays_queued": [p["zone_id"] for p in ctx["pending_interventions"]]}
         twin._emit("swarm.mission", summary)
         return {**summary, "missions": reports, "error_before": before,
@@ -658,6 +697,32 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
             raise HTTPException(400, "Plan 'scout' or 'spray'; 'auto' is only for /sim/mission")
         tasks, plan = plan_mission(req.kind, req)
         return {"tasks": [t.to_dict() for t in tasks], **plan.to_dict()}
+
+    @app.post("/swarm/mission-files", summary="Planned missions as .waypoints (QGC WPL 110) per drone")
+    def swarm_mission_files(req: MissionRequest):
+        if req.kind == "auto":
+            raise HTTPException(400, "Export 'scout' or 'spray'; 'auto' depends on the scout results")
+        fleet = get_fleet()
+        _, plan = plan_mission(req.kind, req)
+        homes = drone_homes()
+        out = {}
+        for k, (d_id, a) in enumerate(plan.assignments.items()):
+            if a.tasks:
+                mission = mm.compile_mission(a, fleet.frame, transit_alt=14.0 + 2.0 * k, home=homes[d_id])
+                out[d_id] = {"items": len(mission.items), "spray_speed_m_s": mission.spray_speed,
+                             "waypoints": mm.to_qgc_wpl(mission)}
+        return {"kind": req.kind, "missions": out, "unassigned": [t.task_id for t in plan.unassigned]}
+
+    @app.get("/swarm/sitl-homes", summary="One ArduCopter SITL instance per drone, at its launch pad")
+    def swarm_sitl_homes():
+        out = []
+        for i, (d_id, (lat, lon)) in enumerate(drone_homes().items()):
+            port = settings.twin_mavlink_base_port + 10 * i
+            out.append({"drone_id": d_id, "instance": i, "home_lat": round(lat, 8), "home_lon": round(lon, 8),
+                        "connection": f"tcp:127.0.0.1:{port}",
+                        "command": f"sim_vehicle.py -v ArduCopter -I {i} --sysid {i + 1} "
+                                   f"--custom-location={lat:.8f},{lon:.8f},0,0 --no-mavproxy"})
+        return {"mode": settings.twin_mavlink_mode, "instances": out}
 
     @app.get("/sim/error", summary="Twin vs ground truth")
     def sim_error():

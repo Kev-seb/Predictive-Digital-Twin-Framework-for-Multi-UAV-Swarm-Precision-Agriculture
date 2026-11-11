@@ -538,6 +538,8 @@ Swarm endpoints (N-drone fleet in 6-DOF flight physics):
 | `POST` / `DELETE` | `/swarm/drones` | Add or remove drones (fleet size: `UAV_TWIN_SWARM_SIZE`) |
 | `POST` | `/swarm/plan` | Allocate scout / spray tasks under battery and tank limits |
 
+Fleet missions can also run over **MAVLink**, using the mission upload protocol with GUIDED, AUTO and RTL. They fly on the built-in vehicle emulator or on **ArduPilot SITL**, one instance per drone; set `"backend": "mavlink"` on `/sim/mission`. See [`docs/sitl.md`](docs/sitl.md).
+
 The Streamlit **Swarm Operations Dashboard** runs any number of drones (1–12). Set the starting fleet size with `UAV_DASHBOARD_SWARM_SIZE`, or change it live with the Fleet size slider.
 
 Validate the twin offline:
