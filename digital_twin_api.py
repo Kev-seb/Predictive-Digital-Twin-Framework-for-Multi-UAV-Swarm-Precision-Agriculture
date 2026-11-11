@@ -649,7 +649,8 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
                 report = mm.execute_plan_mavlink(
                     plan, fleet.frame, mavlink_connections(), homes=drone_homes(),
                     on_capture=on_capture if kind == "scout" else None,
-                    capture_spacing_m=fleet.spec.capture_spacing_m)
+                    capture_spacing_m=fleet.spec.capture_spacing_m,
+                    lane_model=mm.lane_model_for(settings.twin_mavlink_mode, settings.twin_params_file.parent))
                 if report["errors"] and not report["drones"]:
                     raise HTTPException(502, f"MAVLink execution failed: {report['errors']}")
             else:
@@ -708,8 +709,10 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
         out = {}
         for k, (d_id, a) in enumerate(plan.assignments.items()):
             if a.tasks:
-                mission = mm.compile_mission(a, fleet.frame, transit_alt=14.0 + 2.0 * k, home=homes[d_id])
-                out[d_id] = {"items": len(mission.items), "spray_speed_m_s": mission.spray_speed,
+                mission = mm.compile_mission(
+                    a, fleet.frame, transit_alt=14.0 + 2.0 * k, home=homes[d_id],
+                    lane_model=mm.lane_model_for(settings.twin_mavlink_mode, settings.twin_params_file.parent))
+                out[d_id] = {"items": len(mission.items), "pump_pwm": mission.spray_pwm,
                              "waypoints": mm.to_qgc_wpl(mission)}
         return {"kind": req.kind, "missions": out, "unassigned": [t.task_id for t in plan.unassigned]}
 

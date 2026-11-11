@@ -5,21 +5,25 @@ Execute fleet plans on MAVLink vehicles: ArduCopter SITL, the in-repo
 emulator (sim_vehicle.py) or real aircraft.
 
 * ``compile_mission``   Assignment -> MAVLink mission items
-                        (takeoff, waypoints, DO_SET_SERVO spray on/off,
-                        DO_CHANGE_SPEED for variable-rate dosing, RTL)
+                        (takeoff, waypoints, DO_SET_SERVO pump rate per zone,
+                        DO_CHANGE_SPEED, RTL)
 * ``to_qgc_wpl``        the same mission as a QGC WPL 110 / Mission Planner file
 * ``VehicleLink``       GCS side of the MAVLink mission protocol: upload,
                         GUIDED + arm + takeoff, AUTO, monitor until landed
 * ``execute_plan_mavlink``  fly a whole fleet Plan in parallel and return a
                         report in the same shape as ``Fleet.execute``
 
-Variable-rate spraying: a mission can only switch the pump on/off, so the
-planned dose is set by ground speed instead. With a fixed pump flow F (kg/s),
-lanes of total length L, n lanes and a per-lane-end settling time t_v, a
-dose D needs  D / F = L / v + n t_v,  i.e.  v = L / (D / F - n t_v), clamped to
-the airframe's range. The pump runs along the lanes only and is switched off
-on the headland turns between them, as on real spray drones. The realised dose is measured from telemetry (pump-on
-time x flow) and reported next to the plan as ``applied_kg``.
+Variable-rate spraying is done with the pump, as on real spray drones: the
+pump runs along the spray lanes only (off on the headland turns), and its
+PWM sets the flow, F = F_max (pwm - 1100) / 800. The zone's dose D then needs
+F = D / sum(t_lane), with each lane's pump-on time predicted by a
+``LaneTimeModel`` (t = L / v_eff + t0) fitted from flights on the actual
+target (scripts/calibrate_spray_timing.py). Commanding ground speed does not
+work for this: on ArduCopter SITL 20 m lanes flew at ~3.1 m/s mean (4.4 m/s
+peak) whatever DO_CHANGE_SPEED asked for, because waypoint navigation is
+acceleration- and jerk-limited and stops at each lane end. The realised dose
+is measured from telemetry (pump-on time x flow from SERVO_OUTPUT_RAW PWM) and
+reported next to the plan as ``applied_kg``.
 
 Instance i of ArduPilot SITL (``sim_vehicle.py -v ArduCopter -I i``) listens on
 tcp:127.0.0.1:5760 + 10 * i, which is the default connection here.
@@ -31,6 +35,7 @@ import os
 
 os.environ.setdefault("MAVLINK20", "1")   # ArduPilot speaks MAVLink 2 (servo9+, mission_type)
 
+import json
 import math
 import threading
 import time
@@ -48,14 +53,9 @@ mavlink = mavutil.mavlink
 SPRAY_SERVO = 9          # ArduPilot SERVOn_FUNCTION = 22 (SprayerPump) on this channel
 SPRAY_PWM_ON = 1900
 SPRAY_PWM_OFF = 1100
+SPRAY_PWM_MIN_ON = 1150      # lowest PWM that still counts as pumping
 CRUISE_SPEED_M_S = 5.0
-MIN_SPRAY_SPEED_M_S = 1.0
-MAX_SPRAY_SPEED_M_S = 8.0
-# Pump-on time lost at each spray-path vertex while the autopilot settles on the
-# waypoint (tracking lag ~ speed / position gain). Fitted on the emulator's
-# flight physics; re-fit for ArduPilot from the planned vs applied_kg the
-# mission report gives.
-VERTEX_DWELL_S = 1.6
+SPRAY_SPEED_M_S = 5.0        # commanded along spray lanes (see module docstring)
 
 COPTER_MODES = {v: k for k, v in mavutil.mode_mapping_acm.items()}   # "AUTO" -> 3
 
@@ -81,7 +81,7 @@ class MissionItem:
 class CompiledMission:
     drone_id: str
     items: List[MissionItem]           # items[0] is the home placeholder (ArduPilot convention)
-    spray_speed: Dict[str, float] = field(default_factory=dict)
+    spray_pwm: Dict[str, int] = field(default_factory=dict)
     spray_span: Dict[str, Tuple[int, int]] = field(default_factory=dict)  # first pump-on .. last pump-off seq
 
     def task_ranges(self) -> Dict[str, Tuple[int, int]]:
@@ -98,28 +98,76 @@ def spray_lanes(task: Task) -> List[Tuple[Tuple[float, float], Tuple[float, floa
     return [(task.legs[k], task.legs[k + 1]) for k in range(0, len(task.legs) - 1, 2)]
 
 
-def spray_speed_for(task: Task, flow_kg_s: float = SPRAY_RATE_KG_S,
-                    vertex_dwell_s: float = VERTEX_DWELL_S) -> float:
-    """Ground speed that applies task.payload_kg along the task's spray lanes."""
+@dataclass
+class LaneTimeModel:
+    """Pump-on time of one spray lane of length L: t = L / v_eff + t0 (seconds)."""
+    v_eff_m_s: float
+    t0_s: float
+    source: str = "default"
+
+    def lane_s(self, length_m: float) -> float:
+        return length_m / self.v_eff_m_s + self.t0_s
+
+    def to_json(self, path) -> None:
+        from pathlib import Path
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(json.dumps(self.__dict__, indent=2), encoding="utf-8")
+
+    @classmethod
+    def from_json(cls, path) -> "LaneTimeModel":
+        from pathlib import Path
+        return cls(**json.loads(Path(path).read_text(encoding="utf-8")))
+
+
+# Fitted with scripts/calibrate_spray_timing.py: 8 serpentine lanes of 10-60 m
+# with 5 m headland turns, flown at SPRAY_SPEED_M_S = 5 m/s with the pump on.
+# ArduCopter SITL (stock copter params) loses ~1 s more per lane than the
+# emulator to its jerk-limited acceleration and stop at each lane end.
+LANE_MODELS: Dict[str, LaneTimeModel] = {
+    "emulated": LaneTimeModel(5.13, 1.32, "emulated: fitted, RMSE 0.23 s"),
+    "sitl": LaneTimeModel(5.20, 2.37, "ArduCopter SITL: fitted, RMSE 0.16 s"),
+}
+
+
+def lane_model_for(mode: str, calibration_dir=None) -> LaneTimeModel:
+    """A re-fitted outputs/calibration/spray_timing_<mode>.json wins over the defaults."""
+    if calibration_dir is not None:
+        from pathlib import Path
+        path = Path(calibration_dir) / f"spray_timing_{mode}.json"
+        if path.exists():
+            return LaneTimeModel.from_json(path)
+    return LANE_MODELS.get(mode, LANE_MODELS["sitl"])
+
+
+def pwm_for_flow(frac: float) -> int:
+    return int(round(SPRAY_PWM_OFF + 800 * min(1.0, max(0.0, frac))))
+
+
+def flow_frac_from_pwm(pwm: float) -> float:
+    return 0.0 if pwm < SPRAY_PWM_MIN_ON else min(1.0, (pwm - SPRAY_PWM_OFF) / 800.0)
+
+
+def spray_pwm_for(task: Task, lanes_model: LaneTimeModel,
+                  flow_kg_s: float = SPRAY_RATE_KG_S) -> Tuple[int, float]:
+    """(pump PWM, expected pump-on seconds) applying task.payload_kg over its lanes."""
     lanes = spray_lanes(task)
     if task.payload_kg <= 0 or not lanes:
-        return CRUISE_SPEED_M_S
-    lane_m = sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in lanes)
-    moving_s = task.payload_kg / flow_kg_s - len(lanes) * vertex_dwell_s
-    if moving_s <= lane_m / MAX_SPRAY_SPEED_M_S:
-        return MAX_SPRAY_SPEED_M_S   # dose too small to reach even at top speed: least overspray
-    v = lane_m / moving_s
-    return float(min(MAX_SPRAY_SPEED_M_S, max(MIN_SPRAY_SPEED_M_S, v)))
+        return SPRAY_PWM_OFF, 0.0
+    on_s = sum(lanes_model.lane_s(math.hypot(b[0] - a[0], b[1] - a[1])) for a, b in lanes)
+    frac = task.payload_kg / (flow_kg_s * on_s)
+    return max(SPRAY_PWM_MIN_ON, pwm_for_flow(frac)), on_s
 
 
 def compile_mission(assignment: Assignment, frame: LocalFrame, transit_alt: float = 14.0,
-                    home: Optional[Tuple[float, float]] = None) -> CompiledMission:
+                    home: Optional[Tuple[float, float]] = None,
+                    lane_model: Optional[LaneTimeModel] = None) -> CompiledMission:
     """Assignment -> mission items in the drone's own home frame."""
+    lane_model = lane_model or LANE_MODELS["sitl"]
     home_lat, home_lon = home if home else (frame.home_lat, frame.home_lon)
     C = mavlink
     items: List[MissionItem] = [MissionItem(C.MAV_CMD_NAV_WAYPOINT, home_lat, home_lon, 0.0)]
     items.append(MissionItem(C.MAV_CMD_NAV_TAKEOFF, home_lat, home_lon, transit_alt))
-    speeds: Dict[str, float] = {}
+    pwms: Dict[str, int] = {}
     spans: Dict[str, Tuple[int, int]] = {}
     pump = lambda pwm: MissionItem(C.MAV_CMD_DO_SET_SERVO, params=(SPRAY_SERVO, pwm, 0, 0))  # noqa: E731
 
@@ -133,11 +181,11 @@ def compile_mission(assignment: Assignment, frame: LocalFrame, transit_alt: floa
         items.append(wp(first[0], first[1], task.alt_m))
         spraying = task.kind == "spray"
         if spraying:
-            v = spray_speed_for(task)
-            speeds[task.task_id] = v
-            items.append(MissionItem(C.MAV_CMD_DO_CHANGE_SPEED, params=(1.0, v, -1.0, 0.0)))
+            on_pwm, _ = spray_pwm_for(task, lane_model)
+            pwms[task.task_id] = on_pwm
+            items.append(MissionItem(C.MAV_CMD_DO_CHANGE_SPEED, params=(1.0, SPRAY_SPEED_M_S, -1.0, 0.0)))
             span_lo = len(items)
-            items.append(pump(SPRAY_PWM_ON))              # first lane starts at legs[0]
+            items.append(pump(on_pwm))                    # first lane starts at legs[0]
         for j, pt in enumerate(task.legs[1:], start=1):
             items.append(wp(pt[0], pt[1], task.alt_m, task_id=task.task_id, kind=task.kind,
                             last_of_task=(j == len(task.legs) - 1)))
@@ -146,7 +194,7 @@ def compile_mission(assignment: Assignment, frame: LocalFrame, transit_alt: floa
                 if lane_end:
                     items.append(pump(SPRAY_PWM_OFF))     # headland turn: pump off
                 elif j < len(task.legs) - 1:
-                    items.append(pump(SPRAY_PWM_ON))      # next lane starts here
+                    items.append(pump(on_pwm))            # next lane starts here
         if spraying:
             if items[-1].command != C.MAV_CMD_DO_SET_SERVO or items[-1].params[1] != SPRAY_PWM_OFF:
                 items.append(pump(SPRAY_PWM_OFF))
@@ -155,7 +203,7 @@ def compile_mission(assignment: Assignment, frame: LocalFrame, transit_alt: floa
         last = task.legs[-1]
         items.append(wp(last[0], last[1], transit_alt))
     items.append(MissionItem(C.MAV_CMD_NAV_RETURN_TO_LAUNCH))
-    return CompiledMission(assignment.drone_id, items, speeds, spans)
+    return CompiledMission(assignment.drone_id, items, pwms, spans)
 
 
 def to_qgc_wpl(mission: CompiledMission) -> str:
@@ -188,6 +236,22 @@ class VehicleLink:
     def wait_heartbeat(self) -> None:
         if self.master.wait_heartbeat(timeout=self.timeout_s) is None:
             raise MavlinkError(f"No heartbeat on {self.connection}")
+        self.request_streams()
+
+    def request_streams(self, hz: float = 10.0) -> None:
+        """
+        ArduPilot only streams telemetry a GCS asks for. Request the messages
+        the link uses, both the legacy way (all streams) and per message.
+        """
+        m = self.master
+        m.mav.request_data_stream_send(m.target_system, m.target_component,
+                                       mavlink.MAV_DATA_STREAM_ALL, int(hz), 1)
+        for msg_id, rate in ((mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT, hz),
+                             (mavlink.MAVLINK_MSG_ID_MISSION_CURRENT, 2.0),
+                             (mavlink.MAVLINK_MSG_ID_SERVO_OUTPUT_RAW, 2.0)):
+            m.mav.command_long_send(m.target_system, m.target_component,
+                                    mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
+                                    msg_id, int(1e6 / rate), 0, 0, 0, 0, 0)
 
     def _recv(self, types, timeout: Optional[float] = None, cond: Optional[Callable] = None):
         deadline = time.monotonic() + (timeout or self.timeout_s)
@@ -229,18 +293,52 @@ class VehicleLink:
             raise MavlinkError(f"Vehicle did not enter {name}")
 
     # ----------------------------------------------------------- mission
-    def upload(self, mission: CompiledMission) -> None:
+    def upload(self, mission: CompiledMission, retry_s: float = 60.0) -> None:
+        """
+        Upload with retries. Seen on ArduCopter SITL right after boot:
+        MAV_MISSION_NO_SPACE / ERROR while mission storage initialises, and
+        INVALID_SEQUENCE when a retry answered MISSION_REQUESTs left over from
+        the previous attempt. Each attempt therefore starts by draining stale
+        messages, and only answers requests for the current transfer.
+        """
+        deadline = time.monotonic() + retry_s
+        while True:
+            try:
+                self._drain()
+                return self._upload_once(mission)
+            except MavlinkError as e:
+                retryable = any(k in str(e) for k in (" NO_SPACE)", " ERROR)", " INVALID_SEQUENCE)",
+                                                      " OPERATION_CANCELLED)", "timed out"))
+                if not retryable or time.monotonic() > deadline:
+                    raise
+                time.sleep(2.0)
+
+    def _drain(self, quiet_s: float = 0.5) -> None:
+        """Discard buffered messages (e.g. requests from an abandoned upload)."""
+        end = time.monotonic() + 5.0
+        while time.monotonic() < end:
+            if self.master.recv_match(blocking=True, timeout=quiet_s) is None:
+                return
+
+    def _upload_once(self, mission: CompiledMission) -> None:
         m = self.master
         items = mission.items
         m.mav.mission_count_send(m.target_system, m.target_component, len(items),
                                  mavlink.MAV_MISSION_TYPE_MISSION)
+        expected = 0
         while True:
-            msg = self._recv(["MISSION_REQUEST_INT", "MISSION_REQUEST", "MISSION_ACK"])
+            msg = self._recv(["MISSION_REQUEST_INT", "MISSION_REQUEST", "MISSION_ACK"], timeout=10.0)
             if msg is None:
                 raise MavlinkError("Mission upload timed out")
+            if msg.get_type() != "MISSION_ACK" and (msg.seq > expected or msg.seq >= len(items)):
+                continue   # not part of this transfer
+            if msg.get_type() != "MISSION_ACK":
+                expected = max(expected, msg.seq + 1)
             if msg.get_type() == "MISSION_ACK":
                 if msg.type != mavlink.MAV_MISSION_ACCEPTED:
-                    raise MavlinkError(f"Mission rejected (MAV_MISSION_RESULT {msg.type})")
+                    name = mavlink.enums["MAV_MISSION_RESULT"].get(msg.type)
+                    raise MavlinkError(f"Mission rejected (MAV_MISSION_RESULT {msg.type}"
+                                       f"{' ' + name.name.replace('MAV_MISSION_', '') if name else ''})")
                 return
             it = items[msg.seq]
             m.mav.mission_item_int_send(
@@ -253,7 +351,7 @@ class VehicleLink:
         """
         GUIDED -> arm -> takeoff -> AUTO, then monitor until the vehicle has
         landed and disarmed after RTL (or ``max_flight_s`` wall seconds).
-        ``on_position(lat, lon, rel_alt_m, seq, spraying, t_s)`` is called for
+        ``on_position(lat, lon, rel_alt_m, seq, pump_frac, t_s)`` is called for
         every GLOBAL_POSITION_INT; ``t_s`` is the vehicle's boot time, so tracks
         keep simulated time even when SITL runs faster than real time.
         """
@@ -266,7 +364,7 @@ class VehicleLink:
         self.set_mode("AUTO")
 
         reached: List[int] = []
-        seq, spraying, armed, airborne_seen = 1, False, True, False
+        seq, pump_frac, armed, airborne_seen = 1, 0.0, True, False
         n_pos = 0
         t0 = time.monotonic()
         while time.monotonic() - t0 < max_flight_s:
@@ -282,7 +380,7 @@ class VehicleLink:
             elif t == "MISSION_CURRENT":
                 seq = msg.seq
             elif t == "SERVO_OUTPUT_RAW":
-                spraying = getattr(msg, f"servo{SPRAY_SERVO}_raw", 0) > 1500
+                pump_frac = flow_frac_from_pwm(getattr(msg, f"servo{SPRAY_SERVO}_raw", 0))
             elif t == "HEARTBEAT" and msg.get_srcSystem() == self.master.target_system:
                 armed = bool(msg.base_mode & mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
                 if not armed and airborne_seen:
@@ -292,7 +390,7 @@ class VehicleLink:
                 airborne_seen = airborne_seen or rel > 1.0
                 n_pos += 1
                 if on_position is not None:
-                    on_position(msg.lat / 1e7, msg.lon / 1e7, rel, seq, spraying, msg.time_boot_ms / 1000.0)
+                    on_position(msg.lat / 1e7, msg.lon / 1e7, rel, seq, pump_frac, msg.time_boot_ms / 1000.0)
         return {"reached": reached, "landed": not armed, "positions": n_pos,
                 "wall_s": round(time.monotonic() - t0, 2)}
 
@@ -313,6 +411,7 @@ def execute_plan_mavlink(
     capture_spacing_m: float = 5.0,
     timeout_s: float = 60.0,
     max_flight_s: float = 1800.0,
+    lane_model: Optional[LaneTimeModel] = None,
 ) -> Dict[str, Any]:
     """
     Fly every assignment of ``plan`` on its MAVLink vehicle in parallel.
@@ -326,19 +425,19 @@ def execute_plan_mavlink(
 
     def run(drone_id: str, assignment: Assignment, k: int) -> None:
         mission = compile_mission(assignment, frame, transit_alt=14.0 + 2.0 * k,
-                                  home=(homes or {}).get(drone_id))
+                                  home=(homes or {}).get(drone_id), lane_model=lane_model)
         ranges = mission.task_ranges()
         kind_of = {seq: (it.task_id, it.kind) for seq, it in enumerate(mission.items) if it.kind}
         spray_span = mission.spray_span   # pump time is attributed to the task flying it
-        state = {"last": None, "since": 0.0, "dist": 0.0, "captures": 0, "spray_s": {},
-                 "t_last": None, "track": []}
+        state = {"last": None, "since": 0.0, "dist": 0.0, "captures": 0, "spray_kg": {},
+                 "pump_s": {}, "t_last": None, "track": []}
         link = None
         try:
             link = VehicleLink(connections[drone_id], timeout_s=timeout_s)
             link.wait_heartbeat()
             link.upload(mission)
 
-            def on_position(lat, lon, alt, seq, spraying, now):
+            def on_position(lat, lon, alt, seq, pump_frac, now):
                 x, y = frame.to_local(lat, lon)
                 if state["last"] is not None:
                     step = math.hypot(x - state["last"][0], y - state["last"][1])
@@ -351,13 +450,16 @@ def execute_plan_mavlink(
                             state["captures"] += 1
                             if on_capture is not None:
                                 on_capture(drone_id, lat, lon, alt)
-                if spraying and state["t_last"] is not None:
+                if pump_frac > 0 and state["t_last"] is not None:
+                    dt = now - state["t_last"]
                     for tid, (lo, hi) in spray_span.items():
                         if lo <= seq <= hi:
-                            state["spray_s"][tid] = state["spray_s"].get(tid, 0.0) + (now - state["t_last"])
+                            state["pump_s"][tid] = state["pump_s"].get(tid, 0.0) + dt
+                            state["spray_kg"][tid] = state["spray_kg"].get(tid, 0.0) \
+                                + dt * pump_frac * SPRAY_RATE_KG_S
                 state["t_last"] = now
                 state["last"] = (x, y)
-                state["track"].append([round(now, 2), lat, lon, round(alt, 2), int(bool(spraying))])
+                state["track"].append([round(now, 2), lat, lon, round(alt, 2), int(pump_frac > 0)])
 
             flown = link.fly(mission, on_position, max_flight_s=max_flight_s)
             done = [tid for tid, (_, hi) in ranges.items() if hi in flown["reached"]]
@@ -366,10 +468,10 @@ def execute_plan_mavlink(
                 if task.kind == "spray" and task.task_id in done:
                     sprays.append({"zone_id": task.zone_id, "type": "Fungicide Spray", "drone_id": drone_id,
                                    "planned_kg": round(task.payload_kg, 3),
-                                   # measured from telemetry: pump-on time x pump flow
-                                   "applied_kg": round(state["spray_s"].get(task.task_id, 0.0)
-                                                       * SPRAY_RATE_KG_S, 3),
-                                   "spray_speed_m_s": round(mission.spray_speed[task.task_id], 2)})
+                                   # measured from telemetry: pump-on time x flow(PWM)
+                                   "applied_kg": round(state["spray_kg"].get(task.task_id, 0.0), 3),
+                                   "pump_pwm": mission.spray_pwm[task.task_id],
+                                   "pump_on_s": round(state["pump_s"].get(task.task_id, 0.0), 2)})
             t0 = state["track"][0][0] if state["track"] else 0.0
             with lock:
                 report["drones"][drone_id] = {

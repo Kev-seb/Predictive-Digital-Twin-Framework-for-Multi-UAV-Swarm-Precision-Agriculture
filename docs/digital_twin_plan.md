@@ -100,14 +100,21 @@ Coverage near 1.0 means the twin's uncertainty is honest, if slightly conservati
   - Alpha stays the primary drone, linked to MAVLink telemetry and waypoint missions.
   - The two-operator multiplayer roles (`operator_alpha` / `operator_beta`) are unchanged.
 
-### Phase 4: Close the loop (done in simulation and over MAVLink; real SITL run pending)
+### Phase 4: Close the loop ✅ (done: simulation, emulator and ArduCopter SITL)
 - [x] Closed loop in simulation: scout → assimilate → spray the zones the twin flags → completed sprays become interventions on the next simulated day, for both the hidden field and the twin (`/sim/mission` + `/sim/advance`).
 - [x] Execute the same plans over MAVLink (`src/twin_core/mavlink_mission.py`; guide in `docs/sitl.md`):
-  - **Mission compiler:** takeoff, waypoints, and the sprayer pump on servo 9, on along lanes and off on headland turns. `DO_CHANGE_SPEED` sets a variable-rate dose; the report gives `applied_kg` measured from telemetry next to `planned_kg`.
-  - **Ground-station link:** mission upload protocol, GUIDED → arm (retried through SITL pre-arm checks) → takeoff → AUTO → RTL, land and disarm. Camera captures come from `GLOBAL_POSITION_INT`.
-  - **In-repo MAVLink vehicle emulator** on the 6-DOF physics, so the whole path is tested here: 2 drones fly scout and spray missions end to end, and the dose lands within about 10% of plan.
-  - **API:** `/sim/mission` with `"backend": "mavlink"`, `/swarm/sitl-homes`, and `/swarm/mission-files` (`.waypoints` for QGC / Mission Planner). `scripts/sitl_fleet.py` launches one ArduCopter SITL per drone.
-- [ ] Run against real ArduCopter SITL. Building ArduPilot was not permitted in the development sandbox; follow `docs/sitl.md` and re-fit `VERTEX_DWELL_S` from the planned vs. applied dose.
+  - **Mission compiler:** takeoff, waypoints, and the sprayer pump on servo 9, on along lanes and off on headland turns. The pump PWM per zone sets a variable-rate dose from a fitted lane-time model; the report gives `applied_kg` measured from telemetry next to `planned_kg`.
+  - **Ground-station link:** mission upload protocol with boot-time retries, telemetry stream requests, GUIDED → arm → takeoff → AUTO → RTL, land and disarm. Camera captures come from `GLOBAL_POSITION_INT`.
+  - **In-repo MAVLink vehicle emulator** on the 6-DOF physics, for tests anywhere.
+  - **API:** `/sim/mission` with `"backend": "mavlink"`, `/swarm/sitl-homes`, and `/swarm/mission-files` (`.waypoints`). `scripts/sitl_fleet.py` launches one ArduCopter SITL per drone; `scripts/calibrate_spray_timing.py` fits pump timing.
+- [x] **Verified on ArduCopter SITL** (built from ArduPilot `master`), 3 instances driven over HTTP:
+  - the scout fed 166 frames into the twin, and fungus RMSE fell from 0.076 to 0.044
+  - the twin-triggered spray applied 2.75 kg against 2.72 kg planned
+  - the next day's assimilated state reached fungus RMSE 0.023
+- Real-ArduPilot issues found and fixed:
+  - telemetry must be requested
+  - `NO_SPACE` and `INVALID_SEQUENCE` uploads right after boot
+  - jerk-limited lanes defeat dosing by speed, so dosing is by pump rate instead: overdose went from +21–61% to +1–3%
 - [ ] Compare the outcome after the mission against the `what_if` prediction.
 
 Results are reported under Phase 5, after model calibration.

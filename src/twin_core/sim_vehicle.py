@@ -13,7 +13,8 @@ AUTO, telemetry) can be tested without building ArduPilot:
   * mission upload protocol (MISSION_COUNT / MISSION_REQUEST_INT / MISSION_ITEM_INT / MISSION_ACK)
   * SET_MODE, COMMAND_LONG: ARM_DISARM, NAV_TAKEOFF, DO_SET_MODE, MISSION_START
   * AUTO: NAV_TAKEOFF, NAV_WAYPOINT (carrot following at the commanded speed),
-    DO_CHANGE_SPEED, DO_SET_SERVO (sprayer pump on servo 9), NAV_RETURN_TO_LAUNCH
+    DO_CHANGE_SPEED, DO_SET_SERVO (sprayer pump on servo 9, flow proportional
+    to PWM above 1100 us), NAV_RETURN_TO_LAUNCH
   * RTL -> LAND -> automatic disarm on touchdown, like ArduCopter
   * GLOBAL_POSITION_INT 10 Hz, MISSION_CURRENT, MISSION_ITEM_REACHED,
     SERVO_OUTPUT_RAW, SYS_STATUS, COMMAND_ACK
@@ -101,7 +102,12 @@ class EmulatedCopter:
             self._drain()
             self._control()
             if self.armed:
+                payload = float(self.sim.payload_mass)
                 self.sim.step(self.dt)
+                if self.sim.is_spraying:
+                    # Physics drains at full pump flow; scale to the PWM-set flow.
+                    used = payload - float(self.sim.payload_mass)
+                    self.sim.payload_mass = payload - used * self._pump_frac()
                 if self.sim.pos[2] <= 0.0 and self.mode in ("LAND", "RTL") and self.rtl_phase == "land":
                     self._disarm()
             self.t += self.dt
@@ -233,8 +239,7 @@ class EmulatedCopter:
 
     def _control(self) -> None:
         self.sim.autopilot_mode = "stabilized"
-        self.sim.is_spraying = self.armed and self.servo.get(SPRAY_SERVO, 1100) > 1500 \
-            and self.sim.payload_mass > 0.0
+        self.sim.is_spraying = self.armed and self._pump_frac() > 0.0 and self.sim.payload_mass > 0.0
         if not self.armed:
             return
         if self.mode == "GUIDED" and self.guided_target is not None:
@@ -245,6 +250,10 @@ class EmulatedCopter:
             self._rtl()
         else:
             self.sim.target_pos = self.sim.pos.copy()
+
+    def _pump_frac(self) -> float:
+        pwm = self.servo.get(SPRAY_SERVO, 1100)
+        return 0.0 if pwm < 1150 else min(1.0, (pwm - 1100) / 800.0)
 
     def _item_done(self) -> None:
         self.conn.mav.mission_item_reached_send(self.cur)

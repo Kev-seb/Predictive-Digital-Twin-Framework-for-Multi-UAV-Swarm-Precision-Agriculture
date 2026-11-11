@@ -47,24 +47,39 @@ def test_compile_mission_structure(grid):
     cmds = [it.command for it in m.items]
     assert cmds[1] == C.MAV_CMD_NAV_TAKEOFF and cmds[-1] == C.MAV_CMD_NAV_RETURN_TO_LAUNCH
     pumps = [it.params[1] for it in m.items if it.command == C.MAV_CMD_DO_SET_SERVO]
-    assert pumps == [mm.SPRAY_PWM_ON, mm.SPRAY_PWM_OFF] * 3          # one on/off pair per lane
+    on_pwm = m.spray_pwm["spray-z3"]
+    assert mm.SPRAY_PWM_OFF < on_pwm <= mm.SPRAY_PWM_ON
+    assert pumps == [on_pwm, mm.SPRAY_PWM_OFF] * 3                    # one on/off pair per lane
     assert all(it.params[0] == mm.SPRAY_SERVO for it in m.items if it.command == C.MAV_CMD_DO_SET_SERVO)
     lo, hi = m.spray_span["spray-z3"]
-    assert m.items[lo].params[1] == mm.SPRAY_PWM_ON and m.items[hi].params[1] == mm.SPRAY_PWM_OFF
+    assert m.items[lo].params[1] == on_pwm and m.items[hi].params[1] == mm.SPRAY_PWM_OFF
     assert set(m.task_ranges()) == {"scout-z0", "spray-z3"}
     wpl = mm.to_qgc_wpl(m).splitlines()
     assert wpl[0] == "QGC WPL 110" and len(wpl) == len(m.items) + 1
     assert wpl[1].split("\t")[1] == "1"                              # home flagged as current
 
 
-def test_spray_speed_slows_for_bigger_doses():
+def test_pump_pwm_scales_with_dose_and_lane_model():
     t = _spray_task()
-    speeds = []
-    for dose in (0.5, 1.0, 2.0, 4.0, 40.0):
+    model = mm.LaneTimeModel(5.0, 2.0)
+    pwms = []
+    for dose in (0.1, 0.5, 1.0, 1.5, 40.0):
         t.payload_kg = dose
-        speeds.append(mm.spray_speed_for(t))
-    assert speeds == sorted(speeds, reverse=True)
-    assert speeds[0] == mm.MAX_SPRAY_SPEED_M_S and speeds[-1] == mm.MIN_SPRAY_SPEED_M_S
+        pwm, on_s = mm.spray_pwm_for(t, model)
+        pwms.append(pwm)
+    assert on_s == pytest.approx(3 * (20.0 / 5.0 + 2.0))               # 3 lanes of 20 m
+    assert pwms == sorted(pwms) and pwms[-1] == mm.SPRAY_PWM_ON          # capped at full flow
+    t.payload_kg = 1.0
+    pwm, on_s = mm.spray_pwm_for(t, model)
+    assert mm.flow_frac_from_pwm(pwm) * mm.SPRAY_RATE_KG_S * on_s == pytest.approx(1.0, rel=0.01)
+    assert mm.flow_frac_from_pwm(mm.SPRAY_PWM_OFF) == 0.0
+
+
+def test_lane_model_file_overrides_default(tmp_path):
+    assert mm.lane_model_for("sitl") == mm.LANE_MODELS["sitl"]
+    mm.LaneTimeModel(4.2, 3.3, "test").to_json(tmp_path / "spray_timing_sitl.json")
+    m = mm.lane_model_for("sitl", tmp_path)
+    assert (m.v_eff_m_s, m.t0_s) == (4.2, 3.3)
 
 
 def test_emulator_rejects_takeoff_outside_guided():
@@ -97,7 +112,8 @@ def test_fleet_flies_scout_and_spray_over_mavlink(grid):
     captures = []
     try:
         rep = mm.execute_plan_mavlink(plan, fleet.frame, emu.connections, homes=homes,
-                                      on_capture=lambda *a: captures.append(a), timeout_s=10)
+                                      on_capture=lambda *a: captures.append(a), timeout_s=10,
+                                      lane_model=mm.LANE_MODELS["emulated"])
     finally:
         emu.stop()
     assert rep["errors"] == {}
@@ -108,7 +124,7 @@ def test_fleet_flies_scout_and_spray_over_mavlink(grid):
     assert len(captures) > 20
     assert {s["zone_id"] for s in rep["completed_sprays"]} == {t.zone_id for t in tasks if t.kind == "spray"}
     for s in rep["completed_sprays"]:
-        assert s["applied_kg"] == pytest.approx(s["planned_kg"], rel=0.25)
+        assert s["applied_kg"] == pytest.approx(s["planned_kg"], rel=0.15)
     for d_id, v in emu.vehicles.items():
         assert not v.armed and v.sim.pos[2] < 0.5                      # landed and disarmed
     for track in rep["track"].values():
