@@ -480,17 +480,39 @@ python digital_twin_api.py
 
 API available at **http://127.0.0.1:8008/docs** (Swagger UI).
 
-Key endpoints:
+The API is backed by `src/twin_core`, the single source of truth for the simulated
+paddy field: a georeferenced 40 × 40 grid (2.5 m cells, ~1 ha) holding a mean and a
+variance for NDVI, stress, moisture, nitrogen and fungus. The twin advances with the
+agronomic simulator (predict) and is corrected by observations through a per-cell
+Kalman filter (assimilate). State persists to `outputs/twin_core/<field_id>/`.
+Ports, grid size and field id are set in `src/config/config.py` (env prefix `UAV_`).
+See [`docs/digital_twin_plan.md`](docs/digital_twin_plan.md) for the roadmap.
+
+UE5 endpoints (20 × 20 HISM grid, resampled from the twin):
 
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/` | Health check |
-| `POST` | `/field/update` | Receive per-instance state from UE5 |
-| `GET` | `/field/status` | Full 400-instance field state |
-| `GET` | `/field/heatmap` | NDVI grid as 20 × 20 list |
-| `GET` | `/field/anomalies` | Instances with NDVI drop above threshold |
-| `GET` | `/field/summary` | Aggregated field statistics |
-| `DELETE` | `/field/reset` | Reset all instances to defaults |
+| `POST` | `/field/update` | UE5 pushes per-instance state; assimilated as `ue5` observations |
+| `GET` | `/field/status` | Full 400-instance field state (with `ndvi_std` / `stress_std`) |
+| `GET` | `/field/heatmap` | NDVI, stress and uncertainty grids (20 × 20) |
+| `GET` | `/field/anomalies` | Cells with stress > 0.7 or NDVI drop > 0.15 |
+| `GET` | `/field/summary` | Aggregated field statistics + recent daily history |
+| `DELETE` | `/field/reset` | Reset the twin to its prior |
+
+Twin endpoints:
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/twin/state` | Summary, per-layer uncertainty and per-zone values |
+| `GET` | `/twin/layers/{layer}` | One layer (`mean` / `var` / `std`) at any resolution |
+| `POST` | `/twin/step` | Advance N days with weather and zone interventions |
+| `POST` | `/twin/observe/point` | Assimilate a geotagged reading (scout, drone camera) |
+| `POST` | `/twin/observe/grid` | Assimilate a raster (multispectral survey) |
+| `POST` | `/twin/what-if` | Compare interventions vs. doing nothing on a forked twin |
+| `POST` | `/twin/stage` | Set the paddy growth stage |
+| `GET` | `/twin/history`, `/twin/events` | Daily history and event log |
+| `WS` | `/ws/twin` | Live event stream for UE5 and the three.js view |
 
 ### 5.4 Run the Mobile API (companion app backend)
 

@@ -1,53 +1,59 @@
 """
 digital_twin_api.py
 ================================================================
-FastAPI backend for the UE5 Paddy Field Digital Twin.
-Runs on http://127.0.0.1:8000
+FastAPI service for the paddy field digital twin (src/twin_core).
 
-Endpoints:
-  GET  /                          Health check
-  POST /field/update              Receive per-instance state from UE5
-  GET  /field/status              Full current field state (all 400)
-  GET  /field/instance/{index}    Single instance record
-  GET  /field/summary             Aggregated field statistics
-  GET  /field/anomalies           Instances with NDVI drop > threshold
-  GET  /field/heatmap             NDVI grid as 2D list (20x20)
-  DELETE /field/reset             Reset all state to defaults
-  GET  /docs                      Auto-generated Swagger UI
+The twin core is the single source of truth. UE5 and the three.js
+dashboard are views onto it; UE5 can also push rendered field values
+back, which are assimilated as observations (source = "ue5").
 
-HARD CONSTRAINTS:
-  - This file is NEVER read or written by UE5 Python scripts.
-    UE5 communicates only via HTTP.
-  - Never touches Phase A lighting, BP_FieldDataController,
-    HISM component, or M_RiceCrop material.
+Runs on http://127.0.0.1:8008 by default (see UAV_TWIN_API_PORT).
+
+UE5-compatible routes (20 x 20 HISM grid, unchanged contract):
+  GET    /                         Health check
+  POST   /field/update             UE5 pushes per-instance state -> assimilated
+  GET    /field/status             All 400 instances
+  GET    /field/instance/{index}   Single instance
+  GET    /field/summary            Aggregated statistics + recent history
+  GET    /field/anomalies          Recent anomaly events
+  GET    /field/heatmap            NDVI / stress (+ uncertainty) grids
+  DELETE /field/reset              Reset the twin to its prior
+
+Twin routes:
+  GET    /twin/state               Full summary + per-zone values
+  GET    /twin/layers/{layer}      One layer (mean or var) at any resolution
+  POST   /twin/step                Advance the simulation N days
+  POST   /twin/observe/point       Assimilate a geotagged reading
+  POST   /twin/observe/grid        Assimilate a raster
+  POST   /twin/what-if             Compare interventions on a forked twin
+  POST   /twin/stage               Set the paddy growth stage
+  GET    /twin/history             Daily history (mean + std per layer)
+  GET    /twin/events              Recent twin events
+  WS     /ws/twin                  Live event stream (UE5 / three.js)
 ================================================================
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
-import math
-import os
-import sys
-from contextlib import asynccontextmanager
 import time
-from typing import Dict, List, Optional
+from contextlib import asynccontextmanager
+from typing import Any, Dict, List, Literal, Optional
 
+import numpy as np
 import uvicorn
-from fastapi import FastAPI, HTTPException
-from fastapi import __version__ as _fastapi_version
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-# ----------------------------------------------------------------
-# CONFIG
-# ----------------------------------------------------------------
-HOST      = "127.0.0.1"
-PORT      = 8008
-GRID_SIZE = 20
-NUM_INSTANCES = GRID_SIZE * GRID_SIZE   # always 400
+from src.config.config import settings
+from src.twin_core import LAYERS, DigitalTwin, FieldGrid
+
+UE5_GRID = settings.twin_ue5_grid
+NUM_INSTANCES = UE5_GRID * UE5_GRID
+ANOMALY_STRESS = 0.70
+ANOMALY_NDVI_DROP = 0.15
+
 
 # ----------------------------------------------------------------
 # PYDANTIC MODELS
@@ -68,274 +74,368 @@ class FieldUpdatePayload(BaseModel):
     instances: List[InstancePayload]
 
 
-class InstanceRecord(BaseModel):
-    index:          int
-    row:            int
-    col:            int
-    ndvi:           float
-    stress:         float
-    soil_moisture:  float
-    temperature_c:  float
-    last_updated:   float   # Unix timestamp
+class Intervention(BaseModel):
+    day:     int = Field(1, ge=1, description="Day relative to this request (1 = first simulated day)")
+    zone_id: int
+    type:    Literal["Fungicide Spray", "Nutrient Top-Dress", "Precision Irrigation"]
+    cost:    float = 0.0
+
+
+class StepRequest(BaseModel):
+    days:          int = Field(1, ge=1, le=120)
+    weather:       Optional[List[Dict[str, float]] | Dict[str, float]] = None
+    interventions: List[Intervention] = []
+
+
+class PointObservation(BaseModel):
+    lat:     float
+    lon:     float
+    values:  Dict[str, float]
+    source:  str = "phone_rgb"
+    obs_var: Optional[Dict[str, float]] = None
+    footprint_m:        float = Field(3.0, gt=0)
+    influence_radius_m: float = Field(8.0, gt=0)
+
+
+class GridObservation(BaseModel):
+    layer:   str
+    values:  List[List[Optional[float]]]
+    source:  str = "multispectral"
+    obs_var: Optional[float] = Field(None, gt=0)
+
+
+class WhatIfRequest(BaseModel):
+    days:          int = Field(7, ge=1, le=60)
+    weather:       Optional[List[Dict[str, float]] | Dict[str, float]] = None
+    interventions: List[Intervention] = []
+
+
+class StageRequest(BaseModel):
+    growth_stage: str
 
 
 # ----------------------------------------------------------------
-# IN-MEMORY STATE  (survives for the lifetime of this process)
-# ----------------------------------------------------------------
-_field_state: Dict[int, InstanceRecord] = {}
-_current_day: int = 0
-_anomaly_log: List[dict] = []          # recent anomaly events
-_history:     List[dict] = []          # one summary entry per simulated day
-
-
-def _init_state():
-    """Populate default state for 400 instances if empty."""
-    if _field_state:
-        return
-    t = time.time()
-    for row in range(GRID_SIZE):
-        for col in range(GRID_SIZE):
-            idx = row * GRID_SIZE + col
-            _field_state[idx] = InstanceRecord(
-                index=idx, row=row, col=col,
-                ndvi=0.85, stress=0.0,
-                soil_moisture=45.0, temperature_c=28.0,
-                last_updated=t,
-            )
-
-
-@asynccontextmanager
-async def lifespan(application: FastAPI):
-    _init_state()
-    sys.stdout.write(f"[DigitalTwinAPI] Listening on http://{HOST}:{PORT}\n")
-    sys.stdout.write(f"[DigitalTwinAPI] Swagger UI -> http://{HOST}:{PORT}/docs\n")
-    sys.stdout.write(f"[DigitalTwinAPI] {NUM_INSTANCES} field records initialized.\n")
-    sys.stdout.flush()
-    yield
-
-
-# ----------------------------------------------------------------
-# FASTAPI APP
-# ----------------------------------------------------------------
-app = FastAPI(
-    title="Paddy Field Digital Twin API",
-    description=(
-        "Real-time backend for the UE5 paddy field digital twin. "
-        "UE5 pushes per-instance NDVI + Stress after each simulated day."
-    ),
-    version="1.0.0",
-    lifespan=lifespan,
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-
-# ----------------------------------------------------------------
-# ROUTES
+# APP FACTORY
 # ----------------------------------------------------------------
 
-@app.get("/", summary="Health check")
-async def health():
-    return {
-        "status":       "ok",
-        "service":      "Paddy Field Digital Twin API",
-        "version":      "1.0.0",
-        "current_day":  _current_day,
-        "instances":    len(_field_state),
-    }
-
-
-@app.post("/field/update", summary="Receive field state from UE5")
-async def field_update(payload: FieldUpdatePayload):
-    """
-    Called by paddy_field_digital_twin.py after each simulated day.
-    Accepts up to 400 instance records, updates in-memory state,
-    and logs anomalies (stress > 0.7 or NDVI drop > 0.15).
-    """
-    global _current_day
-
-    if len(payload.instances) > NUM_INSTANCES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Too many instances: {len(payload.instances)} > {NUM_INSTANCES}"
-        )
-
-    _current_day = payload.day
-    t = time.time()
-    updated_anomalies = []
-
-    for inst in payload.instances:
-        prev = _field_state.get(inst.index)
-
-        # Anomaly: stress spike or rapid NDVI drop
-        is_anomaly = False
-        if prev:
-            ndvi_drop = prev.ndvi - inst.ndvi
-            if ndvi_drop > 0.15 or inst.stress > 0.70:
-                is_anomaly = True
-                updated_anomalies.append({
-                    "day":        payload.day,
-                    "index":      inst.index,
-                    "row":        inst.row,
-                    "col":        inst.col,
-                    "ndvi":       inst.ndvi,
-                    "stress":     inst.stress,
-                    "ndvi_drop":  round(ndvi_drop, 4),
-                    "timestamp":  t,
-                })
-
-        _field_state[inst.index] = InstanceRecord(
-            index=inst.index, row=inst.row, col=inst.col,
-            ndvi=inst.ndvi, stress=inst.stress,
-            soil_moisture=inst.soil_moisture,
-            temperature_c=inst.temperature_c,
-            last_updated=t,
-        )
-
-    # Append new anomalies (keep last 200)
-    _anomaly_log.extend(updated_anomalies)
-    if len(_anomaly_log) > 200:
-        _anomaly_log[:] = _anomaly_log[-200:]
-
-    # Daily summary snapshot
-    all_records = list(_field_state.values())
-    avg_ndvi   = sum(r.ndvi   for r in all_records) / len(all_records)
-    avg_stress = sum(r.stress for r in all_records) / len(all_records)
-    _history.append({
-        "day":        payload.day,
-        "avg_ndvi":   round(avg_ndvi,   4),
-        "avg_stress": round(avg_stress, 4),
-        "anomalies":  len(updated_anomalies),
-        "timestamp":  t,
-    })
-    if len(_history) > 365:
-        _history[:] = _history[-365:]
-
-    return {
-        "accepted":        len(payload.instances),
-        "day":             payload.day,
-        "new_anomalies":   len(updated_anomalies),
-        "avg_ndvi":        round(avg_ndvi,   4),
-        "avg_stress":      round(avg_stress, 4),
-    }
-
-
-@app.get("/field/status", summary="Full current state — all 400 instances")
-async def field_status():
-    return {
-        "day":       _current_day,
-        "instances": [r.dict() for r in _field_state.values()],
-    }
-
-
-@app.get("/field/instance/{index}", summary="Single instance record")
-async def field_instance(index: int):
-    record = _field_state.get(index)
-    if record is None:
-        raise HTTPException(status_code=404, detail=f"Instance {index} not found.")
-    return record
-
-
-@app.get("/field/summary", summary="Aggregated field statistics")
-async def field_summary():
-    if not _field_state:
-        raise HTTPException(status_code=503, detail="No field data yet.")
-
-    records = list(_field_state.values())
-    n = len(records)
-
-    ndvi_vals   = [r.ndvi   for r in records]
-    stress_vals = [r.stress for r in records]
-    moist_vals  = [r.soil_moisture for r in records]
-    temp_vals   = [r.temperature_c for r in records]
-
-    stressed = sum(1 for s in stress_vals if s > 0.5)
-    healthy  = sum(1 for s in stress_vals if s < 0.2)
-
-    return {
-        "day":             _current_day,
-        "total_instances": n,
-        "ndvi": {
-            "mean": round(sum(ndvi_vals) / n, 4),
-            "min":  round(min(ndvi_vals), 4),
-            "max":  round(max(ndvi_vals), 4),
-        },
-        "stress": {
-            "mean":           round(sum(stress_vals) / n, 4),
-            "high_count":     stressed,          # stress > 0.5
-            "healthy_count":  healthy,           # stress < 0.2
-            "pct_stressed":   round(stressed / n * 100, 1),
-        },
-        "soil_moisture": {
-            "mean": round(sum(moist_vals) / n, 4),
-            "min":  round(min(moist_vals), 4),
-            "max":  round(max(moist_vals), 4),
-        },
-        "temperature_c": {
-            "mean": round(sum(temp_vals) / n, 4),
-        },
-        "history_days": len(_history),
-        "history":      _history[-14:],   # last 14 days
-    }
-
-
-@app.get("/field/anomalies", summary="Recent anomaly events")
-async def field_anomalies(limit: int = 50):
-    return {
-        "total":     len(_anomaly_log),
-        "anomalies": _anomaly_log[-limit:],
-    }
-
-
-@app.get("/field/heatmap", summary="NDVI + Stress as 20x20 grid")
-async def field_heatmap():
-    """
-    Returns NDVI and Stress as 2D 20x20 lists.
-    Row 0 = grid row 0 (top), Column 0 = grid col 0 (left).
-    Suitable for heatmap visualisation in a browser dashboard.
-    """
-    ndvi_grid   = [[0.0] * GRID_SIZE for _ in range(GRID_SIZE)]
-    stress_grid = [[0.0] * GRID_SIZE for _ in range(GRID_SIZE)]
-
-    for r in _field_state.values():
-        ndvi_grid[r.row][r.col]   = round(r.ndvi,   4)
-        stress_grid[r.row][r.col] = round(r.stress, 4)
-
-    return {
-        "day":         _current_day,
-        "grid_size":   GRID_SIZE,
-        "ndvi_grid":   ndvi_grid,
-        "stress_grid": stress_grid,
-    }
-
-
-@app.delete("/field/reset", summary="Reset all state to defaults")
-async def field_reset():
-    global _current_day
-    _field_state.clear()
-    _anomaly_log.clear()
-    _history.clear()
-    _current_day = 0
-    _init_state()
-    return {"status": "reset", "instances": NUM_INSTANCES}
-
-
-# ----------------------------------------------------------------
-# ENTRY POINT
-# ----------------------------------------------------------------
-if __name__ == "__main__":
-    _init_state()
-    uvicorn.run(
-        "digital_twin_api:app",
-        host=HOST,
-        port=PORT,
-        reload=False,
-        log_level="info",
+def _default_twin() -> DigitalTwin:
+    grid = FieldGrid.centered_on(
+        settings.field_center_lat, settings.field_center_lon,
+        rows=settings.twin_grid_rows, cols=settings.twin_grid_cols,
+        cell_size_m=settings.twin_cell_size_m,
     )
+    return DigitalTwin.load_or_create(
+        settings.twin_field_id, settings.twin_storage_dir, grid=grid,
+        propagation_model=settings.twin_propagation_model,
+    )
+
+
+def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
+    ctx: Dict[str, Any] = {"twin": twin, "anomalies": [], "ue5_snapshot": None}
+
+    def get_twin() -> DigitalTwin:
+        if ctx["twin"] is None:
+            ctx["twin"] = _default_twin()
+        return ctx["twin"]
+
+    # ---------------- UE5-resolution helpers ----------------
+    def ue5_grids() -> Dict[str, np.ndarray]:
+        s = get_twin().state
+        return {
+            "ndvi": s.resample("ndvi", UE5_GRID, UE5_GRID),
+            "stress": s.resample("stress", UE5_GRID, UE5_GRID),
+            "moisture": s.resample("moisture", UE5_GRID, UE5_GRID),
+            "ndvi_std": np.sqrt(s.resample("ndvi", UE5_GRID, UE5_GRID, which="var")),
+            "stress_std": np.sqrt(s.resample("stress", UE5_GRID, UE5_GRID, which="var")),
+        }
+
+    def detect_anomalies() -> int:
+        """Flag UE5 cells with high stress or a sharp NDVI drop since the last check."""
+        g = ue5_grids()
+        prev = ctx["ue5_snapshot"]
+        ctx["ue5_snapshot"] = g
+        drop = (prev["ndvi"] - g["ndvi"]) if prev is not None else np.zeros_like(g["ndvi"])
+        flagged = (g["stress"] > ANOMALY_STRESS) | (drop > ANOMALY_NDVI_DROP)
+        day, t = get_twin().state.sim_day, time.time()
+        new = []
+        for r, c in zip(*np.nonzero(flagged)):
+            new.append({
+                "day": day, "index": int(r * UE5_GRID + c), "row": int(r), "col": int(c),
+                "ndvi": round(float(g["ndvi"][r, c]), 4),
+                "stress": round(float(g["stress"][r, c]), 4),
+                "ndvi_drop": round(float(drop[r, c]), 4),
+                "timestamp": t,
+            })
+        ctx["anomalies"].extend(new)
+        del ctx["anomalies"][:-200]
+        return len(new)
+
+    def instance(idx: int, g: Dict[str, np.ndarray], t: float) -> Dict[str, Any]:
+        r, c = divmod(idx, UE5_GRID)
+        temp = get_twin().state.last_weather.get("temperature", 29.0)
+        return {
+            "index": idx, "row": r, "col": c,
+            "ndvi": round(float(np.clip(g["ndvi"][r, c], 0.0, 1.0)), 4),
+            "stress": round(float(g["stress"][r, c]), 4),
+            "soil_moisture": round(float(g["moisture"][r, c]) * 100.0, 2),
+            "temperature_c": float(temp),
+            "ndvi_std": round(float(g["ndvi_std"][r, c]), 4),
+            "stress_std": round(float(g["stress_std"][r, c]), 4),
+            "last_updated": t,
+        }
+
+    @asynccontextmanager
+    async def lifespan(application: FastAPI):
+        t = get_twin()
+        ctx["ue5_snapshot"] = ue5_grids()
+        print(f"[DigitalTwinAPI] field={t.field_id} grid={t.state.grid.rows}x{t.state.grid.cols} "
+              f"day={t.state.sim_day} -> http://{settings.twin_api_host}:{settings.twin_api_port}/docs",
+              flush=True)
+        yield
+
+    app = FastAPI(
+        title="Paddy Field Digital Twin API",
+        description="Single source of truth for the simulated paddy field. "
+                    "UE5 and the three.js dashboard read from it; observations are assimilated.",
+        version="2.0.0",
+        lifespan=lifespan,
+    )
+    app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
+                       allow_methods=["*"], allow_headers=["*"])
+    app.state.ctx = ctx
+
+    # ============================================================
+    # UE5-COMPATIBLE ROUTES
+    # ============================================================
+
+    @app.get("/", summary="Health check")
+    def health():
+        t = get_twin()
+        return {
+            "status": "ok",
+            "service": "Paddy Field Digital Twin API",
+            "version": "2.0.0",
+            "field_id": t.field_id,
+            "current_day": t.state.sim_day,
+            "instances": NUM_INSTANCES,
+            "twin_grid": [t.state.grid.rows, t.state.grid.cols],
+        }
+
+    @app.post("/field/update", summary="UE5 pushes field state; assimilated as observations")
+    def field_update(payload: FieldUpdatePayload):
+        if len(payload.instances) > NUM_INSTANCES:
+            raise HTTPException(400, f"Too many instances: {len(payload.instances)} > {NUM_INSTANCES}")
+        obs = {k: np.full((UE5_GRID, UE5_GRID), np.nan, dtype=np.float32)
+               for k in ("ndvi", "moisture")}
+        for inst in payload.instances:
+            if not (0 <= inst.row < UE5_GRID and 0 <= inst.col < UE5_GRID):
+                raise HTTPException(400, f"Instance {inst.index} row/col outside {UE5_GRID}x{UE5_GRID} grid")
+            obs["ndvi"][inst.row, inst.col] = inst.ndvi
+            obs["moisture"][inst.row, inst.col] = inst.soil_moisture / 100.0
+        twin = get_twin()
+        # Stress is derived from NDVI + fungus in the model, so assimilating
+        # NDVI is enough; UE5's stress value is reported back unchanged.
+        results = []
+        for layer, arr in obs.items():
+            results.extend(twin.observe_grid(layer, arr, source="ue5"))
+        new_anomalies = detect_anomalies()
+        s = twin.state.summary()["layers"]
+        return {
+            "accepted": len(payload.instances),
+            "day": twin.state.sim_day,
+            "ue5_day": payload.day,
+            "new_anomalies": new_anomalies,
+            "avg_ndvi": s["ndvi"]["mean"],
+            "avg_stress": s["stress"]["mean"],
+            "assimilation": results,
+        }
+
+    @app.get("/field/status", summary="Full current state — all 400 instances")
+    def field_status():
+        g, t = ue5_grids(), time.time()
+        return {"day": get_twin().state.sim_day,
+                "instances": [instance(i, g, t) for i in range(NUM_INSTANCES)]}
+
+    @app.get("/field/instance/{index}", summary="Single instance record")
+    def field_instance(index: int):
+        if not 0 <= index < NUM_INSTANCES:
+            raise HTTPException(404, f"Instance {index} not found.")
+        return instance(index, ue5_grids(), time.time())
+
+    @app.get("/field/summary", summary="Aggregated field statistics")
+    def field_summary():
+        twin = get_twin()
+        g = ue5_grids()
+        stress = g["stress"]
+        n = stress.size
+        hist = [h for h in twin.history if h["reason"] == "predict"][-14:]
+        return {
+            "day": twin.state.sim_day,
+            "growth_stage": twin.state.growth_stage,
+            "total_instances": n,
+            "ndvi": {k: round(float(f(g["ndvi"])), 4) for k, f in
+                     (("mean", np.mean), ("min", np.min), ("max", np.max))},
+            "stress": {
+                "mean": round(float(stress.mean()), 4),
+                "high_count": int((stress > 0.5).sum()),
+                "healthy_count": int((stress < 0.2).sum()),
+                "pct_stressed": round(float((stress > 0.5).sum()) / n * 100, 1),
+            },
+            "soil_moisture": {k: round(float(f(g["moisture"])) * 100.0, 4) for k, f in
+                              (("mean", np.mean), ("min", np.min), ("max", np.max))},
+            "temperature_c": {"mean": twin.state.last_weather.get("temperature", 29.0)},
+            "history_days": len(hist),
+            "history": [{"day": h["sim_day"], "avg_ndvi": h["ndvi_mean"],
+                         "avg_stress": h["stress_mean"], "timestamp": h["timestamp"]} for h in hist],
+        }
+
+    @app.get("/field/anomalies", summary="Recent anomaly events")
+    def field_anomalies(limit: int = 50):
+        a = ctx["anomalies"]
+        return {"total": len(a), "anomalies": a[-limit:]}
+
+    @app.get("/field/heatmap", summary="NDVI + stress (and their std) as UE5 grids")
+    def field_heatmap():
+        g = ue5_grids()
+        r4 = lambda a: np.round(a.astype(np.float64), 4).tolist()  # noqa: E731
+        return {
+            "day": get_twin().state.sim_day,
+            "grid_size": UE5_GRID,
+            "ndvi_grid": r4(np.clip(g["ndvi"], 0.0, 1.0)),
+            "stress_grid": r4(g["stress"]),
+            "ndvi_std_grid": r4(g["ndvi_std"]),
+            "stress_std_grid": r4(g["stress_std"]),
+        }
+
+    @app.delete("/field/reset", summary="Reset the twin to its prior state")
+    def field_reset():
+        get_twin().reset()
+        ctx["anomalies"].clear()
+        ctx["ue5_snapshot"] = ue5_grids()
+        return {"status": "reset", "instances": NUM_INSTANCES}
+
+    # ============================================================
+    # TWIN ROUTES
+    # ============================================================
+
+    @app.get("/twin/state", summary="Twin summary and per-zone values")
+    def twin_state():
+        twin = get_twin()
+        return {"field_id": twin.field_id, **twin.state.summary(), "zones": twin.zone_summary()}
+
+    @app.get("/twin/layers/{layer}", summary="One layer at any resolution")
+    def twin_layer(layer: str, rows: Optional[int] = None, cols: Optional[int] = None,
+                   which: Literal["mean", "var", "std"] = "mean"):
+        if layer not in LAYERS:
+            raise HTTPException(404, f"Unknown layer '{layer}'. Expected one of {list(LAYERS)}.")
+        s = get_twin().state
+        rows, cols = rows or s.grid.rows, cols or s.grid.cols
+        if not (1 <= rows <= 500 and 1 <= cols <= 500):
+            raise HTTPException(400, "rows and cols must be between 1 and 500")
+        arr = s.resample(layer, rows, cols, which="mean" if which == "mean" else "var")
+        if which == "std":
+            arr = np.sqrt(arr)
+        return {"layer": layer, "which": which, "rows": rows, "cols": cols,
+                "sim_day": s.sim_day, "values": np.round(arr.astype(np.float64), 5).tolist()}
+
+    @app.post("/twin/step", summary="Advance the simulation")
+    def twin_step(req: StepRequest):
+        twin = get_twin()
+        _check_zones(twin, req.interventions)
+        result = twin.step(days=req.days, weather=req.weather,
+                           interventions=[i.model_dump() for i in req.interventions])
+        result["new_anomalies"] = detect_anomalies()
+        return result
+
+    @app.post("/twin/observe/point", summary="Assimilate a geotagged reading")
+    def twin_observe_point(obs: PointObservation):
+        unknown = set(obs.values) - set(LAYERS)
+        if unknown:
+            raise HTTPException(400, f"Unknown layers {sorted(unknown)}. Expected {list(LAYERS)}.")
+        try:
+            results = get_twin().observe_point(
+                obs.lat, obs.lon, obs.values, obs.source, obs.obs_var,
+                obs.footprint_m, obs.influence_radius_m)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        return {"results": results}
+
+    @app.post("/twin/observe/grid", summary="Assimilate a raster observation")
+    def twin_observe_grid(obs: GridObservation):
+        if obs.layer not in LAYERS:
+            raise HTTPException(400, f"Unknown layer '{obs.layer}'. Expected one of {list(LAYERS)}.")
+        arr = np.array([[np.nan if v is None else v for v in row] for row in obs.values],
+                       dtype=np.float32)
+        if arr.ndim != 2 or arr.size == 0:
+            raise HTTPException(400, "values must be a non-empty 2D list")
+        return {"results": get_twin().observe_grid(obs.layer, arr, obs.source, obs.obs_var)}
+
+    @app.post("/twin/what-if", summary="Compare interventions against doing nothing")
+    def twin_what_if(req: WhatIfRequest):
+        twin = get_twin()
+        _check_zones(twin, req.interventions)
+        return twin.what_if(days=req.days, weather=req.weather,
+                            interventions=[i.model_dump() for i in req.interventions])
+
+    @app.post("/twin/stage", summary="Set the paddy growth stage")
+    def twin_stage(req: StageRequest):
+        get_twin().set_growth_stage(req.growth_stage)
+        return {"growth_stage": req.growth_stage}
+
+    @app.get("/twin/history", summary="History of layer means and uncertainty")
+    def twin_history(limit: int = 365):
+        return {"history": get_twin().history[-limit:]}
+
+    @app.get("/twin/events", summary="Recent twin events")
+    def twin_events(limit: int = 50):
+        return {"events": list(get_twin().events)[-limit:]}
+
+    @app.websocket("/ws/twin")
+    async def ws_twin(ws: WebSocket):
+        await ws.accept()
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+
+        def push(event: Dict[str, Any]) -> None:
+            def _put() -> None:
+                if not queue.full():
+                    queue.put_nowait(event)
+            loop.call_soon_threadsafe(_put)
+
+        twin = get_twin()
+        unsubscribe = twin.subscribe(push)
+        try:
+            await ws.send_json({"type": "twin.hello", "field_id": twin.field_id,
+                                **twin.state.summary()})
+            while True:
+                event = await queue.get()
+                await ws.send_json(_jsonable(event))
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+        finally:
+            unsubscribe()
+
+    return app
+
+
+def _check_zones(twin: DigitalTwin, interventions: List[Intervention]) -> None:
+    for i in interventions:
+        if i.zone_id not in twin.zone_names:
+            raise HTTPException(400, f"Unknown zone_id {i.zone_id}. Valid: {sorted(twin.zone_names)}")
+
+
+def _jsonable(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {k: _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    if isinstance(obj, np.generic):
+        return obj.item()
+    return obj
+
+
+app = create_app()
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host=settings.twin_api_host, port=settings.twin_api_port, log_level="info")

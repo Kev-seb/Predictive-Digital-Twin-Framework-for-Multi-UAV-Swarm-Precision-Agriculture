@@ -91,6 +91,18 @@ class AppSettings(BaseSettings):
     dashboard_port: int  = 8501
     debug_mode:     bool = False
 
+    # --- Digital twin core (src/twin_core) ---
+    twin_api_host:    str   = "127.0.0.1"
+    twin_api_port:    int   = 8008     # digital_twin_api.py (UE5 + /twin/*)
+    mobile_api_port:  int   = 8080     # src/mobile_api/mobile_api_server.py
+    twin_field_id:    str   = "field_alpha"
+    twin_grid_rows:   int   = 40
+    twin_grid_cols:   int   = 40
+    twin_cell_size_m: float = 2.5      # 40 x 2.5 m = 100 m, ~1 ha
+    twin_ue5_grid:    int   = 20       # UE5 HISM grid is 20 x 20
+    twin_propagation_model: Literal["baseline", "pde", "hybrid", "gnn"] = "pde"
+    twin_storage_dir: Path  = Path(__file__).resolve().parents[2] / "outputs" / "twin_core"
+
     # --- Logging ---
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
