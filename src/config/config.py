@@ -91,6 +91,29 @@ class AppSettings(BaseSettings):
     dashboard_port: int  = 8501
     debug_mode:     bool = False
 
+    # --- Digital twin core (src/twin_core) ---
+    twin_api_host:    str   = "127.0.0.1"
+    twin_api_port:    int   = 8008     # digital_twin_api.py (UE5 + /twin/*)
+    mobile_api_port:  int   = 8080     # src/mobile_api/mobile_api_server.py
+    twin_field_id:    str   = "field_alpha"
+    twin_grid_rows:   int   = 40
+    twin_grid_cols:   int   = 40
+    twin_cell_size_m: float = 2.5      # 40 x 2.5 m = 100 m, ~1 ha
+    twin_ue5_grid:    int   = 20       # UE5 HISM grid is 20 x 20
+    twin_propagation_model: Literal["baseline", "pde", "hybrid", "gnn"] = "pde"
+    twin_swarm_size:  int   = 3        # simulated drones in the twin's fleet
+    # MAVLink execution of fleet missions (/sim/mission with backend="mavlink"):
+    #   emulated: in-process MAVLink vehicles on the repo's flight physics
+    #   sitl:     ArduCopter SITL instances (sim_vehicle.py -v ArduCopter -I <i>)
+    twin_mavlink_mode: Literal["emulated", "sitl"] = "emulated"
+    twin_mavlink_base_port: int = 5760    # instance i -> tcp:127.0.0.1:base + 10 i
+    twin_mavlink_connections: str = ""    # optional comma list overriding the port scheme
+    twin_mavlink_time_scale: float = 10.0 # emulator speed-up (SITL: use its --speedup)
+    twin_forward_live: bool = True     # mobile API forwards live inferences to the twin
+    twin_crop_model:  Literal["paddy", "legacy"] = "paddy"
+    twin_params_file: Path  = Path(__file__).resolve().parents[2] / "outputs" / "calibration" / "paddy_params.json"
+    twin_storage_dir: Path  = Path(__file__).resolve().parents[2] / "outputs" / "twin_core"
+
     # --- Logging ---
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 

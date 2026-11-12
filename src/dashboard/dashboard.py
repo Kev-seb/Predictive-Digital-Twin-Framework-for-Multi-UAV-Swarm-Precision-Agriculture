@@ -49,6 +49,12 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from src.digital_twin.camera_feed import get_live_camera_frame
 from src.digital_twin.flight_physics import UAVFlightDynamicsSimulator
+from src.digital_twin import swarm_guidance as _swarm
+
+try:
+    _DEFAULT_SWARM_SIZE = max(1, min(_swarm.MAX_DRONES, int(os.environ.get("UAV_DASHBOARD_SWARM_SIZE", "2"))))
+except ValueError:
+    _DEFAULT_SWARM_SIZE = 2
 
 # Set up shared global telemetry data state with st.cache_resource
 @st.cache_resource
@@ -97,35 +103,12 @@ def get_shared_state():
         "WS_CLIENTS": set(),
         "TELEMETRY_PORT": 8000,
         "WEBSOCKET_PORT": 8765,
+        # Fleet size for the swarm simulation (UAV_DASHBOARD_SWARM_SIZE, default 2);
+        # can be changed live from the Swarm tab.
+        "SWARM_SIZE": _DEFAULT_SWARM_SIZE,
+        "SPRAY_DOSES": {},
         "MULTIPLAYER_DRONES": {
-            "drone_alpha": {
-                "id": "drone_alpha",
-                "label": "Drone Alpha (Sector A)",
-                "lat": 37.7749,
-                "lon": -122.4194,
-                "alt": 10.0,
-                "pitch": 0.0,
-                "roll": 0.0,
-                "yaw": 0.0,
-                "battery": 100.0,
-                "speed": 0.0,
-                "is_spraying": False,
-                "color": "#38bdf8"
-            },
-            "drone_beta": {
-                "id": "drone_beta",
-                "label": "Drone Beta (Sector B)",
-                "lat": 37.7749,
-                "lon": -122.4194,
-                "alt": 10.0,
-                "pitch": 0.0,
-                "roll": 0.0,
-                "yaw": 0.0,
-                "battery": 100.0,
-                "speed": 0.0,
-                "is_spraying": False,
-                "color": "#ec4899"
-            }
+            _swarm.drone_id(_i): _swarm.make_drone_record(_i) for _i in range(_DEFAULT_SWARM_SIZE)
         },
         "COLLABORATIVE_ANNOTATIONS": [],
         "WS_CLIENT_ROLES": {},
@@ -133,6 +116,8 @@ def get_shared_state():
     }
 
 shared_state = get_shared_state()
+shared_state.setdefault("SWARM_SIZE", len(shared_state["MULTIPLAYER_DRONES"]))
+shared_state.setdefault("SPRAY_DOSES", {})
 MAVLINK_TELEMETRY = shared_state["MAVLINK_TELEMETRY"]
 CURRENT_ENV = shared_state["CURRENT_ENV"]
 TELEMETRY_BUFFER = shared_state["TELEMETRY_BUFFER"]
@@ -194,6 +179,7 @@ class TelemetryRequestHandler(BaseHTTPRequestHandler):
                     "roll": drone.get("roll", 0.0),
                     "is_spraying": bool(drone.get("is_spraying", False)),
                     "color": drone.get("color", "#38bdf8"),
+                    "dose": float(drone.get("dose", 0.0)),
                 }
             self.wfile.write(json.dumps(swarm_data).encode('utf-8'))
         elif self.path == '/camera':
@@ -372,18 +358,10 @@ def start_mavlink_listener():
     # Instantiate flight physics simulators for the swarm
     home_lat = shared_state.get("HOME_LAT", 11.0)
     home_lon = shared_state.get("HOME_LON", 79.0)
-    sim_alpha = UAVFlightDynamicsSimulator(shared_state, home_lat=home_lat, home_lon=home_lon, drone_id="drone_alpha")
-    sim_beta = UAVFlightDynamicsSimulator(shared_state, home_lat=home_lat, home_lon=home_lon, drone_id="drone_beta")
-    
-    # Position them slightly offset from center
-    sim_alpha.pos = np.array([-15.0, -15.0, 10.0])
-    sim_beta.pos = np.array([15.0, 15.0, 10.0])
-    
-    shared_state["PHYSICS_SIMULATOR"] = sim_alpha
-    shared_state["PHYSICS_SIMULATORS"] = {
-        "drone_alpha": sim_alpha,
-        "drone_beta": sim_beta
-    }
+    def _make_sim(d_id):
+        return UAVFlightDynamicsSimulator(shared_state, home_lat=home_lat, home_lon=home_lon, drone_id=d_id)
+
+    _swarm.ensure_fleet(shared_state, int(shared_state.get("SWARM_SIZE", _DEFAULT_SWARM_SIZE)), _make_sim)
 
     # Mock generator state variables
     mock_t = 0.0
@@ -420,12 +398,7 @@ def start_mavlink_listener():
             for d_id, drone in MULTIPLAYER_DRONES.items():
                 if drone.get("is_spraying"):
                     # Look up stress-proportional dose for this drone (0.0 = minimal, 1.0 = maximum)
-                    if d_id == "drone_alpha":
-                        dose = float(shared_state.get("SPRAY_DOSE_ALPHA", 1.0))
-                    elif d_id == "drone_beta":
-                        dose = float(shared_state.get("SPRAY_DOSE_BETA", 1.0))
-                    else:
-                        dose = 1.0
+                    dose = float(shared_state.get("SPRAY_DOSES", {}).get(d_id, 1.0))
                     # Scale particle count: 30 minimum, 200 maximum based on severity
                     particle_count = max(30, int(200 * dose))
                     engine.emit_particles(
@@ -522,216 +495,124 @@ def start_mavlink_listener():
         if not packet_received and (time.time() - last_packet_time) > 4.0:
             MAVLINK_TELEMETRY["connected"] = False
             
-            sim_alpha = shared_state["PHYSICS_SIMULATORS"].get("drone_alpha")
-            sim_beta = shared_state["PHYSICS_SIMULATORS"].get("drone_beta")
-            
+            # Resize the fleet if the Swarm tab changed SWARM_SIZE
+            ids = _swarm.ensure_fleet(shared_state, int(shared_state.get("SWARM_SIZE", _DEFAULT_SWARM_SIZE)),
+                                      _make_sim)
+            sims = shared_state["PHYSICS_SIMULATORS"]
+            n_drones = len(ids)
+            primary_id = ids[0]
+            sim_primary = sims[primary_id]
+
             # Dynamic home coordinates update from UI
             home_lat = shared_state.get("HOME_LAT", 11.0)
             home_lon = shared_state.get("HOME_LON", 79.0)
-            if sim_alpha:
-                sim_alpha.home_lat = home_lat
-                sim_alpha.home_lon = home_lon
-            if sim_beta:
-                sim_beta.home_lat = home_lat
-                sim_beta.home_lon = home_lon
-            
+            for _sim in sims.values():
+                _sim.home_lat = home_lat
+                _sim.home_lon = home_lon
+
             swarm_mode = shared_state.get("SWARM_MISSION_TYPE", "coordinated_spraying")
             mock_t += 0.05
-            
-            # Determine flight targets and spray commands based on selected swarm mission type
+            doses = {}
+
             if swarm_mode == "coordinated_spraying":
-                # =========================================================================
-                # Continuous Serpentine Sweep — spray whenever stress is detected below
-                # Both drones sweep the FULL field width so they both encounter stress patches.
-                # Alpha sweeps Top→Bottom, Beta sweeps Bottom→Top simultaneously.
-                # =========================================================================
-                sweep_time = 60.0          # seconds per full field sweep (loops continuously)
-                t_norm = (mock_t % sweep_time) / sweep_time  # 0.0 to 1.0, continuous
-                cycles = 8.0              # number of left-right S-curves in one sweep
-
-                # ── Alpha Drone: Full Width (X: -26 to 26), Top to Bottom ─────────────────
-                y_a = 25.0 - (t_norm * 50.0)
-                # Oscillation centered at 0, amplitude 25
-                x_a = 25.0 * math.sin(t_norm * math.pi * 2.0 * cycles)
-                dx_a = 25.0 * math.pi * 2.0 * cycles * math.cos(t_norm * math.pi * 2.0 * cycles)
-                yaw_a = math.atan2(-50.0, dx_a)   # tangent of the curve = smooth heading
-
-                sim_alpha.target_pos = np.array([x_a, y_a, 8.0])
-                sim_alpha.target_yaw = yaw_a
-                sim_alpha.autopilot_mode = "terrain_follow"
-
-                # Read stress beneath each drone's position.
-                # If no real NDVI map has been processed yet, use a synthetic one so
-                # drones always spray in demo/simulation mode.
+                # Continuous full-width serpentine sweeps (even drones N->S, odd S->N);
+                # each drone sprays, proportionally to stress, when over a stressed patch.
                 ndvi_map = shared_state.get("NDVI_MAP")
-                field_half = 27.5
-
                 if ndvi_map is None or ndvi_map.size == 0:
                     if "_SYNTHETIC_NDVI" not in shared_state:
-                        _SZ = 64
-                        sy = np.full((_SZ, _SZ), 0.60, dtype=np.float32)   # healthy background
-                        sy[4:18,  4:20] = 0.15   # stressed patch 1 – top-left
-                        sy[24:38, 36:56] = 0.22  # stressed patch 2 – centre-right
-                        sy[48:62, 8:28]  = 0.18  # stressed patch 3 – bottom-left
-                        shared_state["_SYNTHETIC_NDVI"] = sy
+                        shared_state["_SYNTHETIC_NDVI"] = _swarm.synthetic_ndvi_map()
                     ndvi_map = shared_state["_SYNTHETIC_NDVI"]
+                for i, d_id in enumerate(ids):
+                    _sim = sims[d_id]
+                    _sim.target_pos, _sim.target_yaw, _sim.autopilot_mode = \
+                        _swarm.target_for(swarm_mode, i, n_drones, mock_t)
+                    doses[d_id] = _swarm.spray_dose(ndvi_map, _sim.pos[0], _sim.pos[1])
+                    _sim.is_spraying = doses[d_id] > 0.0
 
-                spray_dose_a = 0.0
-                h_map, w_map = ndvi_map.shape
-                u_a = float(np.clip((sim_alpha.pos[0] + field_half) / (2.0 * field_half), 0.0, 1.0))
-                v_a = float(np.clip(1.0 - (sim_alpha.pos[1] + field_half) / (2.0 * field_half), 0.0, 1.0))
-                ndvi_a = float(ndvi_map[int(v_a * (h_map - 1)), int(u_a * (w_map - 1))])
-                if ndvi_a < 0.35:
-                    spray_dose_a = float(np.clip((0.35 - ndvi_a) / 0.35, 0.0, 1.0))
-                    sim_alpha.is_spraying = True
-                else:
-                    sim_alpha.is_spraying = False
-                shared_state["SPRAY_DOSE_ALPHA"] = spray_dose_a
+            elif swarm_mode in ("synchronized_scouting", "orbit_avoidance_test"):
+                for i, d_id in enumerate(ids):
+                    _sim = sims[d_id]
+                    _sim.target_pos, _sim.target_yaw, _sim.autopilot_mode = \
+                        _swarm.target_for(swarm_mode, i, n_drones, mock_t)
+                    _sim.is_spraying = False
 
-                # ── Beta Drone: Full Width (X: -26 to 26), Bottom to Top ────────────────────
-                y_b = -25.0 + (t_norm * 50.0)
-                x_b = 25.0 * math.sin(t_norm * math.pi * 2.0 * cycles)
-                dx_b = 25.0 * math.pi * 2.0 * cycles * math.cos(t_norm * math.pi * 2.0 * cycles)
-                yaw_b = math.atan2(50.0, dx_b)
-
-                sim_beta.target_pos = np.array([x_b, y_b, 8.0])
-                sim_beta.target_yaw = yaw_b
-                sim_beta.autopilot_mode = "terrain_follow"
-
-                spray_dose_b = 0.0
-                u_b = float(np.clip((sim_beta.pos[0] + field_half) / (2.0 * field_half), 0.0, 1.0))
-                v_b = float(np.clip(1.0 - (sim_beta.pos[1] + field_half) / (2.0 * field_half), 0.0, 1.0))
-                ndvi_b = float(ndvi_map[int(v_b * (h_map - 1)), int(u_b * (w_map - 1))])
-                if ndvi_b < 0.35:
-                    spray_dose_b = float(np.clip((0.35 - ndvi_b) / 0.35, 0.0, 1.0))
-                    sim_beta.is_spraying = True
-                else:
-                    sim_beta.is_spraying = False
-                shared_state["SPRAY_DOSE_BETA"] = spray_dose_b
-
-
-
-
-            elif swarm_mode == "synchronized_scouting":
-                # Synchronized Scouting: Parallel scanning sweeps of the field sectors
-                alpha_x = -20.0 + 15.0 * math.sin(mock_t * 0.2)
-                alpha_y = 20.0 * math.cos(mock_t * 0.05)
-                sim_alpha.target_pos = np.array([alpha_x, alpha_y, 12.0])
-                sim_alpha.target_yaw = math.atan2(alpha_y, alpha_x)
-                sim_alpha.autopilot_mode = "terrain_follow"
-                sim_alpha.is_spraying = False
-                
-                beta_x = 20.0 + 15.0 * math.cos(mock_t * 0.2)
-                beta_y = 20.0 * math.sin(mock_t * 0.05)
-                sim_beta.target_pos = np.array([beta_x, beta_y, 12.0])
-                sim_beta.target_yaw = math.atan2(beta_y, beta_x)
-                sim_beta.autopilot_mode = "terrain_follow"
-                sim_beta.is_spraying = False
-                
-            elif swarm_mode == "orbit_avoidance_test":
-                # Orbit Avoidance: Overlapping circular paths intersecting at center to test Potential Field collision avoidance
-                alpha_x = -8.0 + 12.0 * math.cos(mock_t * 0.3)
-                alpha_y = 0.0 + 12.0 * math.sin(mock_t * 0.3)
-                sim_alpha.target_pos = np.array([alpha_x, alpha_y, 10.0])
-                sim_alpha.target_yaw = mock_t * 0.3 + math.pi/2
-                sim_alpha.autopilot_mode = "stabilized"
-                sim_alpha.is_spraying = False
-                
-                beta_x = 8.0 + 12.0 * math.cos(mock_t * 0.3 + math.pi)
-                beta_y = 0.0 + 12.0 * math.sin(mock_t * 0.3 + math.pi)
-                sim_beta.target_pos = np.array([beta_x, beta_y, 10.0])
-                sim_beta.target_yaw = mock_t * 0.3 + math.pi/2 + math.pi
-                sim_beta.autopilot_mode = "stabilized"
-                sim_beta.is_spraying = False
             else:
-                # Single Waypoint mission fallback (Alpha follows mission, Beta orbits at distance)
+                # Waypoint mission: the primary flies the uploaded mission (or orbits);
+                # followers hold evenly spaced orbits.
                 waypoints = shared_state.get("MISSION_WAYPOINTS")
                 if waypoints and len(waypoints) > 0:
                     wp_idx = shared_state.get("CURRENT_WP_INDEX", 0)
                     if wp_idx >= len(waypoints):
                         wp_idx = 0
                         shared_state["CURRENT_WP_INDEX"] = 0
-                    
+
                     target_wp = waypoints[wp_idx]
                     lat_deg_per_meter = 1.0 / 111320.0
                     lon_deg_per_meter = 1.0 / (111320.0 * math.cos(math.radians(home_lat)))
-                    
+
                     target_y = (target_wp[0] - home_lat) / lat_deg_per_meter
                     target_x = (target_wp[1] - home_lon) / lon_deg_per_meter
                     target_z = target_wp[2]
-                    
-                    sim_alpha.target_pos = np.array([target_x, target_y, target_z])
-                    sim_alpha.autopilot_mode = shared_state.get("AUTOPILOT_MODE", "terrain_follow")
-                    
-                    dist_to_wp = np.linalg.norm(sim_alpha.pos - sim_alpha.target_pos)
+
+                    sim_primary.target_pos = np.array([target_x, target_y, target_z])
+                    sim_primary.autopilot_mode = shared_state.get("AUTOPILOT_MODE", "terrain_follow")
+
+                    dist_to_wp = np.linalg.norm(sim_primary.pos - sim_primary.target_pos)
                     if dist_to_wp < 2.5:
                         wp_idx = (wp_idx + 1) % len(waypoints)
                         shared_state["CURRENT_WP_INDEX"] = wp_idx
                         spray_triggers = shared_state.get("MISSION_SPRAY_TRIGGERS")
                         if spray_triggers and wp_idx < len(spray_triggers):
-                            sim_alpha.is_spraying = spray_triggers[wp_idx]
+                            sim_primary.is_spraying = spray_triggers[wp_idx]
                 else:
-                    # Default orbit
-                    alpha_x = 18.0 * math.sin(mock_t * 0.4)
-                    alpha_y = 18.0 * math.cos(mock_t * 0.4)
-                    sim_alpha.target_pos = np.array([alpha_x, alpha_y, 10.0])
-                    sim_alpha.target_yaw = math.atan2(alpha_y, alpha_x)
-                    sim_alpha.autopilot_mode = "stabilized"
-                
-                # Beta fallback orbit
-                beta_x = 18.0 * math.sin(mock_t * 0.4 + math.pi)
-                beta_y = 18.0 * math.cos(mock_t * 0.4 + math.pi)
-                sim_beta.target_pos = np.array([beta_x, beta_y, 10.0])
-                sim_beta.target_yaw = math.atan2(beta_y, beta_x)
-                sim_beta.autopilot_mode = "stabilized"
+                    sim_primary.target_pos, sim_primary.target_yaw, sim_primary.autopilot_mode = \
+                        _swarm.holding_orbit(0, n_drones, mock_t)
+                for i, d_id in enumerate(ids[1:], start=1):
+                    _sim = sims[d_id]
+                    _sim.target_pos, _sim.target_yaw, _sim.autopilot_mode = \
+                        _swarm.holding_orbit(i, n_drones, mock_t)
 
-            # Step both flight dynamics simulators
-            if sim_alpha:
-                sim_alpha.step(dt=0.05)
-            if sim_beta:
-                sim_beta.step(dt=0.05)
+            shared_state["SPRAY_DOSES"] = doses
+            # Legacy keys read by older UI code
+            shared_state["SPRAY_DOSE_ALPHA"] = doses.get("drone_alpha", 0.0)
+            shared_state["SPRAY_DOSE_BETA"] = doses.get("drone_beta", 0.0)
+
+            # Step every flight dynamics simulator
+            for d_id in ids:
+                sims[d_id].step(dt=0.05)
 
             # Map positions to global coordinates
             lat_deg_per_meter = 1.0 / 111320.0
             lon_deg_per_meter = 1.0 / (111320.0 * math.cos(math.radians(home_lat)))
-            
-            # Map main telemetry (Legacy/Alpha support)
-            MAVLINK_TELEMETRY["lat"] = home_lat + (sim_alpha.pos[1] * lat_deg_per_meter)
-            MAVLINK_TELEMETRY["lon"] = home_lon + (sim_alpha.pos[0] * lon_deg_per_meter)
-            MAVLINK_TELEMETRY["alt"] = sim_alpha.pos[2]
-            MAVLINK_TELEMETRY["speed"] = np.linalg.norm(sim_alpha.vel)
-            MAVLINK_TELEMETRY["yaw"] = sim_alpha.attitude[2]
-            MAVLINK_TELEMETRY["pitch"] = sim_alpha.attitude[1]
-            MAVLINK_TELEMETRY["roll"] = sim_alpha.attitude[0]
-            MAVLINK_TELEMETRY["battery"] = sim_alpha.battery
-            MAVLINK_TELEMETRY["is_spraying"] = sim_alpha.is_spraying
-            MAVLINK_TELEMETRY["payload_mass"] = sim_alpha.payload_mass
-            MAVLINK_TELEMETRY["autopilot_mode"] = sim_alpha.autopilot_mode
 
-            # Sync both drones to MULTIPLAYER_DRONES dictionary
-            if "drone_alpha" in MULTIPLAYER_DRONES and sim_alpha:
-                d_alpha = MULTIPLAYER_DRONES["drone_alpha"]
-                d_alpha["lat"] = MAVLINK_TELEMETRY["lat"]
-                d_alpha["lon"] = MAVLINK_TELEMETRY["lon"]
-                d_alpha["alt"] = MAVLINK_TELEMETRY["alt"]
-                d_alpha["yaw"] = MAVLINK_TELEMETRY["yaw"]
-                d_alpha["pitch"] = MAVLINK_TELEMETRY["pitch"]
-                d_alpha["roll"] = MAVLINK_TELEMETRY["roll"]
-                d_alpha["battery"] = MAVLINK_TELEMETRY["battery"]
-                d_alpha["speed"] = MAVLINK_TELEMETRY["speed"]
-                d_alpha["is_spraying"] = MAVLINK_TELEMETRY["is_spraying"]
+            # Primary drone drives the main telemetry
+            MAVLINK_TELEMETRY["lat"] = home_lat + (sim_primary.pos[1] * lat_deg_per_meter)
+            MAVLINK_TELEMETRY["lon"] = home_lon + (sim_primary.pos[0] * lon_deg_per_meter)
+            MAVLINK_TELEMETRY["alt"] = sim_primary.pos[2]
+            MAVLINK_TELEMETRY["speed"] = np.linalg.norm(sim_primary.vel)
+            MAVLINK_TELEMETRY["yaw"] = sim_primary.attitude[2]
+            MAVLINK_TELEMETRY["pitch"] = sim_primary.attitude[1]
+            MAVLINK_TELEMETRY["roll"] = sim_primary.attitude[0]
+            MAVLINK_TELEMETRY["battery"] = sim_primary.battery
+            MAVLINK_TELEMETRY["is_spraying"] = sim_primary.is_spraying
+            MAVLINK_TELEMETRY["payload_mass"] = sim_primary.payload_mass
+            MAVLINK_TELEMETRY["autopilot_mode"] = sim_primary.autopilot_mode
 
-            if "drone_beta" in MULTIPLAYER_DRONES and sim_beta:
-                d_beta = MULTIPLAYER_DRONES["drone_beta"]
-                d_beta["lat"] = home_lat + (sim_beta.pos[1] * lat_deg_per_meter)
-                d_beta["lon"] = home_lon + (sim_beta.pos[0] * lon_deg_per_meter)
-                d_beta["alt"] = sim_beta.pos[2]
-                d_beta["yaw"] = sim_beta.attitude[2]
-                d_beta["pitch"] = sim_beta.attitude[1]
-                d_beta["roll"] = sim_beta.attitude[0]
-                d_beta["battery"] = sim_beta.battery
-                d_beta["speed"] = np.linalg.norm(sim_beta.vel)
-                d_beta["is_spraying"] = sim_beta.is_spraying
+            # Sync every drone to MULTIPLAYER_DRONES
+            for d_id in ids:
+                _sim, rec = sims[d_id], MULTIPLAYER_DRONES.get(d_id)
+                if rec is None:
+                    continue
+                rec["lat"] = home_lat + (_sim.pos[1] * lat_deg_per_meter)
+                rec["lon"] = home_lon + (_sim.pos[0] * lon_deg_per_meter)
+                rec["alt"] = _sim.pos[2]
+                rec["yaw"] = _sim.attitude[2]
+                rec["pitch"] = _sim.attitude[1]
+                rec["roll"] = _sim.attitude[0]
+                rec["battery"] = _sim.battery
+                rec["speed"] = float(np.linalg.norm(_sim.vel))
+                rec["is_spraying"] = _sim.is_spraying
+                rec["dose"] = doses.get(d_id, 0.0)
 
         # Log current flight telemetry frame to history buffer
         append_to_buffer(MAVLINK_TELEMETRY)
@@ -3808,7 +3689,8 @@ with tabs[8]:
                                     const localZ = droneData.alt;
 
                                     if (!multiDrones[droneId]) {{
-                                        const colHex = droneId === 'drone_alpha' ? 0x38bdf8 : 0xec4899;
+                                        const colHex = droneData.color ? parseInt(String(droneData.color).replace('#', ''), 16)
+                                                                       : (droneId === 'drone_alpha' ? 0x38bdf8 : 0xec4899);
                                         const model = createDroneModel(colHex);
                                         scene.add(model.group);
                                         multiDrones[droneId] = {{
@@ -4134,11 +4016,9 @@ with tabs[8]:
             buildDroneModel();
             generatePath();
             
-            // Build Beta drone model (pink) — permanently in scene, updated from /swarm poll
-            const betaModel = createDroneModel(0xec4899);
-            scene.add(betaModel.group);
-            betaModel.group.position.set(15, 15, 10);
-            swarmDrones = {{ 'drone_beta': betaModel }};
+            // Follower drones (everything except the primary 'drone_alpha', which is the main model)
+            // are created and removed from the /swarm poll as the fleet size changes.
+            swarmDrones = {{}};
             
             // Poll /swarm endpoint every 100ms to keep all drones in sync
             setInterval(() => {{
@@ -4155,8 +4035,25 @@ with tabs[8]:
                         const homeLatRad = homeLat * Math.PI / 180;
                         const homeLonRad = homeLon * Math.PI / 180;
                         
+                        const drones = swarmData.drones || {{}};
+                        // Remove models of drones that left the fleet
+                        for (const droneId of Object.keys(swarmDrones)) {{
+                            if (!drones[droneId]) {{
+                                scene.remove(swarmDrones[droneId].group);
+                                delete swarmDrones[droneId];
+                            }}
+                        }}
+                        // Create models for new followers
+                        for (const [droneId, d] of Object.entries(drones)) {{
+                            if (droneId === 'drone_alpha' || swarmDrones[droneId]) continue;
+                            const colHex = d.color ? parseInt(String(d.color).replace('#', ''), 16) : 0xec4899;
+                            const model = createDroneModel(colHex);
+                            model.colorHex = colHex;
+                            scene.add(model.group);
+                            swarmDrones[droneId] = model;
+                        }}
                         for (const [droneId, model] of Object.entries(swarmDrones)) {{
-                            const d = swarmData.drones[droneId];
+                            const d = drones[droneId];
                             if (!d) continue;
                             const latRad = d.lat * Math.PI / 180;
                             const lonRad = d.lon * Math.PI / 180;
@@ -4936,17 +4833,16 @@ with tabs[8]:
                 }}
             }}
 
-            // 2. Process Beta Drone (from swarmDrones)
-            if (typeof swarmDrones !== 'undefined' && swarmDrones['drone_beta']) {{
-                const beta = swarmDrones['drone_beta'];
-                if (beta.isSpraying) {{
-                    const pColorBeta = 0xec4899; // Pink spray for Pink drone (Beta)
-                    beta.sprayNozzles.forEach((nozzle, nIdx) => {{
+            // 2. Follower drones (from swarmDrones): spray in each drone's own colour
+            if (typeof swarmDrones !== 'undefined') {{
+                for (const follower of Object.values(swarmDrones)) {{
+                    if (!follower.isSpraying) continue;
+                    const pColor = follower.colorHex || 0xec4899;
+                    follower.sprayNozzles.forEach((nozzle, nIdx) => {{
                         const nozzleWorldPos = new THREE.Vector3();
                         nozzle.getWorldPosition(nozzleWorldPos);
-                        const initialVel = new THREE.Vector3(0, 0, -3.5); // Beta has simple straight-down spray for now
-                        
-                        const pMat = new THREE.MeshBasicMaterial({{ color: pColorBeta, transparent: true, opacity: 0.8 }});
+                        const initialVel = new THREE.Vector3(0, 0, -3.5); // straight-down spray
+                        const pMat = new THREE.MeshBasicMaterial({{ color: pColor, transparent: true, opacity: 0.8 }});
                         const p = new THREE.Mesh(particleGeom, pMat);
                         p.position.copy(nozzleWorldPos);
                         scene.add(p);
@@ -6728,15 +6624,23 @@ with tabs[12]:
         "for real-time collision avoidance, and streams multi-agent spray and scouting data."
     )
 
-    # Fetch simulator instances
-    sim_alpha = shared_state["PHYSICS_SIMULATORS"].get("drone_alpha")
-    sim_beta = shared_state["PHYSICS_SIMULATORS"].get("drone_beta")
+    # Fetch simulator instances (any fleet size; the first drone is the primary)
+    swarm_sims = dict(shared_state.get("PHYSICS_SIMULATORS", {}))
+    swarm_ids = [d for d in _swarm.drone_ids(_swarm.MAX_DRONES) if d in swarm_sims]
 
     col_sw_ctrl, col_sw_map = st.columns([1, 1.3])
 
     with col_sw_ctrl:
         st.subheader("Fleet Mission Commander")
-        
+
+        fleet_size = st.slider(
+            "Fleet size", min_value=1, max_value=_swarm.MAX_DRONES,
+            value=int(shared_state.get("SWARM_SIZE", _DEFAULT_SWARM_SIZE)),
+            help="Drones are added or removed live; the first drone (Alpha) stays the primary "
+                 "linked to MAVLink telemetry and waypoint missions.")
+        if fleet_size != shared_state.get("SWARM_SIZE"):
+            shared_state["SWARM_SIZE"] = int(fleet_size)
+
         swarm_mission = st.selectbox(
             "Select Swarm Strategy",
             [
@@ -6745,8 +6649,8 @@ with tabs[12]:
                 "orbit_avoidance_test"
             ],
             format_func=lambda x: {
-                "coordinated_spraying": "Coordinated Spraying (West vs. East Sectors)",
-                "synchronized_scouting": "Synchronized scouting scan patterns",
+                "coordinated_spraying": "Coordinated spraying (staggered serpentine sweeps)",
+                "synchronized_scouting": "Synchronized scouting (parallel sectors)",
                 "orbit_avoidance_test": "Orbit collision avoidance & proximity test"
             }[x],
             index=[
@@ -6756,18 +6660,22 @@ with tabs[12]:
             ].index(shared_state.get("SWARM_MISSION_TYPE", "coordinated_spraying"))
         )
         shared_state["SWARM_MISSION_TYPE"] = swarm_mission
-        
+
         # Interactive Mission Status details
         if swarm_mission == "coordinated_spraying":
-            st.info("**Coordinated Spraying:** Drone Alpha covers Sector A (Western half of field) while Drone Beta covers Sector B (Eastern half). Spray nozzles activate when crossing target stress zones.")
+            st.info("**Coordinated Spraying:** every drone flies a full-width serpentine sweep, alternating "
+                    "north-to-south and south-to-north, with later pairs staggered half a sweep. Nozzles open, "
+                    "with a dose proportional to stress, over stressed patches.")
         elif swarm_mission == "synchronized_scouting":
-            st.info("**Synchronized Scouting:** Drones sweep and map the field in parallel lines. Actuators remain inactive to conserve payload, prioritizing high-resolution multispectral scouting.")
+            st.info("**Synchronized Scouting:** the field is split into parallel west-to-east sectors, one per "
+                    "drone. Sprayers stay off to save payload while the fleet maps the field.")
         elif swarm_mission == "orbit_avoidance_test":
-            st.warning("**Orbit Avoidance Test:** Both drones fly overlapping circular orbits intersecting at the center of the field. Shows potential field collision avoidance pushing the drones apart as they cross.")
+            st.warning("**Orbit Avoidance Test:** drones fly overlapping orbits that cross near the field centre, "
+                       "showing the potential-field avoidance pushing them apart.")
 
         st.write("---")
         st.subheader("Swarm Collision Avoidance Log")
-        
+
         warnings = shared_state.get("SWARM_WARNINGS", [])
         if len(warnings) == 0:
             st.success("Active Collision Avoidance System: Normal Operations. No proximity violations detected.")
@@ -6781,114 +6689,57 @@ with tabs[12]:
 
         st.write("---")
         st.subheader("Swarm Dispatch Commands")
-        
+
         cmd_c1, cmd_c2 = st.columns(2)
         with cmd_c1:
             if st.button("Inject Gust Fleetwide", help="Simulate a wind turbulence gust hitting all drones simultaneously"):
-                if sim_alpha and sim_beta:
-                    sim_alpha.inject_wind_gust()
-                    sim_beta.inject_wind_gust()
-                    st.success("Gust injected to all drones!")
+                if swarm_sims:
+                    for _sim in swarm_sims.values():
+                        _sim.inject_wind_gust()
+                    st.success(f"Gust injected to all {len(swarm_sims)} drones!")
                 else:
                     st.error("Simulators not ready.")
             if st.button("Trigger Swarm RTL", help="Command all drones to return to launch location"):
-                if sim_alpha and sim_beta:
-                    sim_alpha.pos = np.array([0.0, 0.0, 10.0])
-                    sim_beta.pos = np.array([0.0, 0.0, 10.0])
+                if swarm_sims:
+                    for _i, _d in enumerate(swarm_ids):
+                        swarm_sims[_d].pos = _swarm.spawn_position(_i, len(swarm_ids))
                     st.warning("Fleet commanded to return to home base.")
         with cmd_c2:
-            if st.button("Rotor Failure (Beta)", help="Inject single rotor fail onto Drone Beta"):
-                if sim_beta:
-                    sim_beta.fault_rotor_failure = True
-                    st.error("Rotor 3 Jammed on Drone Beta!")
+            fault_target = st.selectbox(
+                "Rotor failure target", swarm_ids or ["-"],
+                index=min(1, max(len(swarm_ids) - 1, 0)),
+                format_func=lambda d: MULTIPLAYER_DRONES.get(d, {}).get("label", d))
+            if st.button("Inject Rotor Failure", help="Jam rotor 3 on the selected drone"):
+                if fault_target in swarm_sims:
+                    swarm_sims[fault_target].fault_rotor_failure = True
+                    st.error(f"Rotor 3 jammed on {MULTIPLAYER_DRONES.get(fault_target, {}).get('label', fault_target)}!")
                 else:
-                    st.error("Drone Beta offline.")
+                    st.error("Drone offline.")
             if st.button("Fleet Recharge & Refill", help="Refill payloads and recharge batteries for all drones"):
-                if sim_alpha and sim_beta:
-                    sim_alpha.fault_rotor_failure = False
-                    sim_beta.fault_rotor_failure = False
-                    sim_alpha.battery = 100.0
-                    sim_beta.battery = 100.0
-                    sim_alpha.payload_mass = 10.0
-                    sim_beta.payload_mass = 10.0
+                if swarm_sims:
+                    for _sim in swarm_sims.values():
+                        _sim.fault_rotor_failure = False
+                        _sim.battery = 100.0
+                        _sim.payload_mass = 10.0
                     st.success("Fleet recharged and payloads refilled!")
 
     with col_sw_map:
         st.subheader("Swarm 3D Spatial Digital Twin")
         st.markdown("Real-time 3D flight paths, active target vectors, safety proximity margins, and spray particle drift.")
-        
+
         # Plotly 3D Graph
         import plotly.graph_objects as go
-        
-        if "alpha_trail" not in st.session_state:
-            st.session_state["alpha_trail"] = []
-        if "beta_trail" not in st.session_state:
-            st.session_state["beta_trail"] = []
-            
-        if sim_alpha and getattr(sim_alpha, 'pos', None) is not None:
-            st.session_state["alpha_trail"].append(sim_alpha.pos.copy())
-            if len(st.session_state["alpha_trail"]) > 100:
-                st.session_state["alpha_trail"].pop(0)
-        if sim_beta and getattr(sim_beta, 'pos', None) is not None:
-            st.session_state["beta_trail"].append(sim_beta.pos.copy())
-            if len(st.session_state["beta_trail"]) > 100:
-                st.session_state["beta_trail"].pop(0)
-                
-        fig = go.Figure()
-        
-        # Plot trails
-        if len(st.session_state["alpha_trail"]) > 0:
-            trail_a = np.array(st.session_state["alpha_trail"])
-            fig.add_trace(go.Scatter3d(
-                x=trail_a[:, 0], y=trail_a[:, 1], z=trail_a[:, 2],
-                mode='lines',
-                line=dict(color='#00f2fe', width=4),
-                name='Drone Alpha Path'
-            ))
-            
-        if len(st.session_state["beta_trail"]) > 0:
-            trail_b = np.array(st.session_state["beta_trail"])
-            fig.add_trace(go.Scatter3d(
-                x=trail_b[:, 0], y=trail_b[:, 1], z=trail_b[:, 2],
-                mode='lines',
-                line=dict(color='#ff4b4b', width=4),
-                name='Drone Beta Path'
-            ))
-            
-        # Draw current positions
-        if sim_alpha and getattr(sim_alpha, 'pos', None) is not None:
-            fig.add_trace(go.Scatter3d(
-                x=[sim_alpha.pos[0]], y=[sim_alpha.pos[1]], z=[sim_alpha.pos[2]],
-                mode='markers+text',
-                marker=dict(size=12, color='#00f2fe', symbol='diamond', line=dict(width=1, color='white')),
-                text=["Alpha"],
-                textposition="top center",
-                name='Drone Alpha'
-            ))
-            if getattr(sim_alpha, 'target_pos', None) is not None:
-                fig.add_trace(go.Scatter3d(
-                    x=[sim_alpha.target_pos[0]], y=[sim_alpha.target_pos[1]], z=[sim_alpha.target_pos[2]],
-                    mode='markers',
-                    marker=dict(size=7, color='#00f2fe', symbol='cross'),
-                    name='Alpha Waypoint'
-                ))
-            
-        if sim_beta and getattr(sim_beta, 'pos', None) is not None:
-            fig.add_trace(go.Scatter3d(
-                x=[sim_beta.pos[0]], y=[sim_beta.pos[1]], z=[sim_beta.pos[2]],
-                mode='markers+text',
-                marker=dict(size=12, color='#ff4b4b', symbol='diamond', line=dict(width=1, color='white')),
-                text=["Beta"],
-                textposition="top center",
-                name='Drone Beta'
-            ))
-            if getattr(sim_beta, 'target_pos', None) is not None:
-                fig.add_trace(go.Scatter3d(
-                    x=[sim_beta.target_pos[0]], y=[sim_beta.target_pos[1]], z=[sim_beta.target_pos[2]],
-                    mode='markers',
-                    marker=dict(size=7, color='#ff4b4b', symbol='cross'),
-                    name='Beta Waypoint'
-                ))
+
+        trails = st.session_state.setdefault("swarm_trails", {})
+        for _d in list(trails):
+            if _d not in swarm_sims:
+                del trails[_d]
+        for _d in swarm_ids:
+            _pos = getattr(swarm_sims[_d], 'pos', None)
+            if _pos is not None:
+                trails.setdefault(_d, []).append(_pos.copy())
+                if len(trails[_d]) > 100:
+                    trails[_d].pop(0)
 
         # Collision avoidance wireframe spheres (6m diameter -> 3.0m radius)
         def make_sphere(cx, cy, cz, r=3.0, n_points=8):
@@ -6900,27 +6751,29 @@ with tabs[12]:
             z = cz + r * np.cos(theta)
             return x, y, z
 
-        if sim_alpha:
-            sx, sy, sz = make_sphere(sim_alpha.pos[0], sim_alpha.pos[1], sim_alpha.pos[2])
-            fig.add_trace(go.Surface(
-                x=sx, y=sy, z=sz,
-                opacity=0.15,
-                colorscale=[[0, '#00f2fe'], [1, '#00f2fe']],
-                showscale=False,
-                hoverinfo='skip',
-                name='Alpha Proximity Guard'
-            ))
-            
-        if sim_beta:
-            sx, sy, sz = make_sphere(sim_beta.pos[0], sim_beta.pos[1], sim_beta.pos[2])
-            fig.add_trace(go.Surface(
-                x=sx, y=sy, z=sz,
-                opacity=0.15,
-                colorscale=[[0, '#ff4b4b'], [1, '#ff4b4b']],
-                showscale=False,
-                hoverinfo='skip',
-                name='Beta Proximity Guard'
-            ))
+        fig = go.Figure()
+        for _i, _d in enumerate(swarm_ids):
+            _sim = swarm_sims[_d]
+            _col = MULTIPLAYER_DRONES.get(_d, {}).get("color", _swarm.drone_color(_i))
+            _name = _d.replace("drone_", "").capitalize()
+            if len(trails.get(_d, [])) > 0:
+                _tr = np.array(trails[_d])
+                fig.add_trace(go.Scatter3d(x=_tr[:, 0], y=_tr[:, 1], z=_tr[:, 2], mode='lines',
+                                           line=dict(color=_col, width=4), name=f'Drone {_name} Path'))
+            if getattr(_sim, 'pos', None) is None:
+                continue
+            fig.add_trace(go.Scatter3d(
+                x=[_sim.pos[0]], y=[_sim.pos[1]], z=[_sim.pos[2]], mode='markers+text',
+                marker=dict(size=12, color=_col, symbol='diamond', line=dict(width=1, color='white')),
+                text=[_name], textposition="top center", name=f'Drone {_name}'))
+            if getattr(_sim, 'target_pos', None) is not None:
+                fig.add_trace(go.Scatter3d(
+                    x=[_sim.target_pos[0]], y=[_sim.target_pos[1]], z=[_sim.target_pos[2]], mode='markers',
+                    marker=dict(size=7, color=_col, symbol='cross'), name=f'{_name} Waypoint'))
+            sx, sy, sz = make_sphere(_sim.pos[0], _sim.pos[1], _sim.pos[2])
+            fig.add_trace(go.Surface(x=sx, y=sy, z=sz, opacity=0.15,
+                                     colorscale=[[0, _col], [1, _col]], showscale=False,
+                                     hoverinfo='skip', name=f'{_name} Proximity Guard'))
 
         # Render Active Spray Particles
         particles = shared_state.get("ACTIVE_PARTICLES", np.zeros((0, 3)))
@@ -6929,15 +6782,15 @@ with tabs[12]:
             home_lon = shared_state.get("HOME_LON", 79.0)
             lat_deg_per_meter = 1.0 / 111320.0
             lon_deg_per_meter = 1.0 / (111320.0 * math.cos(math.radians(home_lat)))
-            
+
             p_x = (particles[:, 0] - home_lon) / lon_deg_per_meter
             p_y = (particles[:, 1] - home_lat) / lat_deg_per_meter
             p_z = particles[:, 2]
-            
+
             if len(p_x) > 800:
                 indices = np.random.choice(len(p_x), 800, replace=False)
                 p_x, p_y, p_z = p_x[indices], p_y[indices], p_z[indices]
-                
+
             fig.add_trace(go.Scatter3d(
                 x=p_x, y=p_y, z=p_z,
                 mode='markers',
@@ -6960,61 +6813,38 @@ with tabs[12]:
         )
         st.plotly_chart(fig, use_container_width=True)
 
-    # Telemetry grids for side-by-side display
+    # Telemetry deck: one card per drone, two per row
     st.write("---")
     st.subheader("Swarm Parallel Telemetry Deck")
-    
-    col_t1, col_t2 = st.columns(2)
-    
-    with col_t1:
-        st.markdown("### Drone Alpha (Lead)")
-        if sim_alpha:
-            a_c1, a_c2 = st.columns(2)
-            with a_c1:
-                drone_a = MULTIPLAYER_DRONES.get('drone_alpha', {})
-                st.metric("Latitude", f"{drone_a.get('lat', 0.0):.6f}")
-                st.metric("Longitude", f"{drone_a.get('lon', 0.0):.6f}")
-                alt = sim_alpha.pos[2] if getattr(sim_alpha, 'pos', None) is not None else 0.0
-                st.metric("Altitude (Relative)", f"{alt:.2f} m")
-            with a_c2:
-                spd = np.linalg.norm(sim_alpha.vel) if getattr(sim_alpha, 'vel', None) is not None else 0.0
-                st.metric("Ground Speed", f"{spd:.2f} m/s")
-                yaw = math.degrees(sim_alpha.attitude[2]) if getattr(sim_alpha, 'attitude', None) is not None else 0.0
-                st.metric("Yaw / Heading", f"{yaw:.1f}°")
-                st.metric("Sprayer Output State", "ACTIVE" if getattr(sim_alpha, 'is_spraying', False) else "INACTIVE")
-            
-            bat = getattr(sim_alpha, 'battery', 0.0)
-            pmass = getattr(sim_alpha, 'payload_mass', 0.0)
-            st.write(f"**Battery Status:** {bat:.1f}%")
-            st.progress(bat / 100.0)
-            st.write(f"**Estimated Payload Mass:** {pmass:.2f} kg / 10.00 kg")
-        else:
-            st.info("Drone Alpha Offline.")
 
-    with col_t2:
-        st.markdown("### Drone Beta (Scout / Support)")
-        if sim_beta:
-            b_c1, b_c2 = st.columns(2)
-            with b_c1:
-                drone_b = MULTIPLAYER_DRONES.get('drone_beta', {})
-                st.metric("Latitude", f"{drone_b.get('lat', 0.0):.6f}")
-                st.metric("Longitude", f"{drone_b.get('lon', 0.0):.6f}")
-                alt = sim_beta.pos[2] if getattr(sim_beta, 'pos', None) is not None else 0.0
-                st.metric("Altitude (Relative)", f"{alt:.2f} m")
-            with b_c2:
-                spd = np.linalg.norm(sim_beta.vel) if getattr(sim_beta, 'vel', None) is not None else 0.0
-                st.metric("Ground Speed", f"{spd:.2f} m/s")
-                yaw = math.degrees(sim_beta.attitude[2]) if getattr(sim_beta, 'attitude', None) is not None else 0.0
-                st.metric("Yaw / Heading", f"{yaw:.1f}°")
-                st.metric("Sprayer Output State", "ACTIVE" if getattr(sim_beta, 'is_spraying', False) else "INACTIVE")
-            
-            bat = getattr(sim_beta, 'battery', 0.0)
-            pmass = getattr(sim_beta, 'payload_mass', 0.0)
-            st.write(f"**Battery Status:** {bat:.1f}%")
-            st.progress(bat / 100.0)
-            st.write(f"**Estimated Payload Mass:** {pmass:.2f} kg / 10.00 kg")
-        else:
-            st.info("Drone Beta Offline.")
+    if not swarm_ids:
+        st.info("Fleet offline: the physics thread has not started yet.")
+    for _row_start in range(0, len(swarm_ids), 2):
+        _cols = st.columns(2)
+        for _col_ui, _d in zip(_cols, swarm_ids[_row_start:_row_start + 2]):
+            _sim = swarm_sims[_d]
+            _rec = MULTIPLAYER_DRONES.get(_d, {})
+            with _col_ui:
+                _role = "Lead" if _d == swarm_ids[0] else "Support"
+                st.markdown(f"### {_rec.get('label', _d)} ({_role})")
+                c_1, c_2 = st.columns(2)
+                with c_1:
+                    st.metric("Latitude", f"{_rec.get('lat', 0.0):.6f}")
+                    st.metric("Longitude", f"{_rec.get('lon', 0.0):.6f}")
+                    alt = _sim.pos[2] if getattr(_sim, 'pos', None) is not None else 0.0
+                    st.metric("Altitude (Relative)", f"{alt:.2f} m")
+                with c_2:
+                    spd = np.linalg.norm(_sim.vel) if getattr(_sim, 'vel', None) is not None else 0.0
+                    st.metric("Ground Speed", f"{spd:.2f} m/s")
+                    yaw = math.degrees(_sim.attitude[2]) if getattr(_sim, 'attitude', None) is not None else 0.0
+                    st.metric("Yaw / Heading", f"{yaw:.1f}°")
+                    st.metric("Sprayer Output State", "ACTIVE" if getattr(_sim, 'is_spraying', False) else "INACTIVE")
+
+                bat = getattr(_sim, 'battery', 0.0)
+                pmass = getattr(_sim, 'payload_mass', 0.0)
+                st.write(f"**Battery Status:** {bat:.1f}%")
+                st.progress(max(0.0, min(1.0, bat / 100.0)))
+                st.write(f"**Estimated Payload Mass:** {pmass:.2f} kg / 10.00 kg")
 
 
 # ══════════════════════════════════════════════════════════════

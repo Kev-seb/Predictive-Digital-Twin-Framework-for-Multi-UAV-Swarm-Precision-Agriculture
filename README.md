@@ -480,17 +480,77 @@ python digital_twin_api.py
 
 API available at **http://127.0.0.1:8008/docs** (Swagger UI).
 
-Key endpoints:
+The API is backed by `src/twin_core`, the single source of truth for the simulated
+paddy field: a georeferenced 40 × 40 grid (2.5 m cells, ~1 ha) holding a mean and a
+variance for NDVI, stress, moisture, nitrogen and fungus. The twin advances with a
+rice-specific process model (`paddy_model.py`: flooded water balance, GDD phenology
+fitted to the flight manifest, weather-driven disease) and is corrected by observations
+through a per-cell Kalman filter with adaptive inflation (assimilate). Calibrate it with
+`scripts/extract_flight_ndvi.py` + `scripts/calibrate_paddy.py`. State persists to `outputs/twin_core/<field_id>/`.
+Ports, grid size and field id are set in `src/config/config.py` (env prefix `UAV_`).
+See [`docs/digital_twin_plan.md`](docs/digital_twin_plan.md) for the roadmap.
+
+UE5 endpoints (20 × 20 HISM grid, resampled from the twin):
 
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/` | Health check |
-| `POST` | `/field/update` | Receive per-instance state from UE5 |
-| `GET` | `/field/status` | Full 400-instance field state |
-| `GET` | `/field/heatmap` | NDVI grid as 20 × 20 list |
-| `GET` | `/field/anomalies` | Instances with NDVI drop above threshold |
-| `GET` | `/field/summary` | Aggregated field statistics |
-| `DELETE` | `/field/reset` | Reset all instances to defaults |
+| `POST` | `/field/update` | UE5 pushes per-instance state; assimilated as `ue5` observations |
+| `GET` | `/field/status` | Full 400-instance field state (with `ndvi_std` / `stress_std`) |
+| `GET` | `/field/heatmap` | NDVI, stress and uncertainty grids (20 × 20) |
+| `GET` | `/field/anomalies` | Cells with stress > 0.7 or NDVI drop > 0.15 |
+| `GET` | `/field/summary` | Aggregated field statistics + recent daily history |
+| `DELETE` | `/field/reset` | Reset the twin to its prior |
+
+Twin endpoints:
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/twin/state` | Summary, per-layer uncertainty and per-zone values |
+| `GET` | `/twin/layers/{layer}` | One layer (`mean` / `var` / `std`) at any resolution |
+| `POST` | `/twin/step` | Advance N days with weather and zone interventions |
+| `POST` | `/twin/observe/point` | Assimilate a geotagged reading (scout, drone camera) |
+| `POST` | `/twin/observe/grid` | Assimilate a raster (multispectral survey) |
+| `POST` | `/twin/what-if` | Compare interventions vs. doing nothing on a forked twin |
+| `POST` | `/twin/stage` | Set the paddy growth stage |
+| `GET` | `/twin/history`, `/twin/events` | Daily history and event log |
+| `WS` | `/ws/twin` | Live event stream for UE5 and the three.js view |
+| `POST` | `/twin/ingest/rgb` | RGB AI result + telemetry → assimilated point observation |
+| `POST` | `/twin/ingest/multispectral` | 4-band reflectance → assimilated ndvi / moisture / nitrogen |
+
+Simulation endpoints (the hidden "physical" field the twin tracks):
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/sim/reset` | New virtual field with a hidden outbreak and dry patch |
+| `POST` | `/sim/advance` | Advance truth (actual weather) and twin (forecast) together |
+| `POST` | `/sim/drone-pass` | Serpentine RGB pass, every frame assimilated |
+| `POST` | `/sim/survey` | Multispectral survey, assimilated |
+| `GET` | `/sim/error` | Twin vs truth: RMSE, bias, 95% interval coverage |
+
+| `POST` | `/sim/mission` | Plan and fly a fleet mission (`scout`, `spray` or `auto`); sprays apply on the next `/sim/advance` |
+
+Swarm endpoints (N-drone fleet in 6-DOF flight physics):
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/swarm/state` | Drone positions, battery, spray state (dashboard `/swarm` format) |
+| `POST` / `DELETE` | `/swarm/drones` | Add or remove drones (fleet size: `UAV_TWIN_SWARM_SIZE`) |
+| `POST` | `/swarm/plan` | Allocate scout / spray tasks under battery and tank limits |
+
+Fleet missions can also run over **MAVLink**, using the mission upload protocol with GUIDED, AUTO and RTL. They fly on the built-in vehicle emulator or on **ArduPilot SITL**, one instance per drone; set `"backend": "mavlink"` on `/sim/mission`. See [`docs/sitl.md`](docs/sitl.md).
+
+The Streamlit **Swarm Operations Dashboard** runs any number of drones (1–12). Set the starting fleet size with `UAV_DASHBOARD_SWARM_SIZE`, or change it live with the Fleet size slider.
+
+Validate the twin offline:
+
+```bash
+python scripts/run_twin_osse.py --days 21
+```
+
+```bash
+python scripts/run_twin_osse.py --closed-loop --days 21 --fleet 3
+```
 
 ### 5.4 Run the Mobile API (companion app backend)
 
@@ -502,10 +562,25 @@ Scan the QR code from the dashboard to open the companion app on your phone.
 
 ### 5.5 Unreal Engine 5 / Unity Digital Twin Bridge
 
-1. Start `digital_twin_api.py` on the same machine as UE5.
-2. In UE5, add `src/unity_integration/UnityBridgeClient.cs` (or the Blueprint equivalent) to your level Actor.
-3. Set `ApiBaseUrl = "http://127.0.0.1:8008"` in the component.
-4. The C# client polls `/field/status` every 500 ms and updates the HISM material parameters (`NDVI`, `StressLevel`, `GrowthStage`) per-instance on the GPU.
+**UE5, no C++:** enable UE5's built-in *Python Editor Script Plugin*, then run `src/ue5_integration/python/twin_live.py` with *File → Execute Python Script*. It drives your rice field, or builds a twin field and a reality field from blocks, moves the drones and shows captions. See the quick start in [`src/ue5_integration/README.md`](src/ue5_integration/README.md).
+
+**UE5 C++ plugin:** alternatively, install the `TwinStream` plugin from `src/ue5_integration/`. It subscribes to `/ws/field`, so the twin pushes 20 × 20 field snapshots (NDVI, stress, uncertainty, moisture, fungus, anomalies) and drone mission tracks as they change. It writes them into the HISM's per-instance custom data for `M_RiceCrop`. Setup, material slots and the message schema are in [`src/ue5_integration/README.md`](src/ue5_integration/README.md).
+
+Check the stream without UE5:
+
+```bash
+python scripts/twin_stream_client.py --heatmap
+```
+
+**Live demo for presentations:**
+
+```bash
+curl -X POST localhost:8008/demo/start -H 'content-type: application/json' -d '{}'
+```
+
+This runs the full digital-twin story with drones flying in real time. The field updates under the drones, and a twin-vs-reality view and on-screen captions are available. See *Demo for presentations* in [`src/ue5_integration/README.md`](src/ue5_integration/README.md).
+
+**Polling (legacy):** `/field/status` keeps its original contract, so `src/unity_integration/UnityBridgeClient.cs` and existing Blueprints that poll it still work.
 
 ### 5.6 Research Pipeline
 
