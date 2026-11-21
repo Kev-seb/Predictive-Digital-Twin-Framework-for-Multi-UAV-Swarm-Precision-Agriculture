@@ -114,6 +114,8 @@ def test_blocks_mode_shows_field_drones_and_story(fake_unreal, api):
         assert max(c.r for c in colours) > 0.2                                # outbreak visible in reality
         heights = {round(a.scale.z, 3) for a, _, _ in live.twin_field.cells}
         assert len(heights) > 10                                              # NDVI drives crop height
+        forecast = [mid.params["Color"] for _, mid, _ in live.forecast_field.cells]
+        assert len({(round(c.r, 3), round(c.g, 3)) for c in forecast}) > 10   # forecast field coloured
         assert any("drones scouting" in c and "twin vs reality error" in c for c in captions), captions
     finally:
         mod.twin_live_stop()
@@ -129,13 +131,13 @@ def test_camera_framed_and_texts_face_it(fake_unreal, api):
         loc, rot = cam
         assert loc.z > live.center.z and loc.y > live.center.y          # raised, south of the fields
         assert -60.0 < rot.pitch < -15.0                                  # looking down at the fields
-        assert [t.text_render.text for t in live.labels] == ["TWIN", "REALITY"]
+        assert [t.text_render.text for t in live.labels] == ["TWIN", "REALITY", "FORECAST +7 DAYS"]
         fake_unreal._tick_all()
         for t in live.texts:                                              # readable side (+X) faces camera
             d = loc - t.location
             assert abs(math.remainder(t.rotation.yaw - math.degrees(math.atan2(d.y, d.x)), 360.0)) < 1e-6
-        # Twin on the left, reality on the right, as seen from the camera (looking north, -Y).
-        assert live.labels[0].location.x < live.labels[1].location.x
+        # Left to right as seen from the camera (looking north, -Y): twin, reality, forecast.
+        assert live.labels[0].location.x < live.labels[1].location.x < live.labels[2].location.x
         fake_unreal.UnrealEditorSubsystem.camera = None
         mod.twin_live_camera()
         assert fake_unreal.UnrealEditorSubsystem.camera is not None

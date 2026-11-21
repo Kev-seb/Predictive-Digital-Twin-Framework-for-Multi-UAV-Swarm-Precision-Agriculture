@@ -48,6 +48,8 @@ POLL_HZ = 10.0
 FIELD_MODE = "auto"              # "auto" | "hism" | "blocks"
 TWIN_ACTOR_LABEL = None          # hism mode: label of your field actor (None = first 400-instance ISM)
 REALITY_LABEL_HINT = "Reality"   # hism mode: label substring of the optional reality field
+FORECAST_LABEL_HINT = "Forecast" # hism mode: label substring of the optional forecast field
+SHOW_FORECAST = True             # blocks mode: third field with the twin's 7-day prediction
 BLOCKS_ORIGIN = unreal.Vector(0.0, 0.0, 0.0)   # blocks mode: north-west corner of the twin field (cm)
 BLOCKS_GAP_CELLS = 4             # blocks mode: gap between twin and reality fields
 CELL_CM = 500.0                  # blocks mode: 5 m cells, like the twin's 20 x 20 grid
@@ -255,7 +257,7 @@ class HismField:
 
 
 def _find_hism_fields():
-    twin = reality = None
+    twin = reality = forecast = None
     for actor in _actors():
         try:
             comps = actor.get_components_by_class(unreal.InstancedStaticMeshComponent)
@@ -267,36 +269,49 @@ def _find_hism_fields():
             label = actor.get_actor_label()
             if REALITY_LABEL_HINT and REALITY_LABEL_HINT.lower() in label.lower():
                 reality = reality or comp
+            elif FORECAST_LABEL_HINT and FORECAST_LABEL_HINT.lower() in label.lower():
+                forecast = forecast or comp
             elif twin is None and (TWIN_ACTOR_LABEL is None or label == TWIN_ACTOR_LABEL):
                 twin = comp
-    return twin, reality
+    return twin, reality, forecast
 
 
 # ===================================================================== client
 class TwinLive:
     def __init__(self):
         self.frame, self.seq, self.lock, self.running = None, -1, threading.Lock(), True
-        self.twin_field = self.truth_field = None
+        self.twin_field = self.truth_field = self.forecast_field = None
         self.drones, self.targets, self.caption = {}, {}, None
         self.errors = 0
-        twin, reality = (None, None) if FIELD_MODE == "blocks" else _find_hism_fields()
+        twin, reality, forecast = (None, None, None) if FIELD_MODE == "blocks" else _find_hism_fields()
         if twin is not None:
             self.twin_field = HismField(twin)
             self.truth_field = HismField(reality) if reality is not None else None
+            self.forecast_field = HismField(forecast) if forecast is not None else None
             unreal.log(f"[twin_live] hism mode: field '{twin.get_owner().get_actor_label()}'"
-                       + (f", reality '{reality.get_owner().get_actor_label()}'" if reality else ""))
+                       + (f", reality '{reality.get_owner().get_actor_label()}'" if reality else "")
+                       + (f", forecast '{forecast.get_owner().get_actor_label()}'" if forecast else ""))
         elif FIELD_MODE == "hism":
             raise RuntimeError("FIELD_MODE='hism' but no 400-instance ISM/HISM found in the level")
         else:
             self.twin_field = BlocksField(BLOCKS_ORIGIN, "Twin")
             gap = (GRID + BLOCKS_GAP_CELLS) * CELL_CM
             self.truth_field = BlocksField(BLOCKS_ORIGIN + unreal.Vector(gap, 0.0, 0.0), "Reality")
-            unreal.log("[twin_live] blocks mode: built 'Twin' and 'Reality' fields")
+            if SHOW_FORECAST:
+                self.forecast_field = BlocksField(BLOCKS_ORIGIN + unreal.Vector(2 * gap, 0.0, 0.0), "Forecast")
+            unreal.log("[twin_live] blocks mode: built 'Twin', 'Reality'"
+                       + (" and 'Forecast'" if SHOW_FORECAST else "") + " fields")
         size = self.twin_field.size_cm()
-        fields = [self.twin_field] + ([self.truth_field] if self.truth_field is not None else [])
-        centers = [f.grid_to_world(GRID / 2.0, GRID / 2.0, 0.0) for f in fields]
-        self.center = centers[0] if len(centers) == 1 else (centers[0] + centers[1]) * 0.5
-        self.span = size if len(centers) == 1 else size + (centers[1] - centers[0]).length()
+        views = [(self.twin_field, "TWIN", (120, 200, 255)),
+                 (self.truth_field, "REALITY", (255, 200, 120)),
+                 (self.forecast_field, "FORECAST +7 DAYS", (200, 160, 255))]
+        views = [v for v in views if v[0] is not None]
+        centers = [f.grid_to_world(GRID / 2.0, GRID / 2.0, 0.0) for f, _, _ in views]
+        mean = centers[0]
+        for c in centers[1:]:
+            mean = mean + c
+        self.center = mean * (1.0 / len(centers))
+        self.span = size + (centers[-1] - centers[0]).length()
         # Caption above the scene's north edge; labels above each field.
         north = self.twin_field.grid_to_world(-1.0, GRID / 2.0, 0.0) - centers[0]
         self.cm_per_m = size / (GRID * 5.0)        # the twin's cells are 5 m
@@ -305,9 +320,9 @@ class TwinLive:
                                    (255, 255, 255))
         # Labels stand just behind each field's north edge, clear of the blocks.
         self.labels = [_text_actor(c + north * 1.5 + unreal.Vector(0.0, 0.0, size * 0.06), name,
-                                   size * 0.08, f"Label_{name}", color)
-                       for c, name, color in zip(centers, ("TWIN", "REALITY"),
-                                                 ((120, 200, 255), (255, 200, 120)))]
+                                   size * (0.08 if len(name) < 10 else 0.055),
+                                   f"Label_{name.split()[0]}", color)
+                       for c, (_, name, color) in zip(centers, views)]
         self.texts = [self.caption] + self.labels
         if AUTO_FRAME_CAMERA:
             self.frame_camera()
@@ -364,6 +379,13 @@ class TwinLive:
                                   f.get("moisture"), f.get("anomalies", ()))
         else:
             self.twin_field.apply(f["ndvi"], f["stress"], f["fungus"], f.get("stress_std"))
+        if self.forecast_field is not None and f.get("forecast_stress"):
+            if isinstance(self.forecast_field, HismField):
+                self.forecast_field.apply(f["forecast_ndvi"], f["forecast_stress"], f["forecast_fungus"],
+                                          f.get("forecast_std"), None, ())
+            else:
+                self.forecast_field.apply(f["forecast_ndvi"], f["forecast_stress"], f["forecast_fungus"],
+                                          f.get("forecast_std"))
         if self.truth_field is None or not f.get("truth_stress"):
             return
         no_uncertainty = [0.0] * len(f["truth_stress"])     # reality is known exactly
@@ -423,7 +445,7 @@ class TwinLive:
             _destroy(d["cone"])
         for t in getattr(self, "texts", [self.caption] if self.caption else []):
             _destroy(t)
-        for f in (self.twin_field, self.truth_field):
+        for f in (self.twin_field, self.truth_field, self.forecast_field):
             if f is not None:
                 f.destroy()
 

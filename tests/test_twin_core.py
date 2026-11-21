@@ -740,3 +740,23 @@ def test_live_action_busy_guard(client):
     client.post("/demo/start", json={"days": 30, "day_seconds": 5})
     assert client.post("/live/action", json={"action": "next_day"}).status_code == 409
     client.post("/demo/stop")
+
+
+# ---------------------------------------------------------------- forecast
+def test_snapshot_carries_forecast_and_what_if(client):
+    client.post("/sim/reset", json={"seed": 7})
+    client.post("/sim/advance", json={"days": 3})
+    client.post("/sim/mission", json={"kind": "scout"})          # the twin now knows the outbreak
+    f = client.get("/ue5/frame").json()["field"]
+    for k in ("forecast_stress", "forecast_fungus", "forecast_ndvi", "forecast_std"):
+        assert len(f[k]) == 400, k
+    wi = f["what_if"]
+    assert wi["days"] == 7 and wi["on_day"] == f["sim_day"] + 7
+    assert wi["spray_zones"]                                        # the twin flags zones to spray
+    assert wi["if_sprayed"]["fungus_peak"] < wi["no_spray"]["fungus_peak"]
+    # Forecast is the future: disease keeps growing if nothing is done.
+    assert sum(f["forecast_fungus"]) > sum(f["fungus"])
+    # Forecasting never touches the live twin.
+    day = client.get("/twin/state").json()["sim_day"]
+    client.get("/ue5/frame")
+    assert client.get("/twin/state").json()["sim_day"] == day

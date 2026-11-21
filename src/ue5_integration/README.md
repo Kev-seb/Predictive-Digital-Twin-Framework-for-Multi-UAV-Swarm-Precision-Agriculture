@@ -16,7 +16,12 @@ The `TwinStream` C++ plugin (sections 1–7) connects a UE5 level to the digital
    ```
 
 3. **Run the script in UE5:** *File → Execute Python Script…* and pick `src/ue5_integration/python/twin_live.py`.
-   - **Empty level:** the script builds a **Twin** field and a **Reality** field next to each other, 20×20 blocks each. Block colour shows stress and fungus, and block height shows NDVI.
+   - **Empty level:** the script builds three 20×20 block fields side by side. Block colour shows stress and fungus, and block height shows NDVI.
+     - **TWIN:** what the twin believes now.
+     - **REALITY:** the hidden truth.
+     - **FORECAST +7 DAYS:** what the twin predicts a week ahead if nothing is done. It's faded where the prediction is uncertain. This is the "predictive" part of a predictive digital twin.
+
+     Set `SHOW_FORECAST = False` at the top of the script to hide the forecast field. In a level with your own field, an actor labelled "Forecast" gets the prediction.
    - **Level with your rice field** (a 400-instance HISM): the script drives your field instead, through per-instance custom data slots 0–5, which you read in `M_RiceCrop` with *PerInstanceCustomData* nodes. Label a second field actor with "Reality" to get the hidden truth on it.
 4. **Start the story:**
 
@@ -179,6 +184,10 @@ Messages are JSON text frames.
 `error` is the twin's RMSE against the hidden reality.
 
 In simulation, **`field.snapshot`** also carries `truth_ndvi`, `truth_stress` and `truth_fungus`, each 400 floats.
+
+Every snapshot also carries the twin's 7-day forecast, computed on a copy of the twin so the live twin is untouched:
+- **`forecast_ndvi`, `forecast_stress`, `forecast_fungus`, `forecast_std`:** the predicted field if nothing is done.
+- **`what_if`:** `{days, on_day, no_spray, if_sprayed, spray_zones}`, comparing doing nothing with spraying the zones the twin flags now. Each scenario gives mean and peak fungus, mean NDVI and mean stress.
 
 **Client → server:** `{"type": "snapshot"}` requests a snapshot immediately.
 

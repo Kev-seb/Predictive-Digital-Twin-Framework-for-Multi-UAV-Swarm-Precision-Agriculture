@@ -88,7 +88,9 @@ from src.twin_core.ingest import ingest_multispectral, ingest_rgb_result
 from src.twin_core.swarm import Fleet, allocate, tasks_from_twin
 from src.twin_core import mavlink_mission as mm
 from src.twin_core.virtual_field import VirtualField, serpentine_waypoints
-from src.twin_core.weather_feed import get_weather
+from src.twin_core.weather_feed import get_weather, synthetic_weather
+
+FORECAST_DAYS = 7
 
 WeatherSource = Literal["manual", "synthetic", "openmeteo", "auto"]
 
@@ -384,7 +386,57 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
                 "anomalies": anomalies,
                 "pending_sprays": [p["zone_id"] for p in ctx["pending_interventions"]],
                 **truth_layers(flat),
+                **forecast_layers(flat),
             }
+
+    def forecast_bundle() -> Dict[str, Any]:
+        """
+        The twin's prediction FORECAST_DAYS ahead, on forks (the live twin is
+        untouched): doing nothing vs spraying the zones the twin flags now.
+        Uses the same weather forecast /sim/advance feeds the twin. Cached
+        until the twin changes.
+        """
+        version = int(ctx.get("field_version", 0))
+        cached = ctx.get("_forecast")
+        if cached is not None and cached["version"] == version:
+            return cached
+        twin = get_twin()
+        weather = synthetic_weather(FORECAST_DAYS, start_day=twin.state.sim_day + 1)
+        fleet = get_fleet()
+        spray_tasks = tasks_from_twin(twin, "spray", fleet.frame, fleet.spec, fungus_threshold=0.15)
+        plan = [{"day": 1, "zone_id": t.zone_id, "type": "Fungicide Spray"} for t in spray_tasks]
+        plan += [{"day": 1, "zone_id": p["zone_id"], "type": p["type"]} for p in ctx["pending_interventions"]]
+        no_spray = twin.fork()
+        no_spray.step(days=FORECAST_DAYS, weather=weather,
+                      interventions=[{"day": 1, "zone_id": p["zone_id"], "type": p["type"]}
+                                     for p in ctx["pending_interventions"]])
+        sprayed = twin.fork()
+        sprayed.step(days=FORECAST_DAYS, weather=weather, interventions=plan)
+
+        def brief(t: DigitalTwin) -> Dict[str, float]:
+            m = t.state.mean
+            return {"fungus_mean": round(float(m["fungus"].mean()), 4),
+                    "fungus_peak": round(float(m["fungus"].max()), 4),
+                    "ndvi_mean": round(float(m["ndvi"].mean()), 4),
+                    "stress_mean": round(float(m["stress"].mean()), 4)}
+
+        bundle = {"version": version, "days": FORECAST_DAYS, "state": no_spray.state,
+                  "no_spray": brief(no_spray), "if_sprayed": brief(sprayed),
+                  "spray_zones": sorted({p["zone_id"] for p in plan}),
+                  "on_day": twin.state.sim_day + FORECAST_DAYS}
+        ctx["_forecast"] = bundle
+        return bundle
+
+    def forecast_layers(flat) -> Dict[str, Any]:
+        b = forecast_bundle()
+        st = b["state"]
+        return {"forecast_days": b["days"],
+                "forecast_stress": flat(st.resample("stress", UE5_GRID, UE5_GRID)),
+                "forecast_fungus": flat(st.resample("fungus", UE5_GRID, UE5_GRID)),
+                "forecast_ndvi": flat(np.clip(st.resample("ndvi", UE5_GRID, UE5_GRID), 0.0, 1.0)),
+                "forecast_std": flat(np.sqrt(st.resample("stress", UE5_GRID, UE5_GRID, which="var"))),
+                "what_if": {"days": b["days"], "on_day": b["on_day"], "no_spray": b["no_spray"],
+                            "if_sprayed": b["if_sprayed"], "spray_zones": b["spray_zones"]}}
 
     def truth_layers(flat) -> Dict[str, Any]:
         """Hidden 'reality' of the virtual field, for twin-vs-reality views (sim only)."""
