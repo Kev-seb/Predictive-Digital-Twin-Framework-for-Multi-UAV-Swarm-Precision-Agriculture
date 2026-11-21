@@ -96,6 +96,9 @@ def test_blocks_mode_shows_field_drones_and_story(fake_unreal, api):
             return "Demo finished" in live.caption.text_render.text
         assert _pump_until(fake_unreal, live, done), live.caption.text_render.text
         assert len(live.drones) == 3 and seen_spray["v"]
+        body = next(iter(live.drones.values()))["body"]
+        assert body.scale.x == pytest.approx(4.0)                        # 4 m drones on 5 m cells
+        assert live.caption.text_render.size > 300 and live.caption.text_render.color.r == 255
         # Drones flew over the field (grid 20 x 20 cells of 500 cm from the origin).
         xs = [d["pos"].x for d in live.drones.values()]
         assert all(-500 <= x <= 20 * 500 + 500 for x in xs)

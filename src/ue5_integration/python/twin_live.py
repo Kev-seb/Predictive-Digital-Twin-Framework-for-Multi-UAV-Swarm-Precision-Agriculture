@@ -48,6 +48,7 @@ CELL_CM = 500.0                  # blocks mode: 5 m cells, like the twin's 20 x 
 GRID = 20
 SMOOTHING = 0.35                 # drone motion smoothing per editor tick (0..1)
 AUTO_FRAME_CAMERA = True         # frame the editor camera over the fields on start
+DRONE_SIZE_M = 4.0               # drawn drone size; real ~1.6 m drones vanish over a 100 m field
 
 _SPHERE = "/Engine/BasicShapes/Sphere"
 _CUBE = "/Engine/BasicShapes/Cube"
@@ -278,10 +279,13 @@ class TwinLive:
         self.span = size if len(centers) == 1 else size + (centers[1] - centers[0]).length()
         # Caption above the scene's north edge; labels above each field.
         north = self.twin_field.grid_to_world(-1.0, GRID / 2.0, 0.0) - centers[0]
-        self.caption = _text_actor(self.center + north + unreal.Vector(0.0, 0.0, size * 0.3),
-                                   "Digital twin: waiting for the API...", size * 0.022, "TwinCaption")
-        self.labels = [_text_actor(c + unreal.Vector(0.0, 0.0, size * 0.12), name, size * 0.07,
-                                   f"Label_{name}", color)
+        self.cm_per_m = size / (GRID * 5.0)        # the twin's cells are 5 m
+        self.caption = _text_actor(self.center + north * 3.0 + unreal.Vector(0.0, 0.0, size * 0.35),
+                                   "Digital twin: waiting for the API...", size * 0.045, "TwinCaption",
+                                   (255, 255, 255))
+        # Labels stand just behind each field's north edge, clear of the blocks.
+        self.labels = [_text_actor(c + north * 1.5 + unreal.Vector(0.0, 0.0, size * 0.06), name,
+                                   size * 0.08, f"Label_{name}", color)
                        for c, name, color in zip(centers, ("TWIN", "REALITY"),
                                                  ((120, 200, 255), (255, 200, 120)))]
         self.texts = [self.caption] + self.labels
@@ -364,10 +368,14 @@ class TwinLive:
             row, col, alt, spraying, heading = p
             if d_id not in self.drones:
                 color = _DRONE_COLORS[i % len(_DRONE_COLORS)]
+                k = DRONE_SIZE_M * self.cm_per_m / 100.0     # engine shapes are 100 cm
                 body, _ = _mesh_actor(_SPHERE, self.twin_field.grid_to_world(row, col, alt),
-                                      unreal.Vector(1.6, 1.6, 0.6), color, f"Drone_{d_id}")
-                cone, _ = _mesh_actor(_CONE, self.twin_field.grid_to_world(row, col, max(alt - 1.5, 0.0)),
-                                      unreal.Vector(2.5, 2.5, -1.5), (0.45, 0.75, 1.0), f"Spray_{d_id}")
+                                      unreal.Vector(k, k, k * 0.4), color, f"Drone_{d_id}")
+                # Negative Z scale flips the cone so it points down from the drone.
+                cone, _ = _mesh_actor(_CONE, self.twin_field.grid_to_world(row, col, alt),
+                                      unreal.Vector(k * 1.3, k * 1.3, -k * 1.2), (0.45, 0.75, 1.0),
+                                      f"Spray_{d_id}")
+                cone.set_is_temporarily_hidden_in_editor(True)
                 self.drones[d_id] = {"body": body, "cone": cone, "pos": None}
             target = self.twin_field.grid_to_world(row, col, alt)
             self.targets[d_id] = (target, bool(spraying), heading)
@@ -380,7 +388,8 @@ class TwinLive:
             d["body"].set_actor_location(pos, False, True)
             if heading is not None:
                 d["body"].set_actor_rotation(unreal.Rotator(roll=0.0, pitch=0.0, yaw=heading - 90.0), True)
-            d["cone"].set_actor_location(pos - unreal.Vector(0.0, 0.0, 160.0), False, True)
+            drop = DRONE_SIZE_M * self.cm_per_m * 0.8          # cone hangs just under the drone
+            d["cone"].set_actor_location(pos - unreal.Vector(0.0, 0.0, drop), False, True)
             d["cone"].set_is_temporarily_hidden_in_editor(not spraying)
 
     def stop(self):
