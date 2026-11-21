@@ -408,7 +408,7 @@ def test_fleet_scout_mission_feeds_twin(grid):
     assert not rep["timed_out"]
     for st in rep["drones"].values():
         assert st["completed"] and st["captures"] > 0
-        assert st["flight_s"] == pytest.approx(st["est_time_s"], rel=0.3)   # planner is honest
+        assert st["flight_s"] == pytest.approx(st["est_time_s"], rel=0.15)  # planner is honest
     assert vf.twin_error(twin)["fungus"]["rmse"] < 0.7 * before
     for s in fleet.snapshot()["drones"].values():
         assert s["alt"] < 1.5                                                 # back on the pad
@@ -702,3 +702,83 @@ def test_ue5_frame_polling(client):
     assert fr["status"]["phase"] == "done"
     assert fr["drones"]["fields"][0] == "row" and len(fr["drones"]["drones"]) >= 1
     assert "truth_stress" in fr["field"]
+
+
+# ------------------------------------------------------------ live actions
+def _wait_idle(client, timeout=30.0):
+    import time as _t
+    end = _t.time() + timeout
+    while _t.time() < end:
+        st = client.get("/demo/status").json()
+        if not st["running"]:
+            return st
+        _t.sleep(0.05)
+    raise AssertionError("action did not finish")
+
+
+def test_live_actions_step_the_story(client):
+    assert client.post("/live/action", json={"action": "reset", "seed": 3}).status_code == 200
+    assert _wait_idle(client)["phase"] == "start"
+    before = client.get("/sim/truth/layers/fungus?rows=20&cols=20").json()["values"]
+    client.post("/live/action", json={"action": "outbreak", "row": 15, "col": 4, "load": 0.6})
+    st = _wait_idle(client)
+    assert st["phase"] == "outbreak"
+    after = client.get("/sim/truth/layers/fungus?rows=20&cols=20").json()["values"]
+    assert after[15][4] > before[15][4] + 0.3                      # hidden field changed there
+    assert after[2][2] == pytest.approx(before[2][2], abs=0.02)   # and only there
+    twin_before = client.get("/twin/layers/fungus?rows=20&cols=20").json()["values"][15][4]
+    client.post("/live/action", json={"action": "next_day"})
+    assert _wait_idle(client)["phase"] == "advance"
+    client.post("/live/action", json={"action": "auto", "playback_speed": 500})
+    st = _wait_idle(client, 60)
+    assert st["phase"] in ("spray", "decide") and st["error"] is None
+    twin_after = client.get("/twin/layers/fungus?rows=20&cols=20").json()["values"][15][4]
+    assert twin_after > twin_before + 0.1                          # scouting found the new outbreak
+
+
+def test_live_action_busy_guard(client):
+    client.post("/demo/start", json={"days": 30, "day_seconds": 5})
+    assert client.post("/live/action", json={"action": "next_day"}).status_code == 409
+    client.post("/demo/stop")
+
+
+# ---------------------------------------------------------------- forecast
+def test_snapshot_carries_forecast_and_what_if(client):
+    client.post("/sim/reset", json={"seed": 7})
+    client.post("/sim/advance", json={"days": 3})
+    client.post("/sim/mission", json={"kind": "scout"})          # the twin now knows the outbreak
+    f = client.get("/ue5/frame").json()["field"]
+    for k in ("forecast_stress", "forecast_fungus", "forecast_ndvi", "forecast_std"):
+        assert len(f[k]) == 400, k
+    wi = f["what_if"]
+    assert wi["days"] == 7 and wi["on_day"] == f["sim_day"] + 7
+    assert wi["spray_zones"]                                        # the twin flags zones to spray
+    assert wi["if_sprayed"]["fungus_peak"] < wi["no_spray"]["fungus_peak"]
+    # Forecast is the future: disease keeps growing if nothing is done.
+    assert sum(f["forecast_fungus"]) > sum(f["fungus"])
+    # Forecasting never touches the live twin.
+    day = client.get("/twin/state").json()["sim_day"]
+    client.get("/ue5/frame")
+    assert client.get("/twin/state").json()["sim_day"] == day
+
+
+# ----------------------------------------------------------------- metrics
+def test_metrics_panel_numbers(client):
+    from digital_twin_api import expected_harvest_t_ha
+    from src.twin_core import DigitalTwin, FieldGrid
+
+    healthy = DigitalTwin("h", grid=FieldGrid.centered_on(10.0, 78.0, rows=20, cols=20, cell_size_m=5.0))
+    assert 5.5 < expected_harvest_t_ha(healthy) < 7.0                  # typical Tamil Nadu paddy
+
+    client.post("/sim/reset", json={"seed": 7})
+    client.post("/sim/advance", json={"days": 3})
+    client.post("/sim/mission", json={"kind": "auto", "fungus_threshold": 0.15})
+    m = client.get("/ue5/frame").json()["metrics"]
+    assert m["missions"] == {"scout": 1, "spray": 1, "flight_min": m["missions"]["flight_min"]}
+    assert m["missions"]["flight_min"] > 1.0
+    f = m["fungicide"]
+    assert 0 < f["used_kg"] < f["blanket_kg"] and 0 < f["saved_pct"] < 100 and f["zones_sprayed"] >= 1
+    h = m["harvest_t_ha"]
+    assert 3.0 < h["now"] < 7.0
+    assert h["in_7d_if_sprayed"] >= h["in_7d_no_spray"]                 # acting pays
+    assert m["twin_error"]["now"] < m["twin_error"]["first"]            # scouting taught the twin

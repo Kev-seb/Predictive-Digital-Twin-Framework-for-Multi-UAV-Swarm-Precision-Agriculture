@@ -40,6 +40,10 @@ class Rotator:
     def __init__(self, roll=0.0, pitch=0.0, yaw=0.0):
         self.roll, self.pitch, self.yaw = roll, pitch, yaw
 
+    def get_forward_vector(self):
+        p, y = math.radians(self.pitch), math.radians(self.yaw)
+        return Vector(math.cos(p) * math.cos(y), math.cos(p) * math.sin(y), math.sin(p))
+
 
 class LinearColor:
     def __init__(self, r, g, b, a=1.0):
@@ -133,6 +137,26 @@ class StaticMeshActor(Actor):
         self.static_mesh_component = _MeshComponent()
 
 
+class _NiagaraComponent:
+    def __init__(self):
+        self.asset, self.active = None, False
+
+    def set_asset(self, asset):
+        self.asset = asset
+
+    def activate(self, reset=False):
+        self.active = True
+
+    def deactivate(self):
+        self.active = False
+
+
+class NiagaraActor(Actor):
+    def __init__(self, location=None):
+        super().__init__(location)
+        self.niagara_component = _NiagaraComponent()
+
+
 class TextRenderActor(Actor):
     def __init__(self, location=None):
         super().__init__(location)
@@ -192,8 +216,13 @@ class UnrealEditorSubsystem:
 
 
 class EditorActorSubsystem:
+    selected = []
+
     def get_all_level_actors(self):
         return list(_LEVEL)
+
+    def get_selected_level_actors(self):
+        return list(EditorActorSubsystem.selected)
 
     def spawn_actor_from_class(self, cls, location, rotation):
         actor = cls(location)
@@ -211,12 +240,66 @@ _SUBSYSTEM = EditorActorSubsystem()
 _EDITOR = UnrealEditorSubsystem()
 
 
+class MultiBlockType:
+    MENU_ENTRY = "menu_entry"
+
+
+class ToolMenuStringCommandType:
+    PYTHON = "python"
+
+
+class ToolMenuEntry:
+    def __init__(self, name="", type=None):
+        self.name, self.type, self.label, self.command = name, type, "", None
+
+    def set_label(self, label):
+        self.label = label
+
+    def set_string_command(self, kind, custom_type, command):
+        self.command = (kind, command)
+
+
+class ToolMenu:
+    def __init__(self, name, label=""):
+        self.name, self.label, self.entries = name, label, []
+
+    def add_sub_menu(self, owner, section, name, label, tooltip=""):
+        sub = ToolMenu(f"{self.name}.{name}", label)
+        ToolMenus._menus[sub.name] = sub
+        return sub
+
+    def add_menu_entry(self, section, entry):
+        self.entries = [e for e in self.entries if e[1].name != entry.name] + [(section, entry)]
+
+
+class ToolMenus:
+    _menus = {}
+    _instance = None
+    refreshed = 0
+
+    @classmethod
+    def get(cls):
+        if cls._instance is None:
+            cls._instance = ToolMenus()
+            cls._menus["LevelEditor.MainMenu"] = ToolMenu("LevelEditor.MainMenu")
+        return cls._instance
+
+    def find_menu(self, name):
+        return ToolMenus._menus.get(name)
+
+    def refresh_all_widgets(self):
+        ToolMenus.refreshed += 1
+
+
 def get_editor_subsystem(cls):
     return _EDITOR if cls is UnrealEditorSubsystem else _SUBSYSTEM
 
 
+MISSING_ASSETS = set()
+
+
 def load_asset(path):
-    return path
+    return None if path in MISSING_ASSETS else path
 
 
 def register_slate_post_tick_callback(fn):
@@ -232,6 +315,10 @@ def unregister_slate_post_tick_callback(handle):
 # --- test helpers (not part of the real API) -------------------------------
 def _reset():
     UnrealEditorSubsystem.camera = None
+    EditorActorSubsystem.selected = []
+    ToolMenus._menus.clear()
+    ToolMenus._instance = None
+    MISSING_ASSETS.clear()
     _TICKS.clear()
     _LEVEL.clear()
     LOG.clear()

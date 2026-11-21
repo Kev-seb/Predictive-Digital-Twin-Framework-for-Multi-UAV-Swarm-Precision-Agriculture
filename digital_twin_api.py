@@ -59,6 +59,9 @@ Demo mode (paced closed loop for live UE5 presentations):
   GET    /demo/status              Current phase
   (streams swarm.positions at 10 Hz and twin.status captions on /ws/field)
 
+Live control (UE5 menu, one step at a time, animated like the demo):
+  POST   /live/action              {"action": next_day|scout|spray|auto|outbreak|reset, ...}
+
 Polling for clients without WebSockets (UE5 Python, VaRest):
   GET    /ue5/frame?since=<seq>    Latest caption + drone poses, and the field snapshot
                                    only when it changed since <seq>
@@ -85,7 +88,34 @@ from src.twin_core.ingest import ingest_multispectral, ingest_rgb_result
 from src.twin_core.swarm import Fleet, allocate, tasks_from_twin
 from src.twin_core import mavlink_mission as mm
 from src.twin_core.virtual_field import VirtualField, serpentine_waypoints
-from src.twin_core.weather_feed import get_weather
+from src.twin_core.weather_feed import get_weather, synthetic_weather
+
+FORECAST_DAYS = 7
+BLANKET_DOSE_L_PER_HA = 25.0      # conventional whole-field fungicide spraying, per application
+
+
+def expected_harvest_t_ha(twin: DigitalTwin, state=None) -> float:
+    """
+    Expected paddy harvest (t/ha) if the crop keeps its current relative
+    health to maturity: each cell's NDVI relative to the stage's NDVI
+    potential is scaled to a peak-canopy NDVI, then the repo's
+    CropYieldPredictor turns that into mature biomass x harvest index x
+    stress penalty (fungus counts through stress).
+    """
+    from src.ai_engine.yield_predictor import CropYieldPredictor
+    from src.twin_core.paddy_model import ndvi_potential
+
+    st = state or twin.state
+    ndvi = np.clip(st.mean["ndvi"], 0.0, 1.0)
+    if twin.crop_model == "paddy" and "gdd" in st.scalars:
+        pot = max(ndvi_potential(twin.params, st.scalars["gdd"]), 1e-3)
+        peak = twin.params.ndvi_max
+    else:
+        pot = peak = 0.86
+    equiv = np.clip(ndvi / pot, 0.0, 1.0) * peak
+    pred = CropYieldPredictor("Paddy Rice")
+    biomass = pred.estimate_biomass(equiv, equiv, "Mature")
+    return float(pred.predict_yield(biomass, st.mean["stress"], {}, "Mature").mean())
 
 WeatherSource = Literal["manual", "synthetic", "openmeteo", "auto"]
 
@@ -188,6 +218,18 @@ class DemoRequest(BaseModel):
     fungus_threshold: float = Field(0.15, ge=0.0, le=1.0)
 
 
+class LiveAction(BaseModel):
+    action: Literal["next_day", "scout", "spray", "auto", "outbreak", "reset"]
+    row: Optional[float] = Field(None, description="outbreak: UE5-grid row (0-20, north edge = 0)")
+    col: Optional[float] = Field(None, description="outbreak: UE5-grid col (0-20, west edge = 0)")
+    radius: float = Field(2.5, gt=0.0, le=10.0, description="outbreak radius in UE5-grid cells (~12 m: big enough for 10 m-altitude scouting to resolve)")
+    load: float = Field(0.5, gt=0.0, le=1.0, description="outbreak peak fungal load")
+    seed: int = 7
+    playback_speed: float = Field(6.0, gt=0.0, le=1000.0)
+    backend: Literal["physics", "mavlink"] = "physics"
+    fungus_threshold: float = Field(0.15, ge=0.0, le=1.0)
+
+
 class AddDrone(BaseModel):
     drone_id: str = Field(..., min_length=1, max_length=40)
 
@@ -250,7 +292,8 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
     ctx: Dict[str, Any] = {"twin": twin, "anomalies": [], "ue5_snapshot": None, "virtual": None,
                            "fleet": None, "pending_interventions": [], "field_listeners": set(),
                            "last_track": None, "mavlink": None,
-                           "demo": {"task": None, "phase": "idle", "text": "", "day": 0, "error": None}}
+                           "demo": {"task": None, "phase": "idle", "text": "", "day": 0, "error": None},
+                           "metrics": None}
 
     def get_twin() -> DigitalTwin:
         if ctx["twin"] is None:
@@ -369,7 +412,114 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
                 "anomalies": anomalies,
                 "pending_sprays": [p["zone_id"] for p in ctx["pending_interventions"]],
                 **truth_layers(flat),
+                **forecast_layers(flat),
             }
+
+    def new_metrics() -> Dict[str, Any]:
+        return {"scout_missions": 0, "spray_missions": 0, "flight_s": 0.0, "fungicide_kg": 0.0,
+                "blanket_kg": 0.0, "zones_sprayed": 0, "error_history": []}
+
+    def metrics_state() -> Dict[str, Any]:
+        if ctx["metrics"] is None:
+            ctx["metrics"] = new_metrics()
+        return ctx["metrics"]
+
+    def record_mission(kind: str, report: Dict[str, Any]) -> None:
+        m = metrics_state()
+        m[f"{kind}_missions"] += 1
+        m["flight_s"] += sum(float(d.get("flight_s", d.get("wall_s", 0.0)))
+                             for d in report.get("drones", {}).values())
+        if kind == "spray" and report.get("completed_sprays"):
+            m["fungicide_kg"] += sum(float(p.get("applied_kg", p.get("planned_kg", 0.0)))
+                                     for p in report["completed_sprays"])
+            m["zones_sprayed"] += len(report["completed_sprays"])
+            g = get_twin().state.grid
+            m["blanket_kg"] += g.area_m2 / 10_000.0 * BLANKET_DOSE_L_PER_HA   # 1 L ~ 1 kg
+        record_error()
+
+    def record_error() -> None:
+        if ctx["virtual"] is None:
+            return
+        m = metrics_state()
+        e = ctx["virtual"].twin_error(get_twin())["fungus"]["rmse"]
+        m["error_history"].append([get_twin().state.sim_day, round(float(e), 4)])
+        del m["error_history"][:-200]
+
+    def metrics_view() -> Dict[str, Any]:
+        """Numbers for the UE5 results panel."""
+        twin = get_twin()
+        m = metrics_state()
+        b = forecast_bundle()
+        saved = (1.0 - m["fungicide_kg"] / m["blanket_kg"]) * 100.0 if m["blanket_kg"] > 0 else None
+        hist = m["error_history"]
+        return {
+            "sim_day": twin.state.sim_day,
+            "growth_stage": twin.state.growth_stage,
+            "harvest_t_ha": {"now": round(b["harvest_now"], 2),
+                             "in_7d_no_spray": round(b["harvest_no_spray"], 2),
+                             "in_7d_if_sprayed": round(b["harvest_if_sprayed"], 2),
+                             "spray_zones": b["spray_zones"]},
+            "fungicide": {"used_kg": round(m["fungicide_kg"], 2), "blanket_kg": round(m["blanket_kg"], 2),
+                          "saved_pct": None if saved is None else round(saved, 1),
+                          "zones_sprayed": m["zones_sprayed"]},
+            "missions": {"scout": m["scout_missions"], "spray": m["spray_missions"],
+                         "flight_min": round(m["flight_s"] / 60.0, 1)},
+            "twin_error": {"first": hist[0][1] if hist else None, "now": hist[-1][1] if hist else None,
+                           "history": hist[-30:]},
+        }
+
+    def forecast_bundle() -> Dict[str, Any]:
+        """
+        The twin's prediction FORECAST_DAYS ahead, on forks (the live twin is
+        untouched): doing nothing vs spraying the zones the twin flags now.
+        Uses the same weather forecast /sim/advance feeds the twin. Cached
+        until the twin changes.
+        """
+        version = int(ctx.get("field_version", 0))
+        cached = ctx.get("_forecast")
+        if cached is not None and cached["version"] == version:
+            return cached
+        twin = get_twin()
+        weather = synthetic_weather(FORECAST_DAYS, start_day=twin.state.sim_day + 1)
+        fleet = get_fleet()
+        spray_tasks = tasks_from_twin(twin, "spray", fleet.frame, fleet.spec, fungus_threshold=0.15)
+        plan = [{"day": 1, "zone_id": t.zone_id, "type": "Fungicide Spray"} for t in spray_tasks]
+        plan += [{"day": 1, "zone_id": p["zone_id"], "type": p["type"]} for p in ctx["pending_interventions"]]
+        # "No spray": the fleet's sprays (flown or flagged) never happen, so the
+        # gap to "if sprayed" is the value of acting, before or after flying.
+        no_spray = twin.fork()
+        no_spray.step(days=FORECAST_DAYS, weather=weather)
+        sprayed = twin.fork()
+        sprayed.step(days=FORECAST_DAYS, weather=weather, interventions=plan)
+
+        def brief(t: DigitalTwin) -> Dict[str, float]:
+            m = t.state.mean
+            return {"fungus_mean": round(float(m["fungus"].mean()), 4),
+                    "fungus_peak": round(float(m["fungus"].max()), 4),
+                    "ndvi_mean": round(float(m["ndvi"].mean()), 4),
+                    "stress_mean": round(float(m["stress"].mean()), 4)}
+
+        bundle = {"version": version, "days": FORECAST_DAYS, "state": no_spray.state,
+                  "harvest_now": expected_harvest_t_ha(twin),
+                  "harvest_no_spray": expected_harvest_t_ha(no_spray),
+                  "harvest_if_sprayed": expected_harvest_t_ha(sprayed),
+                  "no_spray": brief(no_spray), "if_sprayed": brief(sprayed),
+                  "spray_zones": sorted({p["zone_id"] for p in plan}),
+                  "on_day": twin.state.sim_day + FORECAST_DAYS}
+        ctx["_forecast"] = bundle
+        return bundle
+
+    def forecast_layers(flat) -> Dict[str, Any]:
+        b = forecast_bundle()
+        st = b["state"]
+        return {"forecast_days": b["days"],
+                "forecast_stress": flat(st.resample("stress", UE5_GRID, UE5_GRID)),
+                "forecast_fungus": flat(st.resample("fungus", UE5_GRID, UE5_GRID)),
+                "forecast_ndvi": flat(np.clip(st.resample("ndvi", UE5_GRID, UE5_GRID), 0.0, 1.0)),
+                "forecast_std": flat(np.sqrt(st.resample("stress", UE5_GRID, UE5_GRID, which="var"))),
+                "what_if": {"days": b["days"], "on_day": b["on_day"], "no_spray": b["no_spray"],
+                            "if_sprayed": b["if_sprayed"], "spray_zones": b["spray_zones"]},
+                "metrics": metrics_view()}
 
     def truth_layers(flat) -> Dict[str, Any]:
         """Hidden 'reality' of the virtual field, for twin-vs-reality views (sim only)."""
@@ -622,6 +772,7 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
             ctx["anomalies"].clear()
             ctx["ue5_snapshot"] = ue5_grids()
         ctx["pending_interventions"] = []
+        ctx["metrics"] = new_metrics()
         ctx["virtual"] = VirtualField(twin.state.grid, seed=req.seed, outbreaks=req.outbreaks,
                                       propagation_model=twin.propagation_model,
                                       zone_layout=twin.zone_layout, crop_model=twin.crop_model,
@@ -641,6 +792,7 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
         plan += flown
         actual = vf.advance(req.days, weather, plan)        # truth gets the real weather
         result = twin.step(days=req.days, weather=weather, interventions=plan)  # twin gets the forecast
+        record_error()
         return {"sim_day": twin.state.sim_day, "truth_day": vf.sim_day, "weather_source": used,
                 "applied_fleet_interventions": flown,
                 "forecast": weather, "actual_weather": actual,
@@ -696,6 +848,7 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
             else:
                 report = fleet.execute(plan, on_capture=on_capture if kind == "scout" else None, wind=wind)
             ctx["pending_interventions"].extend(report["completed_sprays"])
+            record_mission(kind, report)
             publish_track(kind, report["track"])
             if not req.include_track:
                 report.pop("track")
@@ -858,6 +1011,7 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
                                              get_twin().state.last_weather or None)
         await replay(report, req.playback_speed, ingest=(kind == "scout"))
         ctx["pending_interventions"].extend(report["completed_sprays"])
+        record_mission(kind, report)
         publish_track(kind, report["track"])
         detect_anomalies()
         return {"tasks": len(tasks), "sprays": [p["zone_id"] for p in report["completed_sprays"]]}
@@ -895,6 +1049,67 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
             demo_status("error", d["error"])
         finally:
             d["task"] = None
+
+    def touch_field() -> None:
+        """Truth changed without a twin event: bump the version and push a snapshot."""
+        ctx["field_version"] = ctx.get("field_version", 0) + 1
+        notify_field_listeners(None)
+
+    async def run_action(req: LiveAction) -> None:
+        d = ctx["demo"]
+        demo_req = DemoRequest(playback_speed=req.playback_speed, backend=req.backend,
+                               fungus_threshold=req.fungus_threshold)
+        try:
+            if req.action == "reset":
+                await asyncio.to_thread(sim_reset, SimReset(seed=req.seed))
+                demo_status("start", "Reset: the twin starts from its prior; a new outbreak is hidden "
+                                     "in the real field.")
+            elif req.action == "next_day":
+                adv = await asyncio.to_thread(sim_advance, SimAdvance(days=1))
+                sprayed = [i["zone_id"] for i in adv["applied_fleet_interventions"]]
+                demo_status("advance", f"Day {adv['sim_day']}: crop grows, disease spreads"
+                            + (f"; fungicide takes effect in zone(s) {sprayed}" if sprayed else "") + ".")
+            elif req.action == "outbreak":
+                vf = get_virtual()
+                g = get_twin().state.grid
+                row = req.row if req.row is not None else UE5_GRID / 2.0
+                col = req.col if req.col is not None else UE5_GRID / 2.0
+                scale = g.rows / UE5_GRID
+                await asyncio.to_thread(vf.inject_outbreak, row * scale, col * scale,
+                                        req.radius * scale, req.load)
+                touch_field()
+                demo_status("outbreak", f"Day {get_twin().state.sim_day}: a new outbreak started near "
+                                        f"row {row:.0f}, col {col:.0f}. The twin does not know yet; "
+                                        "scout to find it.")
+            if req.action in ("scout", "auto"):
+                day = get_twin().state.sim_day
+                demo_status("scout", f"Day {day}: drones scouting the field; the twin updates as they fly.")
+                res = await fly("scout", demo_req)
+                demo_status("decide", f"Day {day}: twin updated from {res.get('tasks', 0)} scouted zones.")
+            if req.action in ("spray", "auto"):
+                day = get_twin().state.sim_day
+                res = await fly("spray", demo_req)
+                if res.get("tasks"):
+                    demo_status("spray", f"Day {day}: sprayed zone(s) {res.get('sprays')}; effect from tomorrow.")
+                else:
+                    demo_status("decide", f"Day {day}: no zone above the action threshold; nothing to spray.")
+        except asyncio.CancelledError:
+            demo_status("stopped", "Stopped.")
+            raise
+        except Exception as e:
+            d["error"] = f"{type(e).__name__}: {e}"
+            demo_status("error", d["error"])
+        finally:
+            d["task"] = None
+
+    @app.post("/live/action", summary="One live step (UE5 menu): next day, scout, spray, outbreak, reset")
+    async def live_action(req: LiveAction):
+        d = ctx["demo"]
+        if d["task"] is not None and not d["task"].done():
+            raise HTTPException(409, "Busy: a demo or action is running; wait or POST /demo/stop")
+        d["error"] = None
+        d["task"] = asyncio.get_running_loop().create_task(run_action(req))
+        return {"status": "started", "action": req.action}
 
     @app.post("/demo/start", summary="Start the paced closed-loop demo for UE5")
     async def demo_start(req: DemoRequest):
@@ -938,7 +1153,18 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
             "drones": ctx.get("latest_positions"),
             "demo_running": ctx["demo"]["task"] is not None and not ctx["demo"]["task"].done(),
             "field": field_snapshot(version) if version != since else None,
+            "metrics": metrics_view(),
+            "weather": frame_weather(),
         }
+
+    def frame_weather():
+        """Today's weather in the (virtual) real field, for rain effects in UE5."""
+        vf = ctx.get("virtual")
+        w = (vf.truth.state.last_weather if vf is not None else None) or get_twin().state.last_weather or {}
+        return {"precipitation_mm": round(float(w.get("precipitation", 0.0)), 2),
+                "temperature_c": round(float(w.get("temperature", 29.0)), 1),
+                "humidity_pct": round(float(w.get("humidity", 75.0)), 1),
+                "wind_speed_m_s": round(float(w.get("wind_speed", 2.0)), 2)}
 
     @app.get("/sim/error", summary="Twin vs ground truth")
     def sim_error():

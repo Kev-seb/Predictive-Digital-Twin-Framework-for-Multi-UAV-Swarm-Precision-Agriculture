@@ -36,7 +36,18 @@ DRAIN_FLY_PCT_S = 0.105
 DRAIN_SPRAY_PCT_S = 0.045
 SPRAY_RATE_KG_S = 0.12          # payload depletion while spraying
 BATTERY_RESERVE_PCT = 35.0      # physics evaluates RTL below 30 %
-PLANNING_SPEED_M_S = 4.0        # effective ground speed incl. turns (calibrated in tests)
+# Planner time model, fitted to missions flown in the 6-DOF physics (scout and
+# spray, 1-3 drones, 20x20 and 40x40 grids; every estimate within +-7 %):
+#   t = horizontal distance / PLANNING_SPEED_M_S + VERTEX_S per path vertex + MISSION_OVERHEAD_S
+PLANNING_SPEED_M_S = 6.05
+VERTEX_S = 1.9                  # slowing into and out of each lane end / zone entry
+MISSION_OVERHEAD_S = 21.0       # take-off, climbs and descents, landing
+# Drones follow a "carrot" moving along each leg at these speeds, so lanes are
+# flown straight and corners cleanly (chasing far waypoints at full speed made
+# the physics overshoot and cut corners).
+WORK_SPEED_M_S = 5.0            # scouting / spraying lanes
+TRANSIT_SPEED_M_S = 6.0         # to and from the work, climbs and descents
+LANE_SETTLE_S = 1.0             # extra pump-on time per lane end (carrot catch-up)
 
 
 @dataclass
@@ -194,10 +205,12 @@ def tasks_from_twin(twin, kind: str, frame: LocalFrame, spec: DroneSpec = DroneS
 def _estimate(start: Tuple[float, float], tasks: List[Task], home: Tuple[float, float],
               speed: float = PLANNING_SPEED_M_S) -> Tuple[float, float]:
     """(time_s, battery_pct) for flying ``tasks`` in order from ``start`` and back home."""
-    pos, t, spray_t = start, 0.0, 0.0
+    if not tasks:
+        return 0.0, 0.0
+    pos, t, spray_t = start, MISSION_OVERHEAD_S, 0.0
     for task in tasks:
         t += _dist(pos, task.legs[0]) / speed
-        work = task.work_length_m / speed
+        work = task.work_length_m / speed + VERTEX_S * len(task.legs)
         t += work
         if task.kind == "spray":
             spray_t += work
@@ -206,32 +219,111 @@ def _estimate(start: Tuple[float, float], tasks: List[Task], home: Tuple[float, 
     return t, t * DRAIN_FLY_PCT_S + spray_t * DRAIN_SPRAY_PCT_S
 
 
+def _orient(route: List[Task], start: Tuple[float, float]) -> List[Task]:
+    """
+    Enter each zone at its corner nearest to where the drone is: reverse a
+    zone's lawn-mower path when its far end is closer. A reversed lawn-mower
+    still covers the zone and still alternates lane / turn, so spraying and
+    scouting are unchanged; only the needless cross-zone diagonals go away.
+    """
+    out, pos = [], start
+    for t in route:
+        if len(t.legs) > 1 and _dist(pos, t.legs[-1]) < _dist(pos, t.legs[0]):
+            t = Task(t.task_id, t.kind, t.zone_id, list(reversed(t.legs)), t.priority,
+                     t.payload_kg, t.alt_m)
+        out.append(t)
+        pos = t.legs[-1]
+    return out
+
+
+def _center(task: Task) -> Tuple[float, float]:
+    xs, ys = zip(*task.legs)
+    return (sum(xs) / len(xs), sum(ys) / len(ys))
+
+
+def _coverage_partition(tasks: List[Task], drones: Dict[str, Dict[str, Any]],
+                        speed: float) -> Optional[Plan]:
+    """
+    Whole-field coverage (scouting): order zones in a snake column by column,
+    cut the order into contiguous chunks of balanced flying time, and give the
+    left-most chunk to the left-most pad, and so on. Every drone then sweeps
+    its own strip and no routes cross. Returns None if a chunk would break a
+    battery or tank limit (the caller falls back to insertion).
+    """
+    ids = sorted(drones, key=lambda d: drones[d]["home"][0])
+    if not ids or len(tasks) < len(ids):
+        return None
+    centers = {t.task_id: _center(t) for t in tasks}
+    col_w = max(1e-6, min((abs(centers[a.task_id][0] - centers[b.task_id][0])
+                           for a in tasks for b in tasks
+                           if abs(centers[a.task_id][0] - centers[b.task_id][0]) > 1e-3), default=1.0))
+    cols = sorted({round(centers[t.task_id][0] / col_w) for t in tasks})
+    order: List[Task] = []
+    for i, c in enumerate(cols):
+        column = sorted((t for t in tasks if round(centers[t.task_id][0] / col_w) == c),
+                        key=lambda t: centers[t.task_id][1], reverse=(i % 2 == 1))
+        order.extend(column)
+    work = [t.work_length_m / speed for t in order]
+    target = sum(work) / len(ids)
+    chunks: List[List[Task]] = [[] for _ in ids]
+    acc, k = 0.0, 0
+    for t, w in zip(order, work):
+        if k < len(ids) - 1 and acc + w / 2 > target * (k + 1) and chunks[k]:
+            k += 1
+        chunks[k].append(t)
+        acc += w
+    assignments = {}
+    for d_id, chunk in zip(ids, chunks):
+        info = drones[d_id]
+        if sum(t.payload_kg for t in chunk) > info.get("tank_kg", 10.0) + 1e-9:
+            return None
+        # Start the strip at whichever end is nearer the drone's pad.
+        if chunk and _dist(info["home"], _center(chunk[-1])) < _dist(info["home"], _center(chunk[0])):
+            chunk = chunk[::-1]
+        chunk = _orient(chunk, info["home"])
+        t_s, pct = _estimate(info["home"], chunk, info["home"], speed)
+        if info.get("battery", 100.0) - pct < BATTERY_RESERVE_PCT:
+            return None
+        assignments[d_id] = Assignment(d_id, chunk, t_s, pct, sum(t.payload_kg for t in chunk))
+    return Plan(assignments, [])
+
+
 def allocate(tasks: List[Task], drones: Dict[str, Dict[str, Any]],
              speed: float = PLANNING_SPEED_M_S) -> Plan:
     """
-    Greedy min-makespan allocation. ``drones`` maps id -> {"home": (x, y),
-    "battery": pct, "tank_kg": capacity}. Tasks are taken in priority order
-    and given to the drone whose finish time grows least, among drones that
-    keep their battery reserve and tank capacity.
+    Greedy min-makespan allocation with cheapest insertion. ``drones`` maps
+    id -> {"home": (x, y), "battery": pct, "tank_kg": capacity}. Tasks are
+    taken in priority order; each is inserted at the position in a drone's
+    route where it adds least flight time, on the drone whose finish time
+    grows least, among drones that keep their battery reserve and tank
+    capacity. Inserting (rather than appending) keeps each drone's route
+    compact, so drones do not criss-cross the field between zones.
     """
+    if tasks and all(t.kind == "scout" for t in tasks):
+        plan = _coverage_partition(tasks, drones, speed)
+        if plan is not None:
+            return plan
     assignments = {d: Assignment(d) for d in drones}
     unassigned: List[Task] = []
     for task in sorted(tasks, key=lambda t: -t.priority):
-        best, best_time = None, math.inf
+        best, best_time, best_pos = None, math.inf, 0
         for d_id, info in drones.items():
             a = assignments[d_id]
             if a.payload_kg + task.payload_kg > info.get("tank_kg", 10.0) + 1e-9:
                 continue
-            t, pct = _estimate(info["home"], a.tasks + [task], info["home"], speed)
-            if info.get("battery", 100.0) - pct < BATTERY_RESERVE_PCT:
-                continue
-            if t < best_time:
-                best, best_time = d_id, t
+            for pos in range(len(a.tasks) + 1):
+                route = a.tasks[:pos] + [task] + a.tasks[pos:]
+                t, pct = _estimate(info["home"], route, info["home"], speed)
+                if info.get("battery", 100.0) - pct < BATTERY_RESERVE_PCT:
+                    continue
+                if t < best_time - 1e-9:
+                    best, best_time, best_pos = d_id, t, pos
         if best is None:
             unassigned.append(task)
             continue
         a = assignments[best]
-        a.tasks.append(task)
+        a.tasks.insert(best_pos, task)
+        a.tasks = _orient(a.tasks, drones[best]["home"])
         a.payload_kg += task.payload_kg
         a.est_time_s, a.est_battery_pct = _estimate(drones[best]["home"], a.tasks,
                                                     drones[best]["home"], speed)
@@ -242,10 +334,20 @@ def allocate(tasks: List[Task], drones: Dict[str, Dict[str, Any]],
 @dataclass
 class _Leg:
     target: Tuple[float, float, float]
+    speed: float = TRANSIT_SPEED_M_S
     spray: bool = False
     capture: bool = False
     task: Optional[Task] = None
     last_of_task: bool = False
+
+
+def _pump_fraction(task: Task) -> float:
+    """Pump flow fraction that applies task.payload_kg over its lanes at WORK_SPEED_M_S."""
+    lanes = [(task.legs[k], task.legs[k + 1]) for k in range(0, len(task.legs) - 1, 2)]
+    if task.payload_kg <= 0 or not lanes:
+        return 0.0
+    on_s = sum(_dist(a, b) / WORK_SPEED_M_S + LANE_SETTLE_S for a, b in lanes)
+    return float(min(1.0, max(0.05, task.payload_kg / (SPRAY_RATE_KG_S * on_s))))
 
 
 class Fleet:
@@ -338,7 +440,10 @@ class Fleet:
             legs.append(_Leg((first[0], first[1], transit_alt)))
             legs.append(_Leg((first[0], first[1], task.alt_m)))
             for j, pt in enumerate(task.legs[1:], start=1):
-                legs.append(_Leg((pt[0], pt[1], task.alt_m), spray=task.kind == "spray",
+                # Lawn-mower legs alternate lane, turn, lane...: the pump runs on lanes
+                # (flying to legs[1], legs[3], ...) and is off on the headland turns.
+                legs.append(_Leg((pt[0], pt[1], task.alt_m), speed=WORK_SPEED_M_S,
+                                 spray=task.kind == "spray" and j % 2 == 1,
                                  capture=task.kind == "scout", task=task,
                                  last_of_task=(j == len(task.legs) - 1)))
             if len(task.legs) == 1:
@@ -376,13 +481,13 @@ class Fleet:
                      "aborted": False, "battery_start": float(self.drones[d].battery),
                      "payload_start": float(self.drones[d].payload_mass)} for d in ids}
         since_capture = {d: 0.0 for d in ids}
-        # Variable-rate spraying: the physics sprays at a fixed 0.12 kg/s, so
-        # flow is duty-cycled to apply each task's planned dose over its path.
-        duty = {task.task_id: min(1.0, task.payload_kg / max(
-                    task.work_length_m / PLANNING_SPEED_M_S * SPRAY_RATE_KG_S, 1e-6))
+        # Variable-rate spraying, as on real spray drones: the pump runs continuously
+        # along each lane at a flow fraction set so lanes x flow = planned dose.
+        flow = {task.task_id: _pump_fraction(task)
                 for a in plan.assignments.values() for task in a.tasks if task.kind == "spray"}
-        applied: Dict[str, float] = {k: 0.0 for k in duty}
-        sprayed_time: Dict[str, float] = {k: 0.0 for k in duty}
+        applied: Dict[str, float] = {k: 0.0 for k in flow}
+        carrot: Dict[str, Optional[np.ndarray]] = {d: None for d in ids}
+        leg_seen = {d: -1 for d in ids}
         track: Dict[str, List[List[float]]] = {d: [] for d in ids}
         completed_sprays: List[Dict[str, Any]] = []
         captures: List[List[Any]] = []          # [t_s, drone_id, lat, lon, alt]
@@ -401,24 +506,36 @@ class Fleet:
                     legs[d] = legs[d][:idx[d]] + [_Leg((pad[0], pad[1], 12.0)),
                                                   _Leg((pad[0], pad[1], 0.5))]
                     sim.autopilot_mode = "stabilized"  # let the planner fly it home
+                    carrot[d], leg_seen[d] = None, -1
                 leg = legs[d][idx[d]]
-                sim.target_pos = np.array(leg.target, dtype=float)
+                goal = np.array(leg.target, dtype=float)
+                if leg_seen[d] != idx[d] or carrot[d] is None:
+                    leg_seen[d] = idx[d]
+                    if carrot[d] is None:
+                        carrot[d] = sim.pos.copy()
+                # Advance the carrot along the leg at the leg's speed; the autopilot tracks it.
+                to_goal = goal - carrot[d]
+                gap = float(np.linalg.norm(to_goal))
+                step_m = leg.speed * dt
+                carrot[d] = goal.copy() if gap <= step_m else carrot[d] + to_goal / gap * step_m
+                sim.target_pos = carrot[d].copy()
                 dx, dy = leg.target[0] - sim.pos[0], leg.target[1] - sim.pos[1]
                 if math.hypot(dx, dy) > 1.0:
                     sim.target_yaw = math.atan2(dy, dx)
-                spraying = False
+                frac = 0.0
                 if leg.spray and sim.payload_mass > 0.0 and leg.task is not None:
                     tid = leg.task.task_id
-                    sprayed_time[tid] += dt
-                    planned = leg.task.payload_kg
-                    spraying = (applied[tid] < duty[tid] * SPRAY_RATE_KG_S * sprayed_time[tid]
-                                and applied[tid] < planned)
-                sim.is_spraying = spraying
+                    if applied[tid] < leg.task.payload_kg:
+                        frac = flow[tid]
+                sim.is_spraying = frac > 0.0
                 before = sim.pos[:2].copy()
                 payload_before = float(sim.payload_mass)
                 sim.step(dt)
-                if spraying:
-                    applied[leg.task.task_id] += payload_before - float(sim.payload_mass)
+                if frac > 0.0:
+                    # Physics drains at full pump flow; scale to the set flow fraction.
+                    used = (payload_before - float(sim.payload_mass)) * frac
+                    sim.payload_mass = payload_before - used
+                    applied[leg.task.task_id] += used
                 moved = float(np.linalg.norm(sim.pos[:2] - before))
                 stats[d]["distance_m"] += moved
                 stats[d]["flight_s"] += dt
@@ -433,7 +550,7 @@ class Fleet:
                             on_capture(d, lat, lon, float(sim.pos[2]))
                 landing = idx[d] == len(legs[d]) - 1
                 tol = 0.6 if landing else arrive_m      # touch-down needs to be precise
-                if np.linalg.norm(np.array(leg.target) - sim.pos) < tol:
+                if gap <= step_m and np.linalg.norm(goal - sim.pos) < tol:
                     if leg.last_of_task and leg.task is not None:
                         stats[d]["tasks_done"].append(leg.task.task_id)
                         if leg.task.kind == "spray":

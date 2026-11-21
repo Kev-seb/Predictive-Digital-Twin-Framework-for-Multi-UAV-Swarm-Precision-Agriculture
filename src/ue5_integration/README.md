@@ -9,14 +9,38 @@ The `TwinStream` C++ plugin (sections 1–7) connects a UE5 level to the digital
 `python/twin_live.py` runs inside the UE5 editor using UE5's built-in Python. There's nothing to compile and nothing to buy.
 
 1. **Enable Python in UE5 (once):** *Edit → Plugins*, search for **Python Editor Script Plugin**, tick it, and restart the editor.
-2. **Start the twin** on the same PC:
+2. **Start the twin** on the same PC. On Windows, double-click **`start_demo.bat`** in the repository root. It starts the twin, waits until it's ready, and prints the next step. To have it open UE5 with the script already running, open `start_demo.bat` in a text editor once and set `UE_PROJECT` to your `.uproject` path. Then step 3 happens by itself.
+
+   From a terminal, the same thing is:
 
    ```bash
-   python digital_twin_api.py
+   python scripts/start_demo.py
    ```
 
+   Options: `--ue-project path/to/Game.uproject` opens UE5 with the script running, `--demo` starts the story at once, and `--fresh` resets the field to day 0. To start the twin on its own, run `python digital_twin_api.py`.
+
 3. **Run the script in UE5:** *File → Execute Python Script…* and pick `src/ue5_integration/python/twin_live.py`.
-   - **Empty level:** the script builds a **Twin** field and a **Reality** field next to each other, 20×20 blocks each. Block colour shows stress and fungus, and block height shows NDVI.
+   - **Empty level:** the script builds three 20×20 block fields side by side. Block colour shows stress and fungus, and block height shows NDVI.
+     - **TWIN:** what the twin believes now.
+     - **REALITY:** the hidden truth.
+     - **FORECAST +7 DAYS:** what the twin predicts a week ahead if nothing is done. It's faded where the prediction is uncertain. This is the "predictive" part of a predictive digital twin.
+
+     A **results panel** stands to the left of the fields. For example:
+
+     ```text
+     DAY 3  |  Vegetative
+     Expected harvest:  5.51 t/ha
+       in 7 days, no spray:  5.37 t/ha
+       in 7 days, sprayed:   5.41 t/ha  (zones 6)
+     Worst disease in 7 days:  36%  ->  16% if sprayed
+     Fungicide:  3.0 kg  vs  25 kg whole-field  (88% saved)
+     Twin vs reality error:  0.076  ->  0.031
+     Missions:  1 scout  |  1 spray  |  9.3 min flown
+     ```
+
+     Expected harvest uses the repo's yield model (mature biomass × harvest index × stress penalty), fed with each cell's health relative to its growth stage. "Whole-field" is conventional blanket spraying of the field at 25 L/ha per application.
+
+     Set `SHOW_FORECAST = False` or `SHOW_PANEL = False` at the top of the script to hide the forecast field or the panel. In a level with your own field, an actor labelled "Forecast" gets the prediction.
    - **Level with your rice field** (a 400-instance HISM): the script drives your field instead, through per-instance custom data slots 0–5, which you read in `M_RiceCrop` with *PerInstanceCustomData* nodes. Label a second field actor with "Reality" to get the hidden truth on it.
 4. **Start the story:**
 
@@ -24,11 +48,39 @@ The `TwinStream` C++ plugin (sections 1–7) connects a UE5 level to the digital
    curl -X POST localhost:8008/demo/start -H 'content-type: application/json' -d '{}'
    ```
 
-   Drones (spheres) take off, scout, and spray, with a blue cone showing while they spray. The twin field changes under them as they fly. A caption above the field narrates each step and shows the twin-vs-reality error.
-5. **Camera:** on start, the script moves the editor camera to a raised view over both fields, with TWIN on the left and REALITY on the right. The caption and labels always turn to face you. If you fly away, type `twin_live_camera()` in the Output Log's Python console to come back.
-6. **Stop or restart:** run the script again, or type `twin_live_stop()` in the same console.
+   Quadcopters (hub, X arms, spinning rotors, spray tank) take off, scout, and spray, with a blue cone under them while they spray. The twin field changes under them as they fly. A caption above the field narrates each step and shows the twin-vs-reality error.
+5. **Digital Twin menu:** the script adds a **Digital Twin** menu to the editor's menu bar, so you can run the show live without a browser or terminal.
+
+   | Menu entry | What happens |
+   |---|---|
+   | Start demo (full story) / Stop | runs or stops the paced story |
+   | Next day | the crop grows and the disease spreads one day |
+   | Scout now / Spray now / Scout + spray | the drones fly that mission, animated |
+   | **Inject outbreak** | plants a new disease patch in the hidden **Reality** field, at the field block you've selected, or else where the centre of your view meets a field. The twin isn't told, so "Scout now" shows it finding the patch. |
+   | Reset field | starts again with a new hidden outbreak |
+   | Re-frame camera | jumps back to the overview |
+
+   Only one step runs at a time. A second click while drones are flying logs "busy" in the Output Log.
+
+6. **Camera:** on start, the script moves the editor camera to a raised view over both fields, with TWIN on the left and REALITY on the right. The caption and labels always turn to face you. If you fly away, type `twin_live_camera()` in the Output Log's Python console to come back.
+7. **Stop or restart:** run the script again, or type `twin_live_stop()` in the same console.
 
 Settings are at the top of the script: API address, field mode, and where to build the blocks.
+
+### Realistic look with your own assets
+
+The script runs in any project with engine shapes only. To use better-looking assets, put their paths in these settings at the top of `twin_live.py`. To get a path, right-click the asset in the Content Browser, choose **Copy Reference**, and keep the part between the quotes, for example `/Game/Drones/SM_AgriDrone.SM_AgriDrone`.
+
+| Setting | What it replaces | Notes |
+|---|---|---|
+| `DRONE_MESH` | the engine-shape quadcopter | Static mesh, nose along +X, about 1 m across. Use `DRONE_MESH_SCALE` to resize it. If its material has a `Color` parameter, each drone gets its own colour. |
+| `SPRAY_NIAGARA` | the blue spray cone | A Niagara system that emits downward. It runs only while the drone sprays. |
+| `RAIN_NIAGARA` | the falling blue streaks | A rain Niagara system, placed above the fields. |
+| `CROP_MESH` | the cubes (blocks mode) | A rice clump with its pivot at the base, about 1 m wide. It grows taller with NDVI. Health colour goes to the material's `CROP_COLOR_PARAM` vector parameter (default `Color`). |
+
+Rain shows on days when the real field gets more than `RAIN_MM` (1 mm) of rain. `/ue5/frame` reports that day's weather in `weather`. Set `SHOW_RAIN = False` to turn rain off. If a path is wrong, the Output Log warns once and the built-in look is used.
+
+Where to get them: a Megascans grass or plant clump from Fab (inside UE5) for the crop, and any quadcopter mesh from Fab for the drone. For spray, make a Niagara system from the **Fountain** template and point it down. For rain, make a sprite emitter that spawns in a wide box and falls fast.
 
 This path is tested against the real API with a stand-in for UE5's Python module (`tests/test_ue5_python.py`), but it hasn't been run inside UE5 yet. If a call doesn't exist in your engine version, the Output Log names it. Send me that line.
 
@@ -166,6 +218,12 @@ Messages are JSON text frames.
 `error` is the twin's RMSE against the hidden reality.
 
 In simulation, **`field.snapshot`** also carries `truth_ndvi`, `truth_stress` and `truth_fungus`, each 400 floats.
+
+Every snapshot also carries the twin's 7-day forecast, computed on a copy of the twin so the live twin is untouched:
+- **`forecast_ndvi`, `forecast_stress`, `forecast_fungus`, `forecast_std`:** the predicted field if nothing is done.
+- **`what_if`:** `{days, on_day, no_spray, if_sprayed, spray_zones}`. "No spray" assumes none of the fleet's sprays happen; "if sprayed" includes the sprays already flown plus the zones the twin flags now. Each scenario gives mean and peak fungus, mean NDVI and mean stress.
+
+`/ue5/frame` and every snapshot also carry **`metrics`**, the numbers behind the results panel: expected harvest (now, and in 7 days with and without spraying), fungicide used against blanket spraying, twin-vs-reality error history, and missions and flight time.
 
 **Client → server:** `{"type": "snapshot"}` requests a snapshot immediately.
 

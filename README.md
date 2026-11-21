@@ -4,7 +4,7 @@
 [![Python Version](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue.svg)](https://www.python.org/)
 [![Framework](https://img.shields.io/badge/framework-Streamlit-FF4B4B.svg)](https://streamlit.io/)
 [![API](https://img.shields.io/badge/API-FastAPI-009688.svg)](https://fastapi.tiangolo.com/)
-[![Build & Tests](https://img.shields.io/badge/tests-passed-brightgreen.svg)](#6-test-suite)
+[![tests](https://github.com/Kev-seb/Predictive-Digital-Twin-Framework-for-Multi-UAV-Swarm-Precision-Agriculture/actions/workflows/tests.yml/badge.svg)](https://github.com/Kev-seb/Predictive-Digital-Twin-Framework-for-Multi-UAV-Swarm-Precision-Agriculture/actions/workflows/tests.yml)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![UE5](https://img.shields.io/badge/Unreal%20Engine-5.x-blueviolet.svg)](#55-unreal-engine-5--unity-digital-twin-bridge)
 
@@ -562,6 +562,8 @@ Scan the QR code from the dashboard to open the companion app on your phone.
 
 ### 5.5 Unreal Engine 5 / Unity Digital Twin Bridge
 
+**One click (Windows):** double-click `start_demo.bat` to start the twin. Set `UE_PROJECT` inside it once, and it also opens UE5 with the twin script running. Elsewhere, run `python scripts/start_demo.py`.
+
 **UE5, no C++:** enable UE5's built-in *Python Editor Script Plugin*, then run `src/ue5_integration/python/twin_live.py` with *File → Execute Python Script*. It drives your rice field, or builds a twin field and a reality field from blocks, moves the drones and shows captions. See the quick start in [`src/ue5_integration/README.md`](src/ue5_integration/README.md).
 
 **UE5 C++ plugin:** alternatively, install the `TwinStream` plugin from `src/ue5_integration/`. It subscribes to `/ws/field`, so the twin pushes 20 × 20 field snapshots (NDVI, stress, uncertainty, moisture, fungus, anomalies) and drone mission tracks as they change. It writes them into the HISM's per-instance custom data for `M_RiceCrop`. Setup, material slots and the message schema are in [`src/ue5_integration/README.md`](src/ue5_integration/README.md).
@@ -616,6 +618,20 @@ python src/classification/train_classifier.py \
 .venv\Scripts\pytest tests/ -v
 ```
 
+GitHub Actions (`.github/workflows/tests.yml`) runs the suite on every pull request and on every push to `main`, on Python 3.11 with CPU-only PyTorch. It uses the slim `requirements-ci.txt`, not the full app requirements. To match CI locally:
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+```
+
+```bash
+pip install -r requirements-ci.txt
+```
+
+```bash
+python -m pytest -q tests
+```
+
 | Test File | What It Validates |
 |---|---|
 | `test_ai_optimizer.py` | Q-Learning policy converges; net reward exceeds baseline |
@@ -626,6 +642,12 @@ python src/classification/train_classifier.py \
 | `test_temporal.py` | Change detection outputs plausible difference maps |
 | `test_weather.py` | Weather risk engine returns valid spray window |
 | `test_yield.py` | Biomass model outputs within $[0.0, 12.0]\,\text{t/ha}$ |
+| `test_twin_core.py` | Twin state, Kalman assimilation, paddy model, virtual field (OSSE), swarm, API, live actions, forecast, results metrics |
+| `test_cross_layer.py` | Cross-layer ensemble: leak-rate and vigour learning, OSSE improvement |
+| `test_flight_replay.py` | Real-flight replay on a synthetic DJI-style dataset (XMP GPS, tiles, prediction skill) |
+| `test_mavlink_mission.py` | MAVLink mission compiler, pump dosing, vehicle link against the emulator |
+| `test_ue5_python.py` | The UE5 editor script against the real API, with a stand-in `unreal` module |
+| `test_start_demo.py` | One-click launcher: starts or reuses the twin, builds the UE5 command line |
 
 ---
 
