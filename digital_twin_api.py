@@ -59,6 +59,9 @@ Demo mode (paced closed loop for live UE5 presentations):
   GET    /demo/status              Current phase
   (streams swarm.positions at 10 Hz and twin.status captions on /ws/field)
 
+Live control (UE5 menu, one step at a time, animated like the demo):
+  POST   /live/action              {"action": next_day|scout|spray|auto|outbreak|reset, ...}
+
 Polling for clients without WebSockets (UE5 Python, VaRest):
   GET    /ue5/frame?since=<seq>    Latest caption + drone poses, and the field snapshot
                                    only when it changed since <seq>
@@ -185,6 +188,18 @@ class DemoRequest(BaseModel):
     scout_every:    int = Field(3, ge=1, le=30, description="scout every N days (sprays follow if needed)")
     playback_speed: float = Field(6.0, gt=0.0, le=1000.0, description="simulated seconds per wall second while drones fly")
     backend:        Literal["physics", "mavlink"] = "physics"
+    fungus_threshold: float = Field(0.15, ge=0.0, le=1.0)
+
+
+class LiveAction(BaseModel):
+    action: Literal["next_day", "scout", "spray", "auto", "outbreak", "reset"]
+    row: Optional[float] = Field(None, description="outbreak: UE5-grid row (0-20, north edge = 0)")
+    col: Optional[float] = Field(None, description="outbreak: UE5-grid col (0-20, west edge = 0)")
+    radius: float = Field(2.5, gt=0.0, le=10.0, description="outbreak radius in UE5-grid cells (~12 m: big enough for 10 m-altitude scouting to resolve)")
+    load: float = Field(0.5, gt=0.0, le=1.0, description="outbreak peak fungal load")
+    seed: int = 7
+    playback_speed: float = Field(6.0, gt=0.0, le=1000.0)
+    backend: Literal["physics", "mavlink"] = "physics"
     fungus_threshold: float = Field(0.15, ge=0.0, le=1.0)
 
 
@@ -895,6 +910,67 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
             demo_status("error", d["error"])
         finally:
             d["task"] = None
+
+    def touch_field() -> None:
+        """Truth changed without a twin event: bump the version and push a snapshot."""
+        ctx["field_version"] = ctx.get("field_version", 0) + 1
+        notify_field_listeners(None)
+
+    async def run_action(req: LiveAction) -> None:
+        d = ctx["demo"]
+        demo_req = DemoRequest(playback_speed=req.playback_speed, backend=req.backend,
+                               fungus_threshold=req.fungus_threshold)
+        try:
+            if req.action == "reset":
+                await asyncio.to_thread(sim_reset, SimReset(seed=req.seed))
+                demo_status("start", "Reset: the twin starts from its prior; a new outbreak is hidden "
+                                     "in the real field.")
+            elif req.action == "next_day":
+                adv = await asyncio.to_thread(sim_advance, SimAdvance(days=1))
+                sprayed = [i["zone_id"] for i in adv["applied_fleet_interventions"]]
+                demo_status("advance", f"Day {adv['sim_day']}: crop grows, disease spreads"
+                            + (f"; fungicide takes effect in zone(s) {sprayed}" if sprayed else "") + ".")
+            elif req.action == "outbreak":
+                vf = get_virtual()
+                g = get_twin().state.grid
+                row = req.row if req.row is not None else UE5_GRID / 2.0
+                col = req.col if req.col is not None else UE5_GRID / 2.0
+                scale = g.rows / UE5_GRID
+                await asyncio.to_thread(vf.inject_outbreak, row * scale, col * scale,
+                                        req.radius * scale, req.load)
+                touch_field()
+                demo_status("outbreak", f"Day {get_twin().state.sim_day}: a new outbreak started near "
+                                        f"row {row:.0f}, col {col:.0f}. The twin does not know yet; "
+                                        "scout to find it.")
+            if req.action in ("scout", "auto"):
+                day = get_twin().state.sim_day
+                demo_status("scout", f"Day {day}: drones scouting the field; the twin updates as they fly.")
+                res = await fly("scout", demo_req)
+                demo_status("decide", f"Day {day}: twin updated from {res.get('tasks', 0)} scouted zones.")
+            if req.action in ("spray", "auto"):
+                day = get_twin().state.sim_day
+                res = await fly("spray", demo_req)
+                if res.get("tasks"):
+                    demo_status("spray", f"Day {day}: sprayed zone(s) {res.get('sprays')}; effect from tomorrow.")
+                else:
+                    demo_status("decide", f"Day {day}: no zone above the action threshold; nothing to spray.")
+        except asyncio.CancelledError:
+            demo_status("stopped", "Stopped.")
+            raise
+        except Exception as e:
+            d["error"] = f"{type(e).__name__}: {e}"
+            demo_status("error", d["error"])
+        finally:
+            d["task"] = None
+
+    @app.post("/live/action", summary="One live step (UE5 menu): next day, scout, spray, outbreak, reset")
+    async def live_action(req: LiveAction):
+        d = ctx["demo"]
+        if d["task"] is not None and not d["task"].done():
+            raise HTTPException(409, "Busy: a demo or action is running; wait or POST /demo/stop")
+        d["error"] = None
+        d["task"] = asyncio.get_running_loop().create_task(run_action(req))
+        return {"status": "started", "action": req.action}
 
     @app.post("/demo/start", summary="Start the paced closed-loop demo for UE5")
     async def demo_start(req: DemoRequest):

@@ -25,8 +25,21 @@ The `TwinStream` C++ plugin (sections 1–7) connects a UE5 level to the digital
    ```
 
    Drones (spheres) take off, scout, and spray, with a blue cone showing while they spray. The twin field changes under them as they fly. A caption above the field narrates each step and shows the twin-vs-reality error.
-5. **Camera:** on start, the script moves the editor camera to a raised view over both fields, with TWIN on the left and REALITY on the right. The caption and labels always turn to face you. If you fly away, type `twin_live_camera()` in the Output Log's Python console to come back.
-6. **Stop or restart:** run the script again, or type `twin_live_stop()` in the same console.
+5. **Digital Twin menu:** the script adds a **Digital Twin** menu to the editor's menu bar, so you can run the show live without a browser or terminal.
+
+   | Menu entry | What happens |
+   |---|---|
+   | Start demo (full story) / Stop | runs or stops the paced story |
+   | Next day | the crop grows and the disease spreads one day |
+   | Scout now / Spray now / Scout + spray | the drones fly that mission, animated |
+   | **Inject outbreak** | plants a new disease patch in the hidden **Reality** field, at the field block you've selected, or else where the centre of your view meets a field. The twin isn't told, so "Scout now" shows it finding the patch. |
+   | Reset field | starts again with a new hidden outbreak |
+   | Re-frame camera | jumps back to the overview |
+
+   Only one step runs at a time. A second click while drones are flying logs "busy" in the Output Log.
+
+6. **Camera:** on start, the script moves the editor camera to a raised view over both fields, with TWIN on the left and REALITY on the right. The caption and labels always turn to face you. If you fly away, type `twin_live_camera()` in the Output Log's Python console to come back.
+7. **Stop or restart:** run the script again, or type `twin_live_stop()` in the same console.
 
 Settings are at the top of the script: API address, field mode, and where to build the blocks.
 

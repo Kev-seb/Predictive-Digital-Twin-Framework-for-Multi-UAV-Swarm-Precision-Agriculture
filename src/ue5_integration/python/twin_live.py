@@ -11,6 +11,11 @@ No C++ and no extra plugins: runs in UE5's built-in Python
   4. Stop the script:           run it again, or in the Python console: twin_live_stop()
      Re-frame the camera:       twin_live_camera()
 
+The script also adds a "Digital Twin" menu to the editor's main menu bar:
+Start demo, Next day, Scout now, Spray now, Scout + spray, Inject outbreak
+(at the selected field block, or where the view centre meets the field),
+Reset, Stop, Re-frame camera.
+
 Field modes (chosen automatically, see FIELD_MODE):
   "hism"   your field: an actor with an (H)ISM component of 20 x 20 = 400
            instances, instance index = row * 20 + col (row 0 = north edge).
@@ -32,6 +37,7 @@ import json
 import math
 import threading
 import time
+import urllib.error
 import urllib.request
 
 import unreal
@@ -182,6 +188,9 @@ class BlocksField:
     def size_cm(self):
         return GRID * CELL_CM
 
+    def world_to_grid(self, p):
+        return (p.y - self.origin.y) / CELL_CM, (p.x - self.origin.x) / CELL_CM
+
     def destroy(self):
         for actor, _, _ in self.cells:
             _destroy(actor)
@@ -224,6 +233,17 @@ class HismField:
 
     def size_cm(self):
         return self.col_axis.length() * GRID
+
+    def world_to_grid(self, p):
+        # Solve corner + col_axis * col + row_axis * row = p in the ground plane.
+        a, b = self.col_axis, self.row_axis
+        dx, dy = p.x - self.corner.x, p.y - self.corner.y
+        det = a.x * b.y - a.y * b.x
+        if abs(det) < 1e-9:
+            return GRID / 2.0, GRID / 2.0
+        col = (dx * b.y - dy * b.x) / det
+        row = (a.x * dy - a.y * dx) / det
+        return row, col
 
     def grid_to_world(self, row, col, alt_m):
         # Altitude scaled like the field, so drones keep their proportions on a resized field.
@@ -417,6 +437,104 @@ def twin_live_stop():
         unreal.log("[twin_live] stopped")
 
 
+# ======================================================== editor menu + actions
+def _post(path, body):
+    req = urllib.request.Request(f"{API}{path}", data=json.dumps(body).encode("utf-8"),
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=5.0) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def _target_cell(live):
+    """(row, col) for 'Inject outbreak': the selected field block, else the view centre on the field."""
+    fields = [f for f in (live.twin_field, live.truth_field) if f is not None]
+    try:
+        selected = unreal.get_editor_subsystem(unreal.EditorActorSubsystem).get_selected_level_actors()
+    except Exception:
+        selected = []
+    for actor in selected or []:
+        label = actor.get_actor_label()
+        parts = label.split("_")
+        if len(parts) == 3 and parts[0] in ("Twin", "Reality") and parts[1].isdigit() and parts[2].isdigit():
+            return int(parts[1]) + 0.5, int(parts[2]) + 0.5
+        loc = actor.get_actor_location()
+        for f in fields:
+            r, c = f.world_to_grid(loc)
+            if 0 <= r <= GRID and 0 <= c <= GRID:
+                return r, c
+    cam = _get_camera()
+    if cam is not None and cam[1] is not None:
+        loc, rot = cam
+        fwd = rot.get_forward_vector()
+        ground_z = live.center.z
+        if fwd.z < -1e-3:
+            hit = loc + fwd * ((ground_z - loc.z) / fwd.z)
+            for f in fields:
+                r, c = f.world_to_grid(hit)
+                if 0 <= r <= GRID and 0 <= c <= GRID:
+                    return r, c
+    return GRID / 2.0, GRID / 2.0
+
+
+def twin_live_action(action):
+    """Run one menu action without blocking the editor."""
+    import builtins
+    live = getattr(builtins, "_twin_live", None)
+    body, path = {"action": action}, "/live/action"
+    if action == "demo":
+        path, body = "/demo/start", {}
+    elif action == "stop":
+        path, body = "/demo/stop", {}
+    elif action == "outbreak" and live is not None:
+        row, col = _target_cell(live)
+        body.update(row=round(row, 2), col=round(col, 2))
+
+    def worker():
+        try:
+            _post(path, body)
+        except urllib.error.HTTPError as e:
+            msg = "busy: wait for the current step, or Stop" if e.code == 409 else f"HTTP {e.code}"
+            unreal.log_warning(f"[twin_live] {action}: {msg}")
+        except Exception as e:
+            unreal.log_warning(f"[twin_live] {action}: cannot reach {API} ({e})")
+    threading.Thread(target=worker, daemon=True).start()
+    unreal.log(f"[twin_live] {action} {body if action == 'outbreak' else ''}".rstrip())
+
+
+MENU_ITEMS = [
+    ("Run", "TwinDemo", "Start demo (full story)", "twin_live_action('demo')"),
+    ("Run", "TwinStop", "Stop", "twin_live_action('stop')"),
+    ("Step", "TwinNextDay", "Next day", "twin_live_action('next_day')"),
+    ("Step", "TwinScout", "Scout now", "twin_live_action('scout')"),
+    ("Step", "TwinSpray", "Spray now", "twin_live_action('spray')"),
+    ("Step", "TwinAuto", "Scout + spray", "twin_live_action('auto')"),
+    ("What if", "TwinOutbreak", "Inject outbreak (selected block / view centre)", "twin_live_action('outbreak')"),
+    ("What if", "TwinReset", "Reset field (new hidden outbreak)", "twin_live_action('reset')"),
+    ("View", "TwinCamera", "Re-frame camera", "twin_live_camera()"),
+]
+
+
+def _register_menu():
+    """Add the 'Digital Twin' menu to the editor's main menu bar (once per editor session)."""
+    try:
+        menus = unreal.ToolMenus.get()
+        main = menus.find_menu("LevelEditor.MainMenu")
+        menu = menus.find_menu("LevelEditor.MainMenu.DigitalTwin")
+        if menu is None:
+            menu = main.add_sub_menu("TwinLive", "", "DigitalTwin", "Digital Twin", "Digital twin demo controls")
+        for section, name, label, command in MENU_ITEMS:
+            entry = unreal.ToolMenuEntry(name=name, type=unreal.MultiBlockType.MENU_ENTRY)
+            entry.set_label(label)
+            entry.set_string_command(unreal.ToolMenuStringCommandType.PYTHON, "", command)
+            menu.add_menu_entry(section, entry)
+        menus.refresh_all_widgets()
+        return True
+    except Exception as e:
+        unreal.log_warning(f"[twin_live] could not add the Digital Twin menu ({e}); "
+                           "use twin_live_action('scout') etc. in the Python console")
+        return False
+
+
 def twin_live_camera():
     """Re-frame the editor camera over the fields."""
     import builtins
@@ -431,6 +549,8 @@ def twin_live_start():
     builtins._twin_live = TwinLive()
     builtins.twin_live_stop = twin_live_stop
     builtins.twin_live_camera = twin_live_camera
+    builtins.twin_live_action = twin_live_action
+    _register_menu()
     unreal.log(f"[twin_live] running against {API}; twin_live_stop() to stop, "
                "twin_live_camera() to re-frame the view")
     return builtins._twin_live

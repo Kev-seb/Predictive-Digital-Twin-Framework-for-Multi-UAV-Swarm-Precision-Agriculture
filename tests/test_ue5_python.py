@@ -46,9 +46,16 @@ def api(tmp_path, monkeypatch):
             return False
 
     def fake_urlopen(url, timeout=None):
+        if isinstance(url, urllib.request.Request):           # POST from the menu actions
+            path = url.full_url.split("8008", 1)[1]
+            r = client.post(path, content=url.data, headers={"Content-Type": "application/json"})
+            if r.status_code >= 400:
+                raise urllib.error.HTTPError(url.full_url, r.status_code, r.text, {}, None)
+            return _Resp(r.content)
         path = url.split("8008", 1)[1]
         return _Resp(client.get(path).content)
 
+    import urllib.error
     import urllib.request
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     yield client
@@ -165,5 +172,53 @@ def test_hism_mode_writes_custom_data_and_maps_grid(fake_unreal, api):
         assert len(real_comp.custom) == 400
         assert all(v[2] == 0.0 for v in real_comp.custom.values())            # reality has no uncertainty
         assert any(v[2] > 0.0 for v in twin_comp.custom.values())             # the twin does
+    finally:
+        mod.twin_live_stop()
+
+
+def test_menu_registered_and_actions_drive_the_twin(fake_unreal, api):
+    import builtins
+    mod, live = _run_script()
+    try:
+        menu = fake_unreal.ToolMenus.get().find_menu("LevelEditor.MainMenu.DigitalTwin")
+        assert menu is not None and menu.label == "Digital Twin"
+        labels = [e.label for _, e in menu.entries]
+        assert "Scout now" in labels and "Inject outbreak (selected block / view centre)" in labels
+        assert all(e.command[1].startswith("twin_live_") for _, e in menu.entries)
+        api.post("/sim/reset", json={"seed": 5})
+
+        def wait_idle():
+            end = time.time() + 30
+            while time.time() < end:
+                fake_unreal._tick_all()
+                if not api.get("/demo/status").json()["running"]:
+                    return
+                time.sleep(0.05)
+
+        # Inject an outbreak at the selected Reality block (row 15, col 4).
+        block = next(a for a, _, _ in live.truth_field.cells if a.label == "Reality_15_04")
+        fake_unreal.EditorActorSubsystem.selected = [block]
+        assert mod._target_cell(live) == (15.5, 4.5)
+        before = api.get("/sim/truth/layers/fungus?rows=20&cols=20").json()["values"][15][4]
+        exec(menu.entries[[e.label for _, e in menu.entries].index(
+            "Inject outbreak (selected block / view centre)")][1].command[1], vars(builtins))
+        time.sleep(0.3)
+        wait_idle()
+        after = api.get("/sim/truth/layers/fungus?rows=20&cols=20").json()["values"][15][4]
+        assert after > before + 0.3
+
+        # Without a selection, the view centre picks the cell: aim at the twin field's (5, 12).
+        fake_unreal.EditorActorSubsystem.selected = []
+        target = live.twin_field.grid_to_world(5.0, 12.0, 0.0)
+        cam = target + fake_unreal.Vector(0.0, 3000.0, 3000.0)
+        fake_unreal.UnrealEditorSubsystem.camera = (cam, mod._look_rotation(cam, target))
+        r, c = mod._target_cell(live)
+        assert abs(r - 5.0) < 0.05 and abs(c - 12.0) < 0.05
+
+        # "Scout now" runs a scouting flight that the script animates.
+        builtins.twin_live_action("scout")
+        time.sleep(0.3)
+        wait_idle()
+        assert len(live.drones) >= 1
     finally:
         mod.twin_live_stop()

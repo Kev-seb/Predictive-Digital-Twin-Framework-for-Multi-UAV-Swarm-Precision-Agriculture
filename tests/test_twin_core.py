@@ -702,3 +702,41 @@ def test_ue5_frame_polling(client):
     assert fr["status"]["phase"] == "done"
     assert fr["drones"]["fields"][0] == "row" and len(fr["drones"]["drones"]) >= 1
     assert "truth_stress" in fr["field"]
+
+
+# ------------------------------------------------------------ live actions
+def _wait_idle(client, timeout=30.0):
+    import time as _t
+    end = _t.time() + timeout
+    while _t.time() < end:
+        st = client.get("/demo/status").json()
+        if not st["running"]:
+            return st
+        _t.sleep(0.05)
+    raise AssertionError("action did not finish")
+
+
+def test_live_actions_step_the_story(client):
+    assert client.post("/live/action", json={"action": "reset", "seed": 3}).status_code == 200
+    assert _wait_idle(client)["phase"] == "start"
+    before = client.get("/sim/truth/layers/fungus?rows=20&cols=20").json()["values"]
+    client.post("/live/action", json={"action": "outbreak", "row": 15, "col": 4, "load": 0.6})
+    st = _wait_idle(client)
+    assert st["phase"] == "outbreak"
+    after = client.get("/sim/truth/layers/fungus?rows=20&cols=20").json()["values"]
+    assert after[15][4] > before[15][4] + 0.3                      # hidden field changed there
+    assert after[2][2] == pytest.approx(before[2][2], abs=0.02)   # and only there
+    twin_before = client.get("/twin/layers/fungus?rows=20&cols=20").json()["values"][15][4]
+    client.post("/live/action", json={"action": "next_day"})
+    assert _wait_idle(client)["phase"] == "advance"
+    client.post("/live/action", json={"action": "auto", "playback_speed": 500})
+    st = _wait_idle(client, 60)
+    assert st["phase"] in ("spray", "decide") and st["error"] is None
+    twin_after = client.get("/twin/layers/fungus?rows=20&cols=20").json()["values"][15][4]
+    assert twin_after > twin_before + 0.1                          # scouting found the new outbreak
+
+
+def test_live_action_busy_guard(client):
+    client.post("/demo/start", json={"days": 30, "day_seconds": 5})
+    assert client.post("/live/action", json={"action": "next_day"}).status_code == 409
+    client.post("/demo/stop")

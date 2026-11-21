@@ -88,6 +88,25 @@ class VirtualField:
         self.weather_noise = weather_noise or {"temperature": 1.0, "humidity": 4.0,
                                                "precipitation": 0.35}
 
+    def inject_outbreak(self, row: float, col: float, radius_cells: float = 3.0,
+                        load: float = 0.5) -> float:
+        """
+        Start a new fungal outbreak in the hidden field (twin-grid cell
+        coordinates). The twin is not told; it has to find it. Returns the
+        peak load added.
+        """
+        g = self.grid
+        rr, cc = np.mgrid[0:g.rows, 0:g.cols]
+        d = np.hypot(rr - row, cc - col)
+        bump = (load * np.exp(-(d / max(radius_cells, 1e-6)) ** 2)).astype(np.float32)
+        m = self.truth.state.mean
+        m["fungus"] = np.clip(m["fungus"] + bump, 0.0, 1.0).astype(np.float32)
+        m["ndvi"] = np.clip(m["ndvi"] - 0.4 * bump, -1.0, 1.0).astype(np.float32)
+        self.truth._refresh_stress()
+        for name in LAYERS:
+            self.truth.state.var[name][:] = 0.0
+        return float(bump.max())
+
     # ------------------------------------------------------------ dynamics
     @property
     def grid(self) -> FieldGrid:
