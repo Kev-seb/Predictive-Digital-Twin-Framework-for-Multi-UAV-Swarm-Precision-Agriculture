@@ -617,6 +617,9 @@ class TwinLive:
 
     def stop(self):
         self.running = False
+        poller = getattr(self, "poller", None)
+        if poller is not None and poller.is_alive() and poller is not threading.current_thread():
+            poller.join(timeout=3.0)      # let an in-flight request finish before tearing down
         try:
             unreal.unregister_slate_post_tick_callback(self.tick_handle)
         except Exception:

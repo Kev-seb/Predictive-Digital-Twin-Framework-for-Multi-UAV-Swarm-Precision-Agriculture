@@ -1,0 +1,15 @@
+# Minimal dependencies for the test suite (CI). The app itself uses requirements.txt.
+# torch is installed separately in CI from the CPU-only index (much smaller).
+numpy
+scipy
+matplotlib
+tifffile
+pillow>=9.0.0
+fastapi>=0.110.0
+uvicorn>=0.29.0
+httpx
+pydantic-settings
+pymavlink
+requests
+websockets
+pytest
