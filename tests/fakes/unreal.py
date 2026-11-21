@@ -137,6 +137,26 @@ class StaticMeshActor(Actor):
         self.static_mesh_component = _MeshComponent()
 
 
+class _NiagaraComponent:
+    def __init__(self):
+        self.asset, self.active = None, False
+
+    def set_asset(self, asset):
+        self.asset = asset
+
+    def activate(self, reset=False):
+        self.active = True
+
+    def deactivate(self):
+        self.active = False
+
+
+class NiagaraActor(Actor):
+    def __init__(self, location=None):
+        super().__init__(location)
+        self.niagara_component = _NiagaraComponent()
+
+
 class TextRenderActor(Actor):
     def __init__(self, location=None):
         super().__init__(location)
@@ -275,8 +295,11 @@ def get_editor_subsystem(cls):
     return _EDITOR if cls is UnrealEditorSubsystem else _SUBSYSTEM
 
 
+MISSING_ASSETS = set()
+
+
 def load_asset(path):
-    return path
+    return None if path in MISSING_ASSETS else path
 
 
 def register_slate_post_tick_callback(fn):
@@ -295,6 +318,7 @@ def _reset():
     EditorActorSubsystem.selected = []
     ToolMenus._menus.clear()
     ToolMenus._instance = None
+    MISSING_ASSETS.clear()
     _TICKS.clear()
     _LEVEL.clear()
     LOG.clear()

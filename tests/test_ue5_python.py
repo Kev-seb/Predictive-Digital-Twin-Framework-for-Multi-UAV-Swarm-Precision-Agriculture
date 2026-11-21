@@ -5,6 +5,7 @@ editor (tests/fakes/unreal.py).
 """
 
 import importlib.util
+import math
 import io
 import sys
 import time
@@ -103,8 +104,12 @@ def test_blocks_mode_shows_field_drones_and_story(fake_unreal, api):
             return "Demo finished" in live.caption.text_render.text
         assert _pump_until(fake_unreal, live, done), live.caption.text_render.text
         assert len(live.drones) == 3 and seen_spray["v"]
-        body = next(iter(live.drones.values()))["body"]
-        assert body.scale.x == pytest.approx(4.0)                        # 4 m drones on 5 m cells
+        drone = next(iter(live.drones.values()))
+        assert drone["body"].scale.x == pytest.approx(4.0 * 0.32)       # hub of a 4 m quadcopter
+        assert len(drone["parts"]) == 11                                  # 2 arms, 4 motors, 4 rotors, tank
+        rotors = [a for a, _, _, spins in drone["parts"] if spins]
+        arm = (rotors[0].location - drone["body"].location)
+        assert math.hypot(arm.x, arm.y) == pytest.approx(0.36 * 400, rel=0.01)   # rotors on the arm tips
         assert live.caption.text_render.size > 300 and live.caption.text_render.color.r == 255
         # Drones flew over the field (grid 20 x 20 cells of 500 cm from the origin).
         xs = [d["pos"].x for d in live.drones.values()]
@@ -229,3 +234,48 @@ def test_menu_registered_and_actions_drive_the_twin(fake_unreal, api):
         assert len(live.drones) >= 1
     finally:
         mod.twin_live_stop()
+
+
+def test_project_assets_and_rain(fake_unreal, api):
+    """Asset paths swap in your meshes / Niagara; rain follows the real field's weather."""
+    mod, live = _run_script()
+    mod.twin_live_stop()
+    fake_unreal.MISSING_ASSETS.add("/Game/FX/NS_Missing")
+    mod.DRONE_MESH = "/Game/Drones/SM_AgriDrone"
+    mod.CROP_MESH = "/Game/Crops/SM_Rice"
+    mod.SPRAY_NIAGARA = "/Game/FX/NS_Spray"
+    mod.RAIN_NIAGARA = "/Game/FX/NS_Missing"           # missing -> falling-streak fallback
+    mod.twin_live_start()
+    import builtins
+    live = builtins._twin_live
+    try:
+        actor, mid, loc = live.twin_field.cells[0]
+        assert live.twin_field.crop and actor.static_mesh_component.mesh == "/Game/Crops/SM_Rice"
+        assert any("NS_Missing" in m and "WARNING" in m for m in fake_unreal.LOG)
+        assert live.rain_streaks and all(a.hidden for a in live.rain)
+        live._apply_drones({"d1": [5.0, 5.0, 4.0, True, 90.0]})
+        d = live.drones["d1"]
+        assert d["body"].static_mesh_component.mesh == "/Game/Drones/SM_AgriDrone" and not d["parts"]
+        assert isinstance(d["cone"], fake_unreal.NiagaraActor)
+        fake_unreal._tick_all()
+        assert d["cone"].niagara_component.active and not d["cone"].hidden     # spraying
+        live._apply_drones({"d1": [5.0, 6.0, 4.0, False, 90.0]})
+        fake_unreal._tick_all()
+        assert not d["cone"].niagara_component.active
+        # Rain: shown on a wet day, streaks fall, hidden again when dry.
+        with live.lock:
+            live.frame = {"seq": live.seq, "weather": {"precipitation_mm": 12.0}}
+        z0 = [p[2] for p in live.rain_streaks]
+        fake_unreal._tick_all()
+        assert all(not a.hidden for a in live.rain)
+        assert [p[2] for p in live.rain_streaks] != z0
+        with live.lock:
+            live.frame = {"seq": live.seq, "weather": {"precipitation_mm": 0.0}}
+        fake_unreal._tick_all()
+        assert all(a.hidden for a in live.rain)
+        # The API reports the weather each frame.
+        w = api.get("/ue5/frame").json()["weather"]
+        assert set(w) == {"precipitation_mm", "temperature_c", "humidity_pct", "wind_speed_m_s"}
+    finally:
+        mod.twin_live_stop()
+    assert not fake_unreal._LEVEL

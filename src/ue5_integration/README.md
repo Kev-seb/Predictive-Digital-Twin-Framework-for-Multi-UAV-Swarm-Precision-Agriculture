@@ -44,7 +44,7 @@ The `TwinStream` C++ plugin (sections 1–7) connects a UE5 level to the digital
    curl -X POST localhost:8008/demo/start -H 'content-type: application/json' -d '{}'
    ```
 
-   Drones (spheres) take off, scout, and spray, with a blue cone showing while they spray. The twin field changes under them as they fly. A caption above the field narrates each step and shows the twin-vs-reality error.
+   Quadcopters (hub, X arms, spinning rotors, spray tank) take off, scout, and spray, with a blue cone under them while they spray. The twin field changes under them as they fly. A caption above the field narrates each step and shows the twin-vs-reality error.
 5. **Digital Twin menu:** the script adds a **Digital Twin** menu to the editor's menu bar, so you can run the show live without a browser or terminal.
 
    | Menu entry | What happens |
@@ -62,6 +62,21 @@ The `TwinStream` C++ plugin (sections 1–7) connects a UE5 level to the digital
 7. **Stop or restart:** run the script again, or type `twin_live_stop()` in the same console.
 
 Settings are at the top of the script: API address, field mode, and where to build the blocks.
+
+### Realistic look with your own assets
+
+The script runs in any project with engine shapes only. To use better-looking assets, put their paths in these settings at the top of `twin_live.py`. To get a path, right-click the asset in the Content Browser, choose **Copy Reference**, and keep the part between the quotes, for example `/Game/Drones/SM_AgriDrone.SM_AgriDrone`.
+
+| Setting | What it replaces | Notes |
+|---|---|---|
+| `DRONE_MESH` | the engine-shape quadcopter | Static mesh, nose along +X, about 1 m across. Use `DRONE_MESH_SCALE` to resize it. If its material has a `Color` parameter, each drone gets its own colour. |
+| `SPRAY_NIAGARA` | the blue spray cone | A Niagara system that emits downward. It runs only while the drone sprays. |
+| `RAIN_NIAGARA` | the falling blue streaks | A rain Niagara system, placed above the fields. |
+| `CROP_MESH` | the cubes (blocks mode) | A rice clump with its pivot at the base, about 1 m wide. It grows taller with NDVI. Health colour goes to the material's `CROP_COLOR_PARAM` vector parameter (default `Color`). |
+
+Rain shows on days when the real field gets more than `RAIN_MM` (1 mm) of rain. `/ue5/frame` reports that day's weather in `weather`. Set `SHOW_RAIN = False` to turn rain off. If a path is wrong, the Output Log warns once and the built-in look is used.
+
+Where to get them: a Megascans grass or plant clump from Fab (inside UE5) for the crop, and any quadcopter mesh from Fab for the drone. For spray, make a Niagara system from the **Fountain** template and point it down. For rain, make a sprite emitter that spawns in a wide box and falls fast.
 
 This path is tested against the real API with a stand-in for UE5's Python module (`tests/test_ue5_python.py`), but it hasn't been run inside UE5 yet. If a call doesn't exist in your engine version, the Output Log names it. Send me that line.
 

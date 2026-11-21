@@ -59,9 +59,21 @@ SMOOTHING = 0.35                 # drone motion smoothing per editor tick (0..1)
 AUTO_FRAME_CAMERA = True         # frame the editor camera over the fields on start
 DRONE_SIZE_M = 4.0               # drawn drone size; real ~1.6 m drones vanish over a 100 m field
 
+# --- Realistic look: paths of assets in YOUR project (right-click asset > Copy Reference,
+# keep the part between the quotes). None = built-in look, so the script runs in any project.
+DRONE_MESH = None        # static mesh, nose along +X, e.g. "/Game/Drones/SM_AgriDrone.SM_AgriDrone"
+DRONE_MESH_SCALE = 1.0   # extra scale for DRONE_MESH (1.0 = sized to DRONE_SIZE_M if the mesh is ~1 m)
+SPRAY_NIAGARA = None     # Niagara system under each spraying drone, e.g. "/Game/FX/NS_Spray.NS_Spray"
+RAIN_NIAGARA = None      # Niagara rain over the fields on rainy days, e.g. "/Game/FX/NS_Rain.NS_Rain"
+CROP_MESH = None         # blocks mode: crop mesh per cell instead of cubes, e.g. a rice clump
+CROP_COLOR_PARAM = "Color"   # vector parameter on CROP_MESH's material that takes the health colour
+SHOW_RAIN = True         # rain on days the real field gets more than RAIN_MM of rain
+RAIN_MM = 1.0
+
 _SPHERE = "/Engine/BasicShapes/Sphere"
 _CUBE = "/Engine/BasicShapes/Cube"
 _CONE = "/Engine/BasicShapes/Cone"
+_CYLINDER = "/Engine/BasicShapes/Cylinder"
 _SHAPE_MAT = "/Engine/BasicShapes/BasicShapeMaterial"   # has a "Color" vector parameter
 _DRONE_COLORS = [(0.22, 0.74, 0.97), (0.93, 0.28, 0.6), (0.64, 0.9, 0.21), (0.96, 0.62, 0.04),
                  (0.65, 0.55, 0.98), (0.18, 0.83, 0.75)]
@@ -91,15 +103,70 @@ def _destroy(actor):
         unreal.EditorLevelLibrary.destroy_actor(actor)
 
 
-def _mesh_actor(mesh_path, location, scale, color, label):
+_ASSETS = {}
+
+
+def _asset(path):
+    """Load an asset once; None (with one warning) when the path is unset or missing."""
+    if not path:
+        return None
+    if path not in _ASSETS:
+        try:
+            _ASSETS[path] = unreal.load_asset(path)
+        except Exception:
+            _ASSETS[path] = None
+        if _ASSETS[path] is None:
+            unreal.log_warning(f"[twin_live] asset '{path}' not found; using the built-in look")
+    return _ASSETS[path]
+
+
+def _mesh_actor(mesh_path, location, scale, color, label, own_material=False, color_param="Color"):
+    """Static mesh actor tinted through a dynamic material instance.
+
+    own_material=True keeps the mesh's own material (your crop or drone mesh)
+    and only sets ``color_param`` on it; engine shapes get BasicShapeMaterial.
+    """
     actor = _spawn(unreal.StaticMeshActor, location, label)
     comp = actor.static_mesh_component
-    comp.set_static_mesh(unreal.load_asset(mesh_path))
+    comp.set_static_mesh(_asset(mesh_path) if own_material else unreal.load_asset(mesh_path))
     actor.set_actor_scale3d(scale)
-    mid = comp.create_dynamic_material_instance(0, unreal.load_asset(_SHAPE_MAT))
+    try:
+        mid = comp.create_dynamic_material_instance(0, None if own_material else unreal.load_asset(_SHAPE_MAT))
+    except Exception:
+        mid = None
     if color is not None and mid is not None:
-        mid.set_vector_parameter_value("Color", unreal.LinearColor(color[0], color[1], color[2], 1.0))
+        mid.set_vector_parameter_value(color_param, unreal.LinearColor(color[0], color[1], color[2], 1.0))
     return actor, mid
+
+
+def _niagara_actor(system_path, location, label):
+    """A Niagara actor running ``system_path``, or None if unset/unavailable."""
+    system = _asset(system_path)
+    if system is None:
+        return None
+    try:
+        actor = _spawn(unreal.NiagaraActor, location, label)
+        comp = actor.niagara_component
+        comp.set_asset(system)
+        comp.activate(True)
+        return actor
+    except Exception as e:
+        unreal.log_warning(f"[twin_live] could not start Niagara '{system_path}' ({e})")
+        return None
+
+
+def _set_active(actor, on):
+    """Show/hide a mesh or Niagara actor (Niagara also stops emitting)."""
+    actor.set_is_temporarily_hidden_in_editor(not on)
+    comp = getattr(actor, "niagara_component", None)
+    if comp is not None:
+        try:
+            if on:
+                comp.activate(False)
+            else:
+                comp.deactivate()
+        except Exception:
+            pass
 
 
 def _editor():
@@ -168,21 +235,39 @@ class BlocksField:
 
     def __init__(self, origin, label):
         self.origin, self.cells = origin, []
+        # CROP_MESH: your crop clump per cell (pivot at its base, ~1 m wide), tinted via CROP_COLOR_PARAM.
+        self.crop = _asset(CROP_MESH) is not None
         for r in range(GRID):
             for c in range(GRID):
                 loc = unreal.Vector(origin.x + (c + 0.5) * CELL_CM, origin.y + (r + 0.5) * CELL_CM, origin.z)
-                actor, mid = _mesh_actor(_CUBE, loc, unreal.Vector(CELL_CM / 105.0, CELL_CM / 105.0, 0.3),
-                                         (0.1, 0.55, 0.12), f"{label}_{r:02d}_{c:02d}")
+                if self.crop:
+                    actor, mid = _mesh_actor(CROP_MESH, loc, self._scale(0.5), (0.1, 0.55, 0.12),
+                                             f"{label}_{r:02d}_{c:02d}", own_material=True,
+                                             color_param=CROP_COLOR_PARAM)
+                else:
+                    actor, mid = _mesh_actor(_CUBE, loc, self._scale(0.3), (0.1, 0.55, 0.12),
+                                             f"{label}_{r:02d}_{c:02d}")
                 self.cells.append((actor, mid, loc))
+
+    def _scale(self, height):
+        if self.crop:   # keep the clump's shape: grow it with NDVI rather than stretching a cube
+            k = CELL_CM / 100.0
+            return unreal.Vector(k, k, k * height)
+        return unreal.Vector(CELL_CM / 105.0, CELL_CM / 105.0, height)
 
     def apply(self, ndvi, stress, fungus, std):
         for i, (actor, mid, loc) in enumerate(self.cells):
-            height = 0.15 + 1.6 * max(0.0, ndvi[i])
-            actor.set_actor_scale3d(unreal.Vector(CELL_CM / 105.0, CELL_CM / 105.0, height))
-            actor.set_actor_location(unreal.Vector(loc.x, loc.y, loc.z + height * 50.0), False, True)
+            if self.crop:
+                height = 0.25 + 1.0 * max(0.0, ndvi[i])
+                actor.set_actor_scale3d(self._scale(height))     # pivot at the base: stays on the ground
+            else:
+                height = 0.15 + 1.6 * max(0.0, ndvi[i])
+                actor.set_actor_scale3d(self._scale(height))
+                actor.set_actor_location(unreal.Vector(loc.x, loc.y, loc.z + height * 50.0), False, True)
             if mid is not None:
                 r, g, b = crop_color(stress[i], fungus[i], std[i] if std else 0.0)
-                mid.set_vector_parameter_value("Color", unreal.LinearColor(r, g, b, 1.0))
+                mid.set_vector_parameter_value(CROP_COLOR_PARAM if self.crop else "Color",
+                                               unreal.LinearColor(r, g, b, 1.0))
 
     def grid_to_world(self, row, col, alt_m):
         return unreal.Vector(self.origin.x + col * CELL_CM, self.origin.y + row * CELL_CM,
@@ -332,11 +417,52 @@ class TwinLive:
                                      "Results: waiting for data...", size * 0.026, "TwinResults",
                                      (235, 245, 235))
             self.texts.append(self.panel)
+        self.rain, self.rain_on, self.raining, self.rain_streaks = [], False, False, None
+        if SHOW_RAIN:
+            self._build_rain(size)
         if AUTO_FRAME_CAMERA:
             self.frame_camera()
         self.poller = threading.Thread(target=self._poll, daemon=True)
         self.poller.start()
         self.tick_handle = unreal.register_slate_post_tick_callback(self._tick)
+
+    def _build_rain(self, size):
+        """RAIN_NIAGARA over the scene, or light-blue streaks falling over every field."""
+        top = size * 0.6
+        fx = _niagara_actor(RAIN_NIAGARA, self.center + unreal.Vector(0.0, 0.0, top), "TwinRain")
+        if fx is not None:
+            fx.set_actor_scale3d(unreal.Vector(self.span / 1000.0, size / 1000.0, 1.0))
+            self.rain, self.rain_streaks = [fx], None
+        else:
+            # A fixed pseudo-random layout so the scene looks the same every run.
+            n, half_x, half_y = 90, self.span * 0.5, size * 0.5
+            self.rain_streaks = []
+            k = size / 2000.0
+            for i in range(n):
+                x = ((i * 0.618034) % 1.0 - 0.5) * 2 * half_x
+                y = ((i * 0.381966 * 7) % 1.0 - 0.5) * 2 * half_y
+                z = ((i * 0.7548777) % 1.0) * top
+                a, _ = _mesh_actor(_CYLINDER, self.center + unreal.Vector(x, y, z),
+                                   unreal.Vector(k * 0.06, k * 0.06, k * 2.0), (0.55, 0.7, 0.95), f"Rain_{i:02d}")
+                self.rain.append(a)
+                self.rain_streaks.append([x, y, z])
+            self.rain_top = top
+        for a in self.rain:
+            _set_active(a, False)
+
+    def _update_rain(self, dt):
+        if self.raining != self.rain_on:
+            for a in self.rain:
+                _set_active(a, self.raining)
+            self.rain_on = self.raining
+        if not (self.rain_on and self.rain_streaks):
+            return
+        fall = self.rain_top * 1.5 * max(dt, 0.0)            # top to ground in ~0.7 s
+        for a, p in zip(self.rain, self.rain_streaks):
+            p[2] -= fall
+            if p[2] < 0.0:
+                p[2] += self.rain_top
+            a.set_actor_location(self.center + unreal.Vector(p[0], p[1], p[2]), False, True)
 
     # background thread: HTTP only, never touches UObjects
     def frame_camera(self):
@@ -375,11 +501,14 @@ class TwinLive:
                 self.what_if = field["what_if"]
             if self.panel is not None and frame.get("metrics"):
                 self.panel.text_render.set_text(panel_text(frame["metrics"], self.what_if))
+            if frame.get("weather"):
+                self.raining = SHOW_RAIN and frame["weather"].get("precipitation_mm", 0.0) > RAIN_MM
             if frame.get("drones"):
                 self._apply_drones(frame["drones"]["drones"])
         elif self.errors > 20 and self.caption is not None:
             self.caption.text_render.set_text(f"Digital twin: cannot reach {API}")
-        self._smooth_drones()
+        self._smooth_drones(delta_seconds)
+        self._update_rain(delta_seconds)
         cam = _get_camera()
         if cam is not None:
             for t in self.texts:
@@ -421,30 +550,70 @@ class TwinLive:
         for i, (d_id, p) in enumerate(sorted(drones.items())):
             row, col, alt, spraying, heading = p
             if d_id not in self.drones:
-                color = _DRONE_COLORS[i % len(_DRONE_COLORS)]
-                k = DRONE_SIZE_M * self.cm_per_m / 100.0     # engine shapes are 100 cm
-                body, _ = _mesh_actor(_SPHERE, self.twin_field.grid_to_world(row, col, alt),
-                                      unreal.Vector(k, k, k * 0.4), color, f"Drone_{d_id}")
-                # Negative Z scale flips the cone so it points down from the drone.
-                cone, _ = _mesh_actor(_CONE, self.twin_field.grid_to_world(row, col, alt),
-                                      unreal.Vector(k * 1.3, k * 1.3, -k * 1.2), (0.45, 0.75, 1.0),
-                                      f"Spray_{d_id}")
-                cone.set_is_temporarily_hidden_in_editor(True)
-                self.drones[d_id] = {"body": body, "cone": cone, "pos": None}
+                self.drones[d_id] = self._build_drone(d_id, _DRONE_COLORS[i % len(_DRONE_COLORS)],
+                                                      self.twin_field.grid_to_world(row, col, alt))
             target = self.twin_field.grid_to_world(row, col, alt)
             self.targets[d_id] = (target, bool(spraying), heading)
 
-    def _smooth_drones(self):
+    def _build_drone(self, d_id, color, at):
+        """Your DRONE_MESH, or a quadcopter of engine shapes (body, X arms, spinning rotors)."""
+        size = DRONE_SIZE_M * self.cm_per_m                   # cm
+        k = size / 100.0                                      # engine shapes are 100 cm
+        parts = []                                            # (actor, local offset cm, local yaw, spins)
+        if _asset(DRONE_MESH) is not None:
+            kk = k * DRONE_MESH_SCALE
+            body, _ = _mesh_actor(DRONE_MESH, at, unreal.Vector(kk, kk, kk), color, f"Drone_{d_id}",
+                                  own_material=True)
+        else:
+            body, _ = _mesh_actor(_CUBE, at, unreal.Vector(k * 0.32, k * 0.32, k * 0.12), color,
+                                  f"Drone_{d_id}")
+            arm = size * 0.36                                 # hub to rotor
+            for j, yaw in enumerate((45.0, 135.0)):
+                a, _ = _mesh_actor(_CUBE, at, unreal.Vector(k * 1.02, k * 0.05, k * 0.04), (0.12, 0.12, 0.13),
+                                   f"Drone_{d_id}_arm{j}")
+                parts.append((a, (0.0, 0.0, 0.0), yaw, False))
+            for j, yaw in enumerate((45.0, 135.0, 225.0, 315.0)):
+                off = (arm * math.cos(math.radians(yaw)), arm * math.sin(math.radians(yaw)), size * 0.05)
+                motor, _ = _mesh_actor(_CYLINDER, at, unreal.Vector(k * 0.07, k * 0.07, k * 0.07),
+                                       (0.1, 0.1, 0.1), f"Drone_{d_id}_motor{j}")
+                rotor, _ = _mesh_actor(_CUBE, at, unreal.Vector(k * 0.36, k * 0.035, k * 0.01),
+                                       (0.85, 0.85, 0.85), f"Drone_{d_id}_rotor{j}")
+                parts.append((motor, off, 0.0, False))
+                parts.append((rotor, (off[0], off[1], size * 0.09), yaw, True))
+            # Spray tank under the hub, in the drone's colour.
+            tank, _ = _mesh_actor(_CYLINDER, at, unreal.Vector(k * 0.16, k * 0.16, k * 0.12), color,
+                                  f"Drone_{d_id}_tank")
+            parts.append((tank, (0.0, 0.0, -size * 0.1), 0.0, False))
+        spray = _niagara_actor(SPRAY_NIAGARA, at, f"Spray_{d_id}")
+        if spray is None:
+            # Negative Z scale flips the cone so it points down from the drone.
+            spray, _ = _mesh_actor(_CONE, at, unreal.Vector(k * 1.3, k * 1.3, -k * 1.2), (0.45, 0.75, 1.0),
+                                   f"Spray_{d_id}")
+        _set_active(spray, False)
+        return {"body": body, "parts": parts, "cone": spray, "pos": None, "yaw": 0.0, "spin": 0.0,
+                "spraying": False, "size": size}
+
+    def _smooth_drones(self, dt=0.05):
         for d_id, (target, spraying, heading) in self.targets.items():
             d = self.drones[d_id]
             pos = target if d["pos"] is None else d["pos"] + (target - d["pos"]) * SMOOTHING
             d["pos"] = pos
-            d["body"].set_actor_location(pos, False, True)
             if heading is not None:
-                d["body"].set_actor_rotation(unreal.Rotator(roll=0.0, pitch=0.0, yaw=heading - 90.0), True)
-            drop = DRONE_SIZE_M * self.cm_per_m * 0.8          # cone hangs just under the drone
+                d["yaw"] = heading - 90.0
+            d["body"].set_actor_location(pos, False, True)
+            d["body"].set_actor_rotation(unreal.Rotator(roll=0.0, pitch=0.0, yaw=d["yaw"]), True)
+            d["spin"] = (d["spin"] + 1440.0 * max(dt, 0.0)) % 360.0     # 4 rev/s reads as "spinning"
+            yr = math.radians(d["yaw"])
+            cy, sy = math.cos(yr), math.sin(yr)
+            for actor, (ox, oy, oz), yaw, spins in d["parts"]:
+                actor.set_actor_location(pos + unreal.Vector(ox * cy - oy * sy, ox * sy + oy * cy, oz), False, True)
+                actor.set_actor_rotation(
+                    unreal.Rotator(roll=0.0, pitch=0.0, yaw=d["yaw"] + yaw + (d["spin"] if spins else 0.0)), True)
+            drop = d["size"] * 0.8                             # spray hangs just under the drone
             d["cone"].set_actor_location(pos - unreal.Vector(0.0, 0.0, drop), False, True)
-            d["cone"].set_is_temporarily_hidden_in_editor(not spraying)
+            if spraying != d["spraying"]:
+                _set_active(d["cone"], spraying)
+                d["spraying"] = spraying
 
     def stop(self):
         self.running = False
@@ -455,6 +624,10 @@ class TwinLive:
         for d in self.drones.values():
             _destroy(d["body"])
             _destroy(d["cone"])
+            for part in d["parts"]:
+                _destroy(part[0])
+        for a in self.rain:
+            _destroy(a)
         for t in getattr(self, "texts", [self.caption] if self.caption else []):
             _destroy(t)
         for f in (self.twin_field, self.truth_field, self.forecast_field):

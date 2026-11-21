@@ -1154,7 +1154,17 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
             "demo_running": ctx["demo"]["task"] is not None and not ctx["demo"]["task"].done(),
             "field": field_snapshot(version) if version != since else None,
             "metrics": metrics_view(),
+            "weather": frame_weather(),
         }
+
+    def frame_weather():
+        """Today's weather in the (virtual) real field, for rain effects in UE5."""
+        vf = ctx.get("virtual")
+        w = (vf.truth.state.last_weather if vf is not None else None) or get_twin().state.last_weather or {}
+        return {"precipitation_mm": round(float(w.get("precipitation", 0.0)), 2),
+                "temperature_c": round(float(w.get("temperature", 29.0)), 1),
+                "humidity_pct": round(float(w.get("humidity", 75.0)), 1),
+                "wind_speed_m_s": round(float(w.get("wind_speed", 2.0)), 2)}
 
     @app.get("/sim/error", summary="Twin vs ground truth")
     def sim_error():
