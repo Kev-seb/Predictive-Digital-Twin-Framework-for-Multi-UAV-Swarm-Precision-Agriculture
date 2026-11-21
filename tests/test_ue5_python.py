@@ -148,6 +148,23 @@ def test_camera_framed_and_texts_face_it(fake_unreal, api):
             assert abs(math.remainder(t.rotation.yaw - math.degrees(math.atan2(d.y, d.x)), 360.0)) < 1e-6
         # Left to right as seen from the camera (looking north, -Y): twin, reality, forecast.
         assert live.labels[0].location.x < live.labels[1].location.x < live.labels[2].location.x
+        # Every text has a dark board just behind it (away from the camera), sized to the text.
+        assert len(live.boards) == len(live.texts)
+        cam_loc = fake_unreal.UnrealEditorSubsystem.camera[0]
+        for t in live.texts:
+            board = mod._TEXTS[t.get_actor_label()]["board"]
+            d_text = (t.location - cam_loc).length()
+            d_board = (board.location - cam_loc).length()
+            assert d_board > d_text and board.rotation.yaw == pytest.approx(t.rotation.yaw)
+        before = mod._TEXTS["TwinResults"]["board"].scale
+        mod._set_text(live.panel, "line one\nline two that is longer\nthree\nfour")
+        after = mod._TEXTS["TwinResults"]["board"].scale
+        assert after.z > before.z * 1.5 and after.y > 0                       # grows with the text
+        # The caption sits in front of the fields, nearer the camera than any field.
+        assert live.caption.location.y > live.twin_field.grid_to_world(20.0, 0.0, 0.0).y
+        # An outbreak reads red even where the twin is still unsure.
+        r, g, b = mod.crop_color(stress=0.5, fungus=0.45, std=0.2)
+        assert r > 0.4 and r > 2 * g and r > 2 * b
         fake_unreal.UnrealEditorSubsystem.camera = None
         mod.twin_live_camera()
         assert fake_unreal.UnrealEditorSubsystem.camera is not None
