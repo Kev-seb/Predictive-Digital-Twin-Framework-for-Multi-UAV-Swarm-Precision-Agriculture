@@ -21,7 +21,22 @@ The `TwinStream` C++ plugin (sections 1–7) connects a UE5 level to the digital
      - **REALITY:** the hidden truth.
      - **FORECAST +7 DAYS:** what the twin predicts a week ahead if nothing is done. It's faded where the prediction is uncertain. This is the "predictive" part of a predictive digital twin.
 
-     Set `SHOW_FORECAST = False` at the top of the script to hide the forecast field. In a level with your own field, an actor labelled "Forecast" gets the prediction.
+     A **results panel** stands to the left of the fields. For example:
+
+     ```text
+     DAY 3  |  Vegetative
+     Expected harvest:  5.51 t/ha
+       in 7 days, no spray:  5.37 t/ha
+       in 7 days, sprayed:   5.41 t/ha  (zones 6)
+     Worst disease in 7 days:  36%  ->  16% if sprayed
+     Fungicide:  3.0 kg  vs  25 kg whole-field  (88% saved)
+     Twin vs reality error:  0.076  ->  0.031
+     Missions:  1 scout  |  1 spray  |  9.3 min flown
+     ```
+
+     Expected harvest uses the repo's yield model (mature biomass × harvest index × stress penalty), fed with each cell's health relative to its growth stage. "Whole-field" is conventional blanket spraying of the field at 25 L/ha per application.
+
+     Set `SHOW_FORECAST = False` or `SHOW_PANEL = False` at the top of the script to hide the forecast field or the panel. In a level with your own field, an actor labelled "Forecast" gets the prediction.
    - **Level with your rice field** (a 400-instance HISM): the script drives your field instead, through per-instance custom data slots 0–5, which you read in `M_RiceCrop` with *PerInstanceCustomData* nodes. Label a second field actor with "Reality" to get the hidden truth on it.
 4. **Start the story:**
 
@@ -187,7 +202,9 @@ In simulation, **`field.snapshot`** also carries `truth_ndvi`, `truth_stress` an
 
 Every snapshot also carries the twin's 7-day forecast, computed on a copy of the twin so the live twin is untouched:
 - **`forecast_ndvi`, `forecast_stress`, `forecast_fungus`, `forecast_std`:** the predicted field if nothing is done.
-- **`what_if`:** `{days, on_day, no_spray, if_sprayed, spray_zones}`, comparing doing nothing with spraying the zones the twin flags now. Each scenario gives mean and peak fungus, mean NDVI and mean stress.
+- **`what_if`:** `{days, on_day, no_spray, if_sprayed, spray_zones}`. "No spray" assumes none of the fleet's sprays happen; "if sprayed" includes the sprays already flown plus the zones the twin flags now. Each scenario gives mean and peak fungus, mean NDVI and mean stress.
+
+`/ue5/frame` and every snapshot also carry **`metrics`**, the numbers behind the results panel: expected harvest (now, and in 7 days with and without spraying), fungicide used against blanket spraying, twin-vs-reality error history, and missions and flight time.
 
 **Client → server:** `{"type": "snapshot"}` requests a snapshot immediately.
 

@@ -760,3 +760,25 @@ def test_snapshot_carries_forecast_and_what_if(client):
     day = client.get("/twin/state").json()["sim_day"]
     client.get("/ue5/frame")
     assert client.get("/twin/state").json()["sim_day"] == day
+
+
+# ----------------------------------------------------------------- metrics
+def test_metrics_panel_numbers(client):
+    from digital_twin_api import expected_harvest_t_ha
+    from src.twin_core import DigitalTwin, FieldGrid
+
+    healthy = DigitalTwin("h", grid=FieldGrid.centered_on(10.0, 78.0, rows=20, cols=20, cell_size_m=5.0))
+    assert 5.5 < expected_harvest_t_ha(healthy) < 7.0                  # typical Tamil Nadu paddy
+
+    client.post("/sim/reset", json={"seed": 7})
+    client.post("/sim/advance", json={"days": 3})
+    client.post("/sim/mission", json={"kind": "auto", "fungus_threshold": 0.15})
+    m = client.get("/ue5/frame").json()["metrics"]
+    assert m["missions"] == {"scout": 1, "spray": 1, "flight_min": m["missions"]["flight_min"]}
+    assert m["missions"]["flight_min"] > 1.0
+    f = m["fungicide"]
+    assert 0 < f["used_kg"] < f["blanket_kg"] and 0 < f["saved_pct"] < 100 and f["zones_sprayed"] >= 1
+    h = m["harvest_t_ha"]
+    assert 3.0 < h["now"] < 7.0
+    assert h["in_7d_if_sprayed"] >= h["in_7d_no_spray"]                 # acting pays
+    assert m["twin_error"]["now"] < m["twin_error"]["first"]            # scouting taught the twin

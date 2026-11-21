@@ -50,6 +50,7 @@ TWIN_ACTOR_LABEL = None          # hism mode: label of your field actor (None = 
 REALITY_LABEL_HINT = "Reality"   # hism mode: label substring of the optional reality field
 FORECAST_LABEL_HINT = "Forecast" # hism mode: label substring of the optional forecast field
 SHOW_FORECAST = True             # blocks mode: third field with the twin's 7-day prediction
+SHOW_PANEL = True                # results panel: harvest, fungicide saved, twin accuracy
 BLOCKS_ORIGIN = unreal.Vector(0.0, 0.0, 0.0)   # blocks mode: north-west corner of the twin field (cm)
 BLOCKS_GAP_CELLS = 4             # blocks mode: gap between twin and reality fields
 CELL_CM = 500.0                  # blocks mode: 5 m cells, like the twin's 20 x 20 grid
@@ -324,6 +325,13 @@ class TwinLive:
                                    f"Label_{name.split()[0]}", color)
                        for c, (_, name, color) in zip(centers, views)]
         self.texts = [self.caption] + self.labels
+        self.panel, self.what_if = None, None
+        if SHOW_PANEL:
+            west = self.twin_field.grid_to_world(GRID / 2.0, -1.0, 0.0) - centers[0]
+            self.panel = _text_actor(centers[0] + west * 2.2 + unreal.Vector(0.0, 0.0, size * 0.25),
+                                     "Results: waiting for data...", size * 0.026, "TwinResults",
+                                     (235, 245, 235))
+            self.texts.append(self.panel)
         if AUTO_FRAME_CAMERA:
             self.frame_camera()
         self.poller = threading.Thread(target=self._poll, daemon=True)
@@ -363,6 +371,10 @@ class TwinLive:
                 self.seq = frame["seq"]
                 self._apply_field(field)
             self._apply_status(frame.get("status"), field)
+            if field is not None and field.get("what_if"):
+                self.what_if = field["what_if"]
+            if self.panel is not None and frame.get("metrics"):
+                self.panel.text_render.set_text(panel_text(frame["metrics"], self.what_if))
             if frame.get("drones"):
                 self._apply_drones(frame["drones"]["drones"])
         elif self.errors > 20 and self.caption is not None:
@@ -457,6 +469,30 @@ def twin_live_stop():
         live.stop()
         builtins._twin_live = None
         unreal.log("[twin_live] stopped")
+
+
+def panel_text(m, what_if=None):
+    """Plain-ASCII results panel (UE's default text font)."""
+    h, f, ms, e = m["harvest_t_ha"], m["fungicide"], m["missions"], m["twin_error"]
+    zones = ", ".join(str(z) for z in h.get("spray_zones") or []) or "none"
+    lines = [
+        f"DAY {m['sim_day']}  |  {m['growth_stage']}",
+        f"Expected harvest:  {h['now']:.2f} t/ha",
+        f"  in 7 days, no spray:  {h['in_7d_no_spray']:.2f} t/ha",
+        f"  in 7 days, sprayed:   {h['in_7d_if_sprayed']:.2f} t/ha  (zones {zones})",
+    ]
+    if what_if:
+        lines.append(f"Worst disease in 7 days:  {what_if['no_spray']['fungus_peak'] * 100:.0f}%"
+                     f"  ->  {what_if['if_sprayed']['fungus_peak'] * 100:.0f}% if sprayed")
+    if f["blanket_kg"]:
+        lines.append(f"Fungicide:  {f['used_kg']:.1f} kg  vs  {f['blanket_kg']:.0f} kg whole-field"
+                     f"  ({f['saved_pct']:.0f}% saved)")
+    else:
+        lines.append("Fungicide:  none used yet")
+    if e.get("first") is not None:
+        lines.append(f"Twin vs reality error:  {e['first']:.3f}  ->  {e['now']:.3f}")
+    lines.append(f"Missions:  {ms['scout']} scout  |  {ms['spray']} spray  |  {ms['flight_min']:.1f} min flown")
+    return "\n".join(lines)
 
 
 # ======================================================== editor menu + actions

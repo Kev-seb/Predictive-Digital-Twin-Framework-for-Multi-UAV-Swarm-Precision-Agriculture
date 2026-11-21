@@ -117,6 +117,11 @@ def test_blocks_mode_shows_field_drones_and_story(fake_unreal, api):
         forecast = [mid.params["Color"] for _, mid, _ in live.forecast_field.cells]
         assert len({(round(c.r, 3), round(c.g, 3)) for c in forecast}) > 10   # forecast field coloured
         assert any("drones scouting" in c and "twin vs reality error" in c for c in captions), captions
+        panel = live.panel.text_render.text.split("\n")
+        assert panel[0].startswith("DAY ") and "Expected harvest" in panel[1]
+        assert any(l.startswith("Fungicide:") and "saved" in l for l in panel), panel
+        assert any(l.startswith("Twin vs reality error:") for l in panel)
+        assert all(ord(ch) < 128 for ch in live.panel.text_render.text)      # default UE font safe
     finally:
         mod.twin_live_stop()
     assert not fake_unreal._LEVEL and not fake_unreal._TICKS                 # stop() cleans up
