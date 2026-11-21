@@ -25,7 +25,8 @@ The `TwinStream` C++ plugin (sections 1–7) connects a UE5 level to the digital
    ```
 
    Drones (spheres) take off, scout, and spray, with a blue cone showing while they spray. The twin field changes under them as they fly. A caption above the field narrates each step and shows the twin-vs-reality error.
-5. **Stop or restart:** run the script again, or type `twin_live_stop()` in the Output Log's Python console.
+5. **Camera:** on start, the script moves the editor camera to a raised view over both fields, with TWIN on the left and REALITY on the right. The caption and labels always turn to face you. If you fly away, type `twin_live_camera()` in the Output Log's Python console to come back.
+6. **Stop or restart:** run the script again, or type `twin_live_stop()` in the same console.
 
 Settings are at the top of the script: API address, field mode, and where to build the blocks.
 

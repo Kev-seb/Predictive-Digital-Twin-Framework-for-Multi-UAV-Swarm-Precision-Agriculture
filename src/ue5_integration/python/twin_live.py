@@ -9,6 +9,7 @@ No C++ and no extra plugins: runs in UE5's built-in Python
      (or in the Output Log, Python mode:  exec(open(r"C:/path/to/twin_live.py").read()) )
   3. Start the story:           curl -X POST localhost:8008/demo/start -H 'content-type: application/json' -d '{}'
   4. Stop the script:           run it again, or in the Python console: twin_live_stop()
+     Re-frame the camera:       twin_live_camera()
 
 Field modes (chosen automatically, see FIELD_MODE):
   "hism"   your field: an actor with an (H)ISM component of 20 x 20 = 400
@@ -22,10 +23,13 @@ Field modes (chosen automatically, see FIELD_MODE):
            plus a "Reality" field beside it.
 
 Drones are spheres (spray cone under them while spraying); a caption shows
-the demo's narration and the twin-vs-reality error.
+the demo's narration and the twin-vs-reality error. On start the editor
+camera is framed in a raised three-quarter view over the fields, and the
+caption and the TWIN / REALITY labels always turn to face the camera.
 """
 
 import json
+import math
 import threading
 import time
 import urllib.request
@@ -43,6 +47,7 @@ BLOCKS_GAP_CELLS = 4             # blocks mode: gap between twin and reality fie
 CELL_CM = 500.0                  # blocks mode: 5 m cells, like the twin's 20 x 20 grid
 GRID = 20
 SMOOTHING = 0.35                 # drone motion smoothing per editor tick (0..1)
+AUTO_FRAME_CAMERA = True         # frame the editor camera over the fields on start
 
 _SPHERE = "/Engine/BasicShapes/Sphere"
 _CUBE = "/Engine/BasicShapes/Cube"
@@ -87,6 +92,53 @@ def _mesh_actor(mesh_path, location, scale, color, label):
     return actor, mid
 
 
+def _editor():
+    return unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)
+
+
+def _get_camera():
+    """(location, rotation) of the active level viewport, or None if unavailable."""
+    try:
+        info = _editor().get_level_viewport_camera_info()
+    except Exception:
+        return None
+    if not info:
+        return None
+    loc = next((x for x in info if isinstance(x, unreal.Vector)), None)
+    return (loc, next((x for x in info if isinstance(x, unreal.Rotator)), None)) if loc else None
+
+
+def _look_rotation(frm, to):
+    d = to - frm
+    yaw = math.degrees(math.atan2(d.y, d.x))
+    pitch = math.degrees(math.atan2(d.z, math.hypot(d.x, d.y)))
+    return unreal.Rotator(roll=0.0, pitch=pitch, yaw=yaw)
+
+
+def _face_camera(actor, cam_loc):
+    """Turn a TextRender actor so its readable (+X) side faces the camera."""
+    loc = actor.get_actor_location()
+    yaw = math.degrees(math.atan2(cam_loc.y - loc.y, cam_loc.x - loc.x))
+    actor.set_actor_rotation(unreal.Rotator(roll=0.0, pitch=0.0, yaw=yaw), True)
+
+
+def _text_actor(location, text, size, label, color=None):
+    actor = _spawn(unreal.TextRenderActor, location, label)
+    tr = actor.text_render
+    try:   # (UE's enum really is spelled "HorizTextAligment")
+        tr.set_horizontal_alignment(unreal.HorizTextAligment.EHTA_CENTER)
+    except Exception:
+        pass
+    tr.set_world_size(size)
+    if color is not None:
+        try:
+            tr.set_text_render_color(unreal.Color(*color, 255))
+        except Exception:
+            pass
+    tr.set_text(text)
+    return actor
+
+
 def _lerp(a, b, t):
     return tuple(a[i] + (b[i] - a[i]) * t for i in range(3))
 
@@ -125,6 +177,9 @@ class BlocksField:
     def grid_to_world(self, row, col, alt_m):
         return unreal.Vector(self.origin.x + col * CELL_CM, self.origin.y + row * CELL_CM,
                              self.origin.z + alt_m * 100.0)
+
+    def size_cm(self):
+        return GRID * CELL_CM
 
     def destroy(self):
         for actor, _, _ in self.cells:
@@ -165,6 +220,9 @@ class HismField:
             else:
                 for k, v in enumerate(vals):
                     self.comp.set_custom_data_value(i, k, v, last and k == 5)
+
+    def size_cm(self):
+        return self.col_axis.length() * GRID
 
     def grid_to_world(self, row, col, alt_m):
         # Altitude scaled like the field, so drones keep their proportions on a resized field.
@@ -213,19 +271,35 @@ class TwinLive:
             gap = (GRID + BLOCKS_GAP_CELLS) * CELL_CM
             self.truth_field = BlocksField(BLOCKS_ORIGIN + unreal.Vector(gap, 0.0, 0.0), "Reality")
             unreal.log("[twin_live] blocks mode: built 'Twin' and 'Reality' fields")
-        cap_loc = self.twin_field.grid_to_world(-2.0, GRID / 2.0, 12.0)
-        self.caption = _spawn(unreal.TextRenderActor, cap_loc, "TwinCaption")
-        try:   # (UE's enum really is spelled "HorizTextAligment")
-            self.caption.text_render.set_horizontal_alignment(unreal.HorizTextAligment.EHTA_CENTER)
-        except Exception:
-            pass
-        self.caption.text_render.set_world_size(120.0)
-        self.caption.text_render.set_text("Digital twin: waiting for the API...")
+        size = self.twin_field.size_cm()
+        fields = [self.twin_field] + ([self.truth_field] if self.truth_field is not None else [])
+        centers = [f.grid_to_world(GRID / 2.0, GRID / 2.0, 0.0) for f in fields]
+        self.center = centers[0] if len(centers) == 1 else (centers[0] + centers[1]) * 0.5
+        self.span = size if len(centers) == 1 else size + (centers[1] - centers[0]).length()
+        # Caption above the scene's north edge; labels above each field.
+        north = self.twin_field.grid_to_world(-1.0, GRID / 2.0, 0.0) - centers[0]
+        self.caption = _text_actor(self.center + north + unreal.Vector(0.0, 0.0, size * 0.3),
+                                   "Digital twin: waiting for the API...", size * 0.022, "TwinCaption")
+        self.labels = [_text_actor(c + unreal.Vector(0.0, 0.0, size * 0.12), name, size * 0.07,
+                                   f"Label_{name}", color)
+                       for c, name, color in zip(centers, ("TWIN", "REALITY"),
+                                                 ((120, 200, 255), (255, 200, 120)))]
+        self.texts = [self.caption] + self.labels
+        if AUTO_FRAME_CAMERA:
+            self.frame_camera()
         self.poller = threading.Thread(target=self._poll, daemon=True)
         self.poller.start()
         self.tick_handle = unreal.register_slate_post_tick_callback(self._tick)
 
     # background thread: HTTP only, never touches UObjects
+    def frame_camera(self):
+        """Raised three-quarter view from the south, both fields in shot."""
+        cam = self.center + unreal.Vector(0.0, self.span * 0.85, self.span * 0.55)
+        try:
+            _editor().set_level_viewport_camera_info(cam, _look_rotation(cam, self.center))
+        except Exception as e:
+            unreal.log_warning(f"[twin_live] could not move the camera ({e}); fly there yourself")
+
     def _poll(self):
         while self.running:
             try:
@@ -255,6 +329,10 @@ class TwinLive:
         elif self.errors > 20 and self.caption is not None:
             self.caption.text_render.set_text(f"Digital twin: cannot reach {API}")
         self._smooth_drones()
+        cam = _get_camera()
+        if cam is not None:
+            for t in self.texts:
+                _face_camera(t, cam[0])
 
     def _apply_field(self, f):
         if isinstance(self.twin_field, HismField):
@@ -314,8 +392,8 @@ class TwinLive:
         for d in self.drones.values():
             _destroy(d["body"])
             _destroy(d["cone"])
-        if self.caption is not None:
-            _destroy(self.caption)
+        for t in getattr(self, "texts", [self.caption] if self.caption else []):
+            _destroy(t)
         for f in (self.twin_field, self.truth_field):
             if f is not None:
                 f.destroy()
@@ -330,12 +408,22 @@ def twin_live_stop():
         unreal.log("[twin_live] stopped")
 
 
+def twin_live_camera():
+    """Re-frame the editor camera over the fields."""
+    import builtins
+    live = getattr(builtins, "_twin_live", None)
+    if live is not None:
+        live.frame_camera()
+
+
 def twin_live_start():
     import builtins
     twin_live_stop()                       # re-running the script restarts cleanly
     builtins._twin_live = TwinLive()
     builtins.twin_live_stop = twin_live_stop
-    unreal.log(f"[twin_live] running against {API}; twin_live_stop() to stop")
+    builtins.twin_live_camera = twin_live_camera
+    unreal.log(f"[twin_live] running against {API}; twin_live_stop() to stop, "
+               "twin_live_camera() to re-frame the view")
     return builtins._twin_live
 
 
