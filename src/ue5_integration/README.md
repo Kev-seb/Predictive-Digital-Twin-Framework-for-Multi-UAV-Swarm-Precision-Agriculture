@@ -9,11 +9,15 @@ The `TwinStream` C++ plugin (sections 1–7) connects a UE5 level to the digital
 `python/twin_live.py` runs inside the UE5 editor using UE5's built-in Python. There's nothing to compile and nothing to buy.
 
 1. **Enable Python in UE5 (once):** *Edit → Plugins*, search for **Python Editor Script Plugin**, tick it, and restart the editor.
-2. **Start the twin** on the same PC:
+2. **Start the twin** on the same PC. On Windows, double-click **`start_demo.bat`** in the repository root. It starts the twin, waits until it's ready, and prints the next step. To have it open UE5 with the script already running, open `start_demo.bat` in a text editor once and set `UE_PROJECT` to your `.uproject` path. Then step 3 happens by itself.
+
+   From a terminal, the same thing is:
 
    ```bash
-   python digital_twin_api.py
+   python scripts/start_demo.py
    ```
+
+   Options: `--ue-project path/to/Game.uproject` opens UE5 with the script running, `--demo` starts the story at once, and `--fresh` resets the field to day 0. To start the twin on its own, run `python digital_twin_api.py`.
 
 3. **Run the script in UE5:** *File → Execute Python Script…* and pick `src/ue5_integration/python/twin_live.py`.
    - **Empty level:** the script builds three 20×20 block fields side by side. Block colour shows stress and fungus, and block height shows NDVI.
