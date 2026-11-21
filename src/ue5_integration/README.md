@@ -25,7 +25,7 @@ The `TwinStream` C++ plugin (sections 1–7) connects a UE5 level to the digital
      - **REALITY:** the hidden truth.
      - **FORECAST +7 DAYS:** what the twin predicts a week ahead if nothing is done. It's faded where the prediction is uncertain. This is the "predictive" part of a predictive digital twin.
 
-     A **results panel** stands to the left of the fields. For example:
+     A **results panel** shows what the twin is worth. For example:
 
      ```text
      DAY 3  |  Vegetative
@@ -39,6 +39,8 @@ The `TwinStream` C++ plugin (sections 1–7) connects a UE5 level to the digital
      ```
 
      Expected harvest uses the repo's yield model (mature biomass × harvest index × stress penalty), fed with each cell's health relative to its growth stage. "Whole-field" is conventional blanket spraying of the field at 25 L/ha per application.
+
+     The results panel hangs above the fields and the caption sits in front of them like a subtitle. All text stands on dark boards so it stays readable against a bright sky. Set `SHOW_BOARDS = False` to remove the boards. In the twin, an outbreak shows red even while the twin is still unsure of its edges; uncertainty only greys the healthy colour.
 
      Set `SHOW_FORECAST = False` or `SHOW_PANEL = False` at the top of the script to hide the forecast field or the panel. In a level with your own field, an actor labelled "Forecast" gets the prediction.
    - **Level with your rice field** (a 400-instance HISM): the script drives your field instead, through per-instance custom data slots 0–5, which you read in `M_RiceCrop` with *PerInstanceCustomData* nodes. Label a second field actor with "Reality" to get the hidden truth on it.

@@ -57,6 +57,7 @@ CELL_CM = 500.0                  # blocks mode: 5 m cells, like the twin's 20 x 
 GRID = 20
 SMOOTHING = 0.35                 # drone motion smoothing per editor tick (0..1)
 AUTO_FRAME_CAMERA = True         # frame the editor camera over the fields on start
+SHOW_BOARDS = True               # dark boards behind caption, labels and panel (readable over a bright sky)
 DRONE_SIZE_M = 4.0               # drawn drone size; real ~1.6 m drones vanish over a 100 m field
 
 # --- Realistic look: paths of assets in YOUR project (right-click asset > Copy Reference,
@@ -193,10 +194,18 @@ def _look_rotation(frm, to):
 
 
 def _face_camera(actor, cam_loc):
-    """Turn a TextRender actor so its readable (+X) side faces the camera."""
+    """Turn a TextRender actor so its readable (+X) side faces the camera; its board sits just behind."""
     loc = actor.get_actor_location()
     yaw = math.degrees(math.atan2(cam_loc.y - loc.y, cam_loc.x - loc.x))
-    actor.set_actor_rotation(unreal.Rotator(roll=0.0, pitch=0.0, yaw=yaw), True)
+    rot = unreal.Rotator(roll=0.0, pitch=0.0, yaw=yaw)
+    actor.set_actor_rotation(rot, True)
+    m = _TEXTS.get(actor.get_actor_label())
+    board = m["board"] if m else None
+    if board is not None:
+        back = m["size"] * 0.3
+        y = math.radians(yaw)
+        board.set_actor_location(loc - unreal.Vector(math.cos(y) * back, math.sin(y) * back, 0.0), False, True)
+        board.set_actor_rotation(rot, True)
 
 
 def _text_actor(location, text, size, label, color=None):
@@ -206,7 +215,12 @@ def _text_actor(location, text, size, label, color=None):
         tr.set_horizontal_alignment(unreal.HorizTextAligment.EHTA_CENTER)
     except Exception:
         pass
+    try:   # centre multi-line text on the actor, so its board can sit centred behind it
+        tr.set_vertical_alignment(unreal.VerticalTextAligment.EVRTA_TEXT_CENTER)
+    except Exception:
+        pass
     tr.set_world_size(size)
+    _TEXTS[label] = {"size": size, "text": text, "board": None}
     if color is not None:
         try:
             tr.set_text_render_color(unreal.Color(*color, 255))
@@ -214,6 +228,42 @@ def _text_actor(location, text, size, label, color=None):
             pass
     tr.set_text(text)
     return actor
+
+
+# Text bookkeeping on the Python side: UE objects don't accept new Python attributes.
+_TEXTS = {}     # actor label -> {"size": world size, "text": current text, "board": board actor or None}
+
+
+def _meta(actor):
+    return _TEXTS.setdefault(actor.get_actor_label(), {"size": 100.0, "text": "", "board": None})
+
+
+def _board(text_actor, color=(0.02, 0.03, 0.04)):
+    """A dark board behind a text, so it stays readable over a bright sky or field."""
+    board, _ = _mesh_actor(_CUBE, text_actor.get_actor_location(), unreal.Vector(0.01, 1.0, 1.0), color,
+                           text_actor.get_actor_label() + "_Board")
+    _meta(text_actor)["board"] = board
+    _fit_board(text_actor)
+    return board
+
+
+def _fit_board(text_actor):
+    m = _meta(text_actor)
+    if m["board"] is None:
+        return
+    lines = m["text"].split("\n")
+    width = (max(len(l) for l in lines) * 0.62 + 1.5) * m["size"]      # default font ~0.6 em per char
+    height = (len(lines) * 1.05 + 0.6) * m["size"]
+    m["board"].set_actor_scale3d(unreal.Vector(0.02, width / 100.0, height / 100.0))
+
+
+def _set_text(actor, text):
+    m = _meta(actor)
+    if m["text"] == text:
+        return
+    actor.text_render.set_text(text)
+    m["text"] = text
+    _fit_board(actor)
 
 
 def _lerp(a, b, t):
@@ -225,8 +275,10 @@ def crop_color(stress, fungus, std=0.0):
     green, yellow, brown, grey = (0.10, 0.55, 0.12), (0.85, 0.78, 0.20), (0.42, 0.24, 0.10), (0.5, 0.5, 0.5)
     s = max(0.0, min(1.0, stress * 2.5))
     c = _lerp(green, yellow, min(1.0, s * 2.0)) if s < 0.5 else _lerp(yellow, brown, (s - 0.5) * 2.0)
-    c = _lerp(c, (0.30, 0.05, 0.05), max(0.0, min(1.0, fungus * 1.6)))
-    return _lerp(c, grey, max(0.0, min(0.8, std * 8.0)))
+    # Uncertainty fades the health colour only (at most halfway), then disease is painted on top,
+    # so an outbreak the twin has found reads red even while it is still unsure of its extent.
+    c = _lerp(c, grey, max(0.0, min(0.5, std * 6.0)))
+    return _lerp(c, (0.55, 0.06, 0.04), max(0.0, min(1.0, fungus * 1.8)))
 
 
 # ======================================================================= fields
@@ -401,8 +453,10 @@ class TwinLive:
         # Caption above the scene's north edge; labels above each field.
         north = self.twin_field.grid_to_world(-1.0, GRID / 2.0, 0.0) - centers[0]
         self.cm_per_m = size / (GRID * 5.0)        # the twin's cells are 5 m
-        self.caption = _text_actor(self.center + north * 3.0 + unreal.Vector(0.0, 0.0, size * 0.35),
-                                   "Digital twin: waiting for the API...", size * 0.045, "TwinCaption",
+        # Caption in front of the fields (towards the camera), like a subtitle.
+        south = north * -1.0
+        self.caption = _text_actor(self.center + south * 1.45 + unreal.Vector(0.0, 0.0, size * 0.08),
+                                   "Digital twin: waiting for the API...", size * 0.05, "TwinCaption",
                                    (255, 255, 255))
         # Labels stand just behind each field's north edge, clear of the blocks.
         self.labels = [_text_actor(c + north * 1.5 + unreal.Vector(0.0, 0.0, size * 0.06), name,
@@ -412,11 +466,12 @@ class TwinLive:
         self.texts = [self.caption] + self.labels
         self.panel, self.what_if = None, None
         if SHOW_PANEL:
-            west = self.twin_field.grid_to_world(GRID / 2.0, -1.0, 0.0) - centers[0]
-            self.panel = _text_actor(centers[0] + west * 2.2 + unreal.Vector(0.0, 0.0, size * 0.25),
-                                     "Results: waiting for data...", size * 0.026, "TwinResults",
+            # Results board up in the sky behind the fields, where the view is otherwise empty.
+            self.panel = _text_actor(self.center + north * 2.4 + unreal.Vector(0.0, 0.0, size * 0.45),
+                                     "Results: waiting for data...", size * 0.045, "TwinResults",
                                      (235, 245, 235))
             self.texts.append(self.panel)
+        self.boards = [_board(t) for t in self.texts] if SHOW_BOARDS else []
         self.rain, self.rain_on, self.raining, self.rain_streaks = [], False, False, None
         if SHOW_RAIN:
             self._build_rain(size)
@@ -467,7 +522,7 @@ class TwinLive:
     # background thread: HTTP only, never touches UObjects
     def frame_camera(self):
         """Raised three-quarter view from the south, both fields in shot."""
-        cam = self.center + unreal.Vector(0.0, self.span * 0.85, self.span * 0.55)
+        cam = self.center + unreal.Vector(0.0, self.span * 0.62, self.span * 0.42)
         try:
             _editor().set_level_viewport_camera_info(cam, _look_rotation(cam, self.center))
         except Exception as e:
@@ -500,13 +555,13 @@ class TwinLive:
             if field is not None and field.get("what_if"):
                 self.what_if = field["what_if"]
             if self.panel is not None and frame.get("metrics"):
-                self.panel.text_render.set_text(panel_text(frame["metrics"], self.what_if))
+                _set_text(self.panel, panel_text(frame["metrics"], self.what_if))
             if frame.get("weather"):
                 self.raining = SHOW_RAIN and frame["weather"].get("precipitation_mm", 0.0) > RAIN_MM
             if frame.get("drones"):
                 self._apply_drones(frame["drones"]["drones"])
         elif self.errors > 20 and self.caption is not None:
-            self.caption.text_render.set_text(f"Digital twin: cannot reach {API}")
+            _set_text(self.caption, f"Digital twin: cannot reach {API}")
         self._smooth_drones(delta_seconds)
         self._update_rain(delta_seconds)
         cam = _get_camera()
@@ -542,9 +597,9 @@ class TwinLive:
         if status:
             err = status.get("error") or {}
             extra = f"   |   twin vs reality error: {err['fungus']:.3f}" if err.get("fungus") is not None else ""
-            self.caption.text_render.set_text(f"{status['text']}{extra}")
+            _set_text(self.caption, f"{status['text']}{extra}")
         elif field is not None:
-            self.caption.text_render.set_text(f"Day {field['sim_day']}  ({field['growth_stage']})")
+            _set_text(self.caption, f"Day {field['sim_day']}  ({field['growth_stage']})")
 
     def _apply_drones(self, drones):
         for i, (d_id, p) in enumerate(sorted(drones.items())):
@@ -633,6 +688,9 @@ class TwinLive:
             _destroy(a)
         for t in getattr(self, "texts", [self.caption] if self.caption else []):
             _destroy(t)
+        for b in getattr(self, "boards", []):
+            _destroy(b)
+        _TEXTS.clear()
         for f in (self.twin_field, self.truth_field, self.forecast_field):
             if f is not None:
                 f.destroy()
