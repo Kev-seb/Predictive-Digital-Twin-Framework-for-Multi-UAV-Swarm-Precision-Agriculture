@@ -68,13 +68,14 @@ Most parts existed, but they weren't connected:
 
   | | Per-layer filter | + cross-layer | Change |
   |---|---|---|---|
-  | Moisture RMSE | 0.0292 | **0.0243** | −17% |
+  | Moisture RMSE | 0.0291 | **0.0243** | −16% |
   | Nitrogen RMSE | 0.0252 | **0.0235** | −7% |
-  | NDVI, stress, fungus RMSE | 0.014, 0.018, 0.027 | same | 0% |
+  | Stress RMSE | 0.0189 | **0.0181** | −4% |
+  | NDVI, fungus RMSE | 0.014, 0.030 | same | 0% |
   | Leaky patch: leak rate off by | ×4.55 | **×1.63** | |
-  | 7-day moisture forecast over the leaky patch | 0.159 | **0.089** | −44% |
+  | 7-day moisture forecast over the leaky patch | 0.159 | **0.093** | −41% |
 
-  95% coverage stays at 0.91–1.00. NDVI readings are deliberately not used for cross-layer updates. In this OSSE, the leaky patch dries without its NDVI dropping for weeks, so NDVI-driven updates made drone-only moisture 8% worse. With drones only, the twin now matches the per-layer filter. The nowcast gain needs a few surveys: after two (day 14), moisture is 7% worse, but the leak rate and the forecast are already better.
+  95% coverage stays at 0.90–1.00. NDVI readings don't update other layers. They update only a second estimated parameter, per-cell crop **vigour** (how much better or worse the crop grows than modelled, ±25%). That's what lets the twin keep a real field's persistent difference from the model between flights (Phase 5, real-flight replay). In this OSSE, the leaky patch dries without its NDVI dropping for weeks, so NDVI-driven updates made drone-only moisture 8% worse. With drones only, the twin now matches the per-layer filter. The nowcast gain needs a few surveys: after two (day 14), moisture is 7% worse, but the leak rate and the forecast are already better.
 - [ ] Point `mobile_api_server.py` `/api/field/state` at the twin API instead of `FieldDigitalTwin` survey files.
 
 #### Validation result with the original generic crop model (superseded; see Phase 5)
@@ -149,7 +150,7 @@ It's replaced as the twin's default by a rice-specific process model. The legacy
   - A managed season peaks at NDVI ~0.85 at booting and ends at ~0.45.
   - An unsprayed monsoon epidemic plateaus at 30–50% severity.
   - Without irrigation, the field drains in ~1 week and then droughts.
-  - Disease does not grow in dry weather.
+  - Disease does not grow in dry weather. Fixed during upgrade 7: before, the spore-spread step chose its sub-steps by checking diffusion and advection separately. The explicit scheme needs them combined, `dt·(4D + |vx| + |vy|) ≤ 1`. Values oscillated to −8·10⁴, and the daily clip at 0 turned that into disease, which reached 50% severity even with humidity below the infection threshold.
 - [x] **Twin uncertainty calibrated:**
   - Process and prior noise are tuned so normalised squared errors average ~1; the 95% intervals now contain the truth 95–97% of the time, up from 99–100%.
   - Adaptive covariance inflation (innovations > 3σ) lets the twin absorb surprises such as a hidden outbreak, which one scout pass now detects: 0.28 vs a true 0.34.
@@ -160,30 +161,46 @@ It's replaced as the twin's default by a rice-specific process model. The legacy
 - [ ] **On your machine with the raw imagery:**
   1. Run `python scripts/extract_flight_ndvi.py --raw <paddy_dataset>`, which writes `data/manifests/flight_ndvi.csv`.
   2. Run `python scripts/calibrate_paddy.py` to refit phenology with Open-Meteo archive temperatures and fit the NDVI curve. This writes `outputs/calibration/paddy_params.json`, which the twin API loads automatically.
+  3. Run `python scripts/replay_flights.py --raw <paddy_dataset> --field F1 --save-twin` to replay the real flights through the twin (`src/twin_core/flight_replay.py`). See "Real-flight replay" below.
+
+#### Real-flight replay (upgrade 7)
+
+`scripts/replay_flights.py` replays the real flights in date order:
+
+- It reads each image's position from the DJI XMP metadata (GPS, height above take-off, gimbal yaw), or from EXIF GPS if there's no XMP.
+- It splits each image into 3 × 3 tiles and places each tile on the ground (nadir camera, Mavic 3M field of view). Then it averages tile NDVI onto a twin grid sized to the flight area.
+- Between flights, the twin runs on the Open-Meteo archive weather for those days.
+- Before each flight is assimilated, the twin's NDVI is scored as a prediction of that flight. The score is compared with a model-only twin, which never assimilates.
+
+The output is a table, `outputs/replay/<field>/report.json`, and a map per flight (predicted, measured, after the update). With `--save-twin`, the replayed twin is saved as field `real_<field>` for the API and UE5: `UAV_TWIN_FIELD_ID=real_F1 python digital_twin_api.py`.
+
+It's tested on a synthetic DJI-style dataset (`tests/test_flight_replay.py`). There, the "real" field is the paddy model with a hidden crop vigour of 0.85. The twin learns a vigour of 0.8–0.95 and predicts the next flight 44% better than the model alone (RMSE 0.075 vs 0.134). It hasn't been run on the real imagery yet, because the raw dataset isn't in the repository.
 - [ ] **Re-tune sensor noise on real data:** estimate `SENSOR_NOISE` from ground-truth plots, then process noise from real innovation statistics. The current values are only self-consistent inside the simulation.
 
 #### Results with the calibrated model
 
-**Tracking** (`python scripts/run_twin_osse.py --days 21`). RMSE against the hidden truth on day 21:
+**Tracking** (`python scripts/run_twin_osse.py --days 21`, seed 42, with the cross-layer correction). RMSE against the hidden truth, averaged over the 21 days, with day 21 in brackets:
 
 | Layer | Model-only twin | Assimilating twin | 95% coverage |
 |---|---|---|---|
-| Stress | 0.062 | **0.017** | 0.94 |
-| NDVI | 0.045 | **0.014** | 0.97 |
-| Fungus | 0.080 | **0.027** | 0.92 |
-| Moisture | 0.032 | **0.019** | 1.00 |
-| Nitrogen | 0.033 | **0.026** | 0.98 |
+| Stress | 0.065 (0.069) | **0.025 (0.013)** | 0.96 |
+| NDVI | 0.047 (0.050) | **0.023 (0.012)** | 0.96 |
+| Fungus | 0.082 (0.089) | **0.032 (0.021)** | 0.95 |
+| Moisture | 0.066 (0.009) | **0.053** (0.016) | 0.96 |
+| Nitrogen | 0.030 (0.033) | **0.027 (0.023)** | 0.97 |
 
-Moisture is now informative: the hidden leaky patch drains between canal turns.
+Moisture is informative: the hidden leaky patch drains between canal turns. Day 21 alone says little about it, because 27.5 mm of rain the day before flooded every cell.
+
+These numbers were regenerated after fixing an instability in the spore-spread step (below). The earlier tables were made with the unstable step.
 
 **Closed loop** (`python scripts/run_twin_osse.py --closed-loop --days 21 --fleet 3`). Paired runs with identical weather:
 
 | Day 21, hidden field | Scout only | Twin-driven spraying |
 |---|---|---|
 | Mean fungal load | 0.072 | **0.050** (−31%) |
-| Peak fungal load | 0.375 | **0.190** (−49%) |
+| Peak fungal load | 0.375 | **0.189** (−50%) |
 | Mean NDVI | 0.788 | **0.799** |
-| Fungicide | 0 | 3.7 kg, 2 zones, day 3 |
+| Fungicide | 0 | 5.0 kg, 2 zones |
 
 ### Phase 6: Visualization (in progress)
 - [x] `/ws/field`: a UE5-oriented push stream.

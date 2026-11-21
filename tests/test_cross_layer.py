@@ -34,9 +34,12 @@ def test_moisture_reading_also_corrects_leak_rate_and_reports_it():
     assert twin.state.aux["percolation_mm_day"][20, 20] > perc0[20, 20] * 1.2
     far = twin.state.aux["percolation_mm_day"][2, 2]
     assert abs(far - perc0[2, 2]) < 1e-3                       # only near the reading
-    # An NDVI reading does not drive cross-layer updates (see CROSS_FROM).
+    # An NDVI reading corrects only the crop-vigor parameter, never other layers (CROSS_FROM).
+    moist = twin.state.mean["moisture"].copy()
     res = twin.observe_point(lat, lon, {"ndvi": 0.3}, source="drone_rgb")
-    assert "cross_layer" not in res[0]
+    assert set(res[0].get("cross_layer", {})) <= {"vigor"}
+    assert np.array_equal(twin.state.mean["moisture"], moist)
+    assert twin.state.aux["vigor_factor"][20, 20] < 1.0              # much browner than expected
 
 
 def test_osse_cross_layer_learns_the_leaky_patch():

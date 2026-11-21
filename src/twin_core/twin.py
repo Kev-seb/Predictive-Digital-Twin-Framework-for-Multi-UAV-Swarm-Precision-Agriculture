@@ -138,6 +138,7 @@ class DigitalTwin:
         crop_model: str = "paddy",
         params: Optional[PaddyParams] = None,
         cross_layer: bool = True,
+        cross_from: Optional[tuple] = None,
     ):
         if crop_model not in ("paddy", "legacy"):
             raise ValueError("crop_model must be 'paddy' or 'legacy'")
@@ -162,8 +163,10 @@ class DigitalTwin:
         self._sim_state = None  # the FieldState object the model is bound to
         # Cross-layer correction (ensemble.py); paddy model only, built on first use.
         self.cross_layer = bool(cross_layer) and crop_model == "paddy"
+        self.cross_layer = bool(cross_layer) and crop_model == "paddy"
         self.ensemble = None
-        self._model()           # initialise process state (water, GDD, stage)
+        self.cross_from = tuple(cross_from) if cross_from else None   # None = ensemble.CROSS_FROM
+           # initialise process state (water, GDD, stage)
         self._refresh_stress()  # stress is derived: make it consistent from the start
 
     # ================================================================ setup
@@ -249,7 +252,7 @@ class DigitalTwin:
                 if ens is not None:
                     # The ensemble's soil estimate drives the twin's water balance.
                     ens.recenter(self.state)
-                    self.state.aux["percolation_mm_day"] = ens.percolation()
+                    ens.write_params(self.state)
                     ens.step_day(weather_seq[d - 1], todays)
                 model.sync_from_moisture()   # respect assimilated moisture
                 day_logs = model.simulate_day(weather=weather_seq[d - 1], interventions=todays)
@@ -346,7 +349,7 @@ class DigitalTwin:
         if self.ensemble is None:
             from src.twin_core.ensemble import CrossLayerEnsemble
             self._model()
-            self.ensemble = CrossLayerEnsemble(self, seed=self.state.sim_day)
+            self.ensemble = CrossLayerEnsemble(self, seed=self.state.sim_day, cross_from=self.cross_from)
         return self.ensemble
 
     def _cross(self, result, layer: str) -> None:
@@ -356,8 +359,6 @@ class DigitalTwin:
             return
         result.cross = self.ensemble.cross_update(self.state, layer, det["valid"], det["innovation"],
                                                   det["p_obs"], det["r"])
-        if "percolation" in result.cross:
-            self.state.aux["percolation_mm_day"] = self.ensemble.percolation()
         if "moisture" in result.cross:
             self._model().sync_from_moisture()
 

@@ -26,9 +26,9 @@ This is a hybrid ensemble Kalman filter:
         C_ab = rho_ab sqrt(P_a P_b),   K_b = C_ab / (P_a + R)
         x_b += K_b d,                  P_b -= K_b C_ab
 
-    and the soil percolation (log scale, an estimated parameter) gets the
-    same update, so the twin learns where the soil is leaky and forecasts
-    the drying there.
+    and the estimated parameters (``PARAMS``: soil percolation, crop vigor)
+    get the same update, so the twin learns where the soil is leaky and
+    where the crop grows better or worse than modelled, and forecasts that.
 
 Correlations below ``RHO_FLOOR`` are treated as sampling noise and ignored.
 """
@@ -53,7 +53,21 @@ CROSS_FROM = ("moisture", "nitrogen", "fungus")
 RHO_FLOOR = 0.45         # |rho| below this is sampling noise for 24 members x 9 cells
 RHO_CAP = 0.95
 RAIN_LOG_SD = 0.35       # forecast rain error, as in the virtual field's weather
-PERC_LOG_SD = 0.9        # prior spread of soil percolation (x0.2 .. x6 at 95%)
+
+# Estimated per-cell parameters (log scale): aux key in the twin's state,
+# prior spread, daily random walk (so they keep adapting), and which observed
+# layers may correct them (None = the twin's cross_from).
+#   percolation: how leaky the soil is (x0.2 .. x6 at 95%).
+#   vigor:       how well the crop grows relative to the model (variety,
+#                management, anything the model lacks), +-25% at 95%. Only
+#                NDVI informs it, and it only scales the canopy target, so
+#                a field that keeps greening more (or less) than modelled is
+#                forecast that way from then on.
+PARAMS = {
+    "percolation": {"aux": "percolation_mm_day", "prior_sd": 0.9, "walk_sd": 0.03, "from": None},
+    "vigor": {"aux": "vigor_factor", "prior_sd": 0.12, "walk_sd": 0.01, "from": ("ndvi",)},
+}
+PERC_LOG_SD = PARAMS["percolation"]["prior_sd"]
 
 
 def _smooth_noise(rng, shape, coarse=8):
@@ -64,17 +78,20 @@ def _smooth_noise(rng, shape, coarse=8):
 
 
 class CrossLayerEnsemble:
-    def __init__(self, twin, n: int = 24, seed: int = 0):
+    def __init__(self, twin, n: int = 24, seed: int = 0, cross_from=None):
         from src.twin_core.paddy_model import PaddyFieldSimulator
 
         self.n = n
+        self.cross_from = tuple(cross_from or CROSS_FROM)
         self.rng = np.random.default_rng(seed)
         st = twin.state
         shape = st.grid.shape
-        base = st.aux["percolation_mm_day"].astype(np.float64)
-        noise = np.stack([_smooth_noise(self.rng, shape) for _ in range(n)])
-        noise = (noise - noise.mean(0)[None]) / np.maximum(noise.std(0)[None], 1e-6)   # median stays at base
-        self.log_perc = np.log(np.maximum(base, 1e-3))[None] + PERC_LOG_SD * noise
+        self.shape = shape
+        self.params: Dict[str, np.ndarray] = {}      # name -> (n, rows, cols) log values
+        for name, spec in PARAMS.items():
+            base = st.aux.get(spec["aux"])
+            base = np.ones(shape) if base is None else base.astype(np.float64)
+            self.params[name] = np.log(np.maximum(base, 1e-3))[None] + spec["prior_sd"] * self._noise()
         self.members: List = []
         for i in range(n):
             ms = st.copy()
@@ -84,11 +101,28 @@ class CrossLayerEnsemble:
             self.members.append((ms, PaddyFieldSimulator(ms, twin.zone_labels, twin.zone_names, twin.params)))
         self._corr: Optional[Dict] = None
 
+    def _noise(self):
+        """(n, rows, cols) smooth unit noise with zero mean and unit spread in every cell."""
+        noise = np.stack([_smooth_noise(self.rng, self.shape) for _ in range(self.n)])
+        return (noise - noise.mean(0)[None]) / np.maximum(noise.std(0)[None], 1e-6)
+
+    def estimate(self, name: str) -> np.ndarray:
+        """The twin's estimate of a parameter: geometric mean of the members."""
+        return np.exp(self.params[name].mean(0)).astype(np.float32)
+
+    def write_params(self, state) -> None:
+        for name, spec in PARAMS.items():
+            state.aux[spec["aux"]] = self.estimate(name)
+
     # ------------------------------------------------------------ forecast
     def step_day(self, weather: Dict, interventions: List[Dict]) -> None:
         rain = float(weather.get("precipitation", 0.0))
+        for name, spec in PARAMS.items():
+            if spec["walk_sd"]:
+                self.params[name] = self.params[name] + spec["walk_sd"] * self._noise()
         for i, (ms, model) in enumerate(self.members):
-            ms.aux["percolation_mm_day"] = np.exp(self.log_perc[i]).astype(np.float32)
+            for name, spec in PARAMS.items():
+                ms.aux[spec["aux"]] = np.exp(self.params[name][i]).astype(np.float32)
             w = dict(weather)
             w["precipitation"] = rain * float(np.exp(self.rng.normal(0.0, RAIN_LOG_SD)))
             model.sync_from_moisture()
@@ -118,7 +152,8 @@ class CrossLayerEnsemble:
             for k in CROSS_LAYERS:
                 stack = np.stack([ms.mean[k] for ms, _ in self.members]).astype(np.float64)
                 anoms[k] = stack - stack.mean(0)[None]
-            anoms["log_perc"] = self.log_perc - self.log_perc.mean(0)[None]
+            for name, stack in self.params.items():
+                anoms[name] = stack - stack.mean(0)[None]
             var = {k: uniform_filter((a ** 2).mean(0), size=3, mode="nearest") for k, a in anoms.items()}
             self._corr = {"anoms": anoms, "var": var, "pairs": {}}
         return self._corr
@@ -134,12 +169,9 @@ class CrossLayerEnsemble:
             s["pairs"][key] = np.where(np.abs(rho) < RHO_FLOOR, 0.0, rho)
         return s["pairs"][key]
 
-    def perc_sd(self) -> np.ndarray:
-        return np.sqrt(self._stats()["var"]["log_perc"])
-
     def percolation(self) -> np.ndarray:
-        """The twin's estimate of soil percolation (mm/day): geometric mean of the members."""
-        return np.exp(self.log_perc.mean(0)).astype(np.float32)
+        """The twin's estimate of soil percolation (mm/day)."""
+        return self.estimate("percolation")
 
     # --------------------------------------------------------------- update
     def cross_update(self, state, layer: str, valid: np.ndarray, innovation: np.ndarray,
@@ -150,33 +182,41 @@ class CrossLayerEnsemble:
         to the other layers and to the percolation parameter. Returns the
         mean absolute change per corrected layer.
         """
-        if layer not in CROSS_LAYERS or layer not in CROSS_FROM or not np.any(valid):
+        if layer not in CROSS_LAYERS or not np.any(valid):
             return {}
         changes = {}
         denom = p_obs + r
-        for b in CROSS_LAYERS:
-            if b == layer:
+        if layer in self.cross_from:
+            for b in CROSS_LAYERS:
+                if b == layer:
+                    continue
+                rho = self.corr(layer, b)[valid]
+                if not np.any(rho):
+                    continue
+                pb = state.var[b][valid].astype(np.float64)
+                c = rho * np.sqrt(p_obs * pb)
+                k = c / denom
+                delta = k * innovation
+                state.mean[b][valid] = np.clip(state.mean[b][valid] + delta, *LAYER_BOUNDS[b])
+                state.var[b][valid] = np.maximum(pb - k * c, 1e-6)
+                changes[b] = float(np.abs(delta).mean())
+        for name, spec in PARAMS.items():
+            if layer not in (spec["from"] or self.cross_from):
                 continue
-            rho = self.corr(layer, b)[valid]
+            rho = self.corr(layer, name)[valid]
             if not np.any(rho):
                 continue
-            pb = state.var[b][valid].astype(np.float64)
-            c = rho * np.sqrt(p_obs * pb)
-            k = c / denom
-            delta = k * innovation
-            state.mean[b][valid] = np.clip(state.mean[b][valid] + delta, *LAYER_BOUNDS[b])
-            state.var[b][valid] = np.maximum(pb - k * c, 1e-6)
-            changes[b] = float(np.abs(delta).mean())
-        rho = self.corr(layer, "log_perc")[valid]
-        if np.any(rho):
-            sd_p = self.perc_sd()[valid]
+            sd_p = np.sqrt(self._stats()["var"][name][valid])
             k = rho * sd_p * np.sqrt(p_obs) / denom
-            shift = np.zeros(state.grid.shape)
+            shift = np.zeros(self.shape)
             shift[valid] = k * innovation
-            shrink = np.ones(state.grid.shape)
+            shrink = np.ones(self.shape)
             shrink[valid] = np.sqrt(np.clip(1.0 - rho ** 2 * p_obs / denom, 0.05, 1.0))
-            mu = self.log_perc.mean(0)
-            self.log_perc = mu[None] + shift[None] + (self.log_perc - mu[None]) * shrink[None]
+            stack = self.params[name]
+            mu = stack.mean(0)
+            self.params[name] = mu[None] + shift[None] + (stack - mu[None]) * shrink[None]
             self._corr = None
-            changes["percolation"] = float(np.abs(shift[valid]).mean())
+            changes[name] = float(np.abs(shift[valid]).mean())
+        if any(n in changes for n in PARAMS):
+            self.write_params(state)
         return changes

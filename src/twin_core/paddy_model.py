@@ -327,6 +327,8 @@ class PaddyFieldSimulator:
         st.growth_stage = new_stage
         pot = self.ndvi_pot
         vigor = f_n * f_w * (1.0 - p.fungus_damage_weight * m["fungus"])
+        if "vigor_factor" in st.aux:      # learned by the twin (ensemble.py); 1 = as modelled
+            vigor = vigor * st.aux["vigor_factor"]
         target = pot * vigor
         m["ndvi"] = np.clip(m["ndvi"] + p.ndvi_relax_per_day * (target - m["ndvi"]),
                             -1.0, 1.0).astype(np.float32)
@@ -358,7 +360,12 @@ class PaddyFieldSimulator:
         # Wind direction is where the wind comes FROM; spores move downwind.
         theta = math.radians(wind_dir_deg + 180.0)
         vx, vy = v * math.sin(theta), v * math.cos(theta)   # east, north (cells/day)
-        n = max(1, int(math.ceil(max(4 * d, 2 * (abs(vx) + abs(vy))))))
+        # Explicit diffusion + upwind advection is stable (no overshoot, so no
+        # mass created by the clip at 0) when dt * (4 d + |vx| + |vy|) <= 1.
+        # Checking the two terms separately is not enough: with n = 1 the
+        # field oscillated to -8e4 within weeks and the clip turned that into
+        # disease that grew even in dry weather.
+        n = max(1, int(math.ceil(1.25 * (4 * d + abs(vx) + abs(vy)))))
         dt = 1.0 / n
         P = fung
         for _ in range(n):
