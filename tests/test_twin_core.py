@@ -408,7 +408,7 @@ def test_fleet_scout_mission_feeds_twin(grid):
     assert not rep["timed_out"]
     for st in rep["drones"].values():
         assert st["completed"] and st["captures"] > 0
-        assert st["flight_s"] == pytest.approx(st["est_time_s"], rel=0.3)   # planner is honest
+        assert st["flight_s"] == pytest.approx(st["est_time_s"], rel=0.15)  # planner is honest
     assert vf.twin_error(twin)["fungus"]["rmse"] < 0.7 * before
     for s in fleet.snapshot()["drones"].values():
         assert s["alt"] < 1.5                                                 # back on the pad
