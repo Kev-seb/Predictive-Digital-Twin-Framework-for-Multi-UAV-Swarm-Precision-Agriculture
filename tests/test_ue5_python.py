@@ -110,6 +110,30 @@ def test_blocks_mode_shows_field_drones_and_story(fake_unreal, api):
     assert not fake_unreal._LEVEL and not fake_unreal._TICKS                 # stop() cleans up
 
 
+def test_camera_framed_and_texts_face_it(fake_unreal, api):
+    import math
+    mod, live = _run_script()
+    try:
+        cam = fake_unreal.UnrealEditorSubsystem.camera
+        assert cam is not None, "camera should be framed on start"
+        loc, rot = cam
+        assert loc.z > live.center.z and loc.y > live.center.y          # raised, south of the fields
+        assert -60.0 < rot.pitch < -15.0                                  # looking down at the fields
+        assert [t.text_render.text for t in live.labels] == ["TWIN", "REALITY"]
+        fake_unreal._tick_all()
+        for t in live.texts:                                              # readable side (+X) faces camera
+            d = loc - t.location
+            assert abs(math.remainder(t.rotation.yaw - math.degrees(math.atan2(d.y, d.x)), 360.0)) < 1e-6
+        # Twin on the left, reality on the right, as seen from the camera (looking north, -Y).
+        assert live.labels[0].location.x < live.labels[1].location.x
+        fake_unreal.UnrealEditorSubsystem.camera = None
+        mod.twin_live_camera()
+        assert fake_unreal.UnrealEditorSubsystem.camera is not None
+    finally:
+        mod.twin_live_stop()
+    assert not fake_unreal._LEVEL
+
+
 def test_hism_mode_writes_custom_data_and_maps_grid(fake_unreal, api):
     unreal = fake_unreal
     def field(label, x0):

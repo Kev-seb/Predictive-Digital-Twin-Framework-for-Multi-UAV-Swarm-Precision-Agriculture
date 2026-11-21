@@ -89,6 +89,9 @@ class _TextRender:
     def set_horizontal_alignment(self, value):
         self.align = value
 
+    def set_text_render_color(self, color):
+        self.color = color
+
 
 class Actor:
     def __init__(self, location=None):
@@ -98,6 +101,9 @@ class Actor:
         self.rotation = Rotator()
         self.hidden = False
         self.components = []
+
+    def get_actor_location(self):
+        return self.location
 
     def set_actor_label(self, label):
         self.label = label
@@ -166,6 +172,25 @@ class HierarchicalInstancedStaticMeshComponent(InstancedStaticMeshComponent):
     pass
 
 
+class Color:
+    def __init__(self, r, g, b, a=255):
+        self.r, self.g, self.b, self.a = r, g, b, a
+
+
+def log_warning(msg):
+    LOG.append("WARNING: " + str(msg))
+
+
+class UnrealEditorSubsystem:
+    camera = None
+
+    def get_level_viewport_camera_info(self):
+        return UnrealEditorSubsystem.camera          # UE returns (location, rotation) or None
+
+    def set_level_viewport_camera_info(self, location, rotation):
+        UnrealEditorSubsystem.camera = (location, rotation)
+
+
 class EditorActorSubsystem:
     def get_all_level_actors(self):
         return list(_LEVEL)
@@ -183,8 +208,11 @@ class EditorActorSubsystem:
 _SUBSYSTEM = EditorActorSubsystem()
 
 
+_EDITOR = UnrealEditorSubsystem()
+
+
 def get_editor_subsystem(cls):
-    return _SUBSYSTEM
+    return _EDITOR if cls is UnrealEditorSubsystem else _SUBSYSTEM
 
 
 def load_asset(path):
@@ -203,6 +231,7 @@ def unregister_slate_post_tick_callback(handle):
 
 # --- test helpers (not part of the real API) -------------------------------
 def _reset():
+    UnrealEditorSubsystem.camera = None
     _TICKS.clear()
     _LEVEL.clear()
     LOG.clear()
