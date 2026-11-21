@@ -137,6 +137,7 @@ class DigitalTwin:
         max_events: int = 500,
         crop_model: str = "paddy",
         params: Optional[PaddyParams] = None,
+        cross_layer: bool = True,
     ):
         if crop_model not in ("paddy", "legacy"):
             raise ValueError("crop_model must be 'paddy' or 'legacy'")
@@ -159,6 +160,9 @@ class DigitalTwin:
         self.params = params or PaddyParams()
         self._sim = None        # built lazily (the legacy model imports torch)
         self._sim_state = None  # the FieldState object the model is bound to
+        # Cross-layer correction (ensemble.py); paddy model only, built on first use.
+        self.cross_layer = bool(cross_layer) and crop_model == "paddy"
+        self.ensemble = None
         self._model()           # initialise process state (water, GDD, stage)
         self._refresh_stress()  # stress is derived: make it consistent from the start
 
@@ -191,6 +195,7 @@ class DigitalTwin:
             self.state = FieldState.initial(self.state.grid, values=values,
                                             growth_stage=self.state.growth_stage, seed=seed)
             self._sim = None
+            self.ensemble = None
             self._model()
             self._refresh_stress()
             self.history = []
@@ -238,8 +243,14 @@ class DigitalTwin:
         logs: List[str] = []
         with self._lock:
             model = self._model()
+            ens = self._ensemble()
             for d in range(1, days + 1):
                 todays = [i for i in interventions if int(i.get("day", 1)) == d]
+                if ens is not None:
+                    # The ensemble's soil estimate drives the twin's water balance.
+                    ens.recenter(self.state)
+                    self.state.aux["percolation_mm_day"] = ens.percolation()
+                    ens.step_day(weather_seq[d - 1], todays)
                 model.sync_from_moisture()   # respect assimilated moisture
                 day_logs = model.simulate_day(weather=weather_seq[d - 1], interventions=todays)
                 self.state.clip()
@@ -270,9 +281,11 @@ class DigitalTwin:
                 implied = self._ndvi_from_stress(np.asarray(values, dtype=np.float32))
                 r = da.observation_variance(source, "stress", obs_var) * self._model().ndvi_per_stress() ** 2
                 result = da.assimilate_grid(self.state, "ndvi", implied, source, r)
+                self._cross(result, "ndvi")
                 result.layer = "stress->ndvi"
             else:
                 result = da.assimilate_grid(self.state, layer, values, source, obs_var)
+                self._cross(result, layer)
             self._refresh_stress()
             out = [result.to_dict()]
             self._record_history(f"observe:{source}")
@@ -313,10 +326,12 @@ class DigitalTwin:
                         * model.ndvi_per_stress() ** 2
                     res = da.assimilate_point(self.state, "ndvi", implied, lat, lon, source,
                                               r, footprint_m, influence_radius_m)
+                    self._cross(res, "ndvi")
                     res.layer = "stress->ndvi"
                 else:
                     res = da.assimilate_point(self.state, layer, float(value), lat, lon, source,
                                               obs_var.get(layer), footprint_m, influence_radius_m)
+                    self._cross(res, layer)
                 results.append(res.to_dict())
             self._refresh_stress()
             self._record_history(f"observe:{source}")
@@ -324,6 +339,27 @@ class DigitalTwin:
                                          "lon": lon, "results": results})
             self.save()
         return results
+
+    def _ensemble(self):
+        if not self.cross_layer:
+            return None
+        if self.ensemble is None:
+            from src.twin_core.ensemble import CrossLayerEnsemble
+            self._model()
+            self.ensemble = CrossLayerEnsemble(self, seed=self.state.sim_day)
+        return self.ensemble
+
+    def _cross(self, result, layer: str) -> None:
+        """Let an observation of ``layer`` also correct the layers linked to it."""
+        det = result.detail
+        if self.ensemble is None or det is None or not np.any(det["valid"]):
+            return
+        result.cross = self.ensemble.cross_update(self.state, layer, det["valid"], det["innovation"],
+                                                  det["p_obs"], det["r"])
+        if "percolation" in result.cross:
+            self.state.aux["percolation_mm_day"] = self.ensemble.percolation()
+        if "moisture" in result.cross:
+            self._model().sync_from_moisture()
 
     def _ndvi_from_stress(self, stress_obs: np.ndarray) -> np.ndarray:
         """
@@ -369,6 +405,7 @@ class DigitalTwin:
                 zone_layout=self.zone_layout,
                 crop_model=self.crop_model,
                 params=self.params,
+                cross_layer=False,       # forecasts only: nothing is observed in a fork
             )
             twin.history = copy.deepcopy(self.history[-30:])
             return twin

@@ -77,7 +77,7 @@ class VirtualField:
 
         self.truth = DigitalTwin(field_id="virtual_field", state=state, storage_dir=None,
                                  propagation_model=propagation_model, zone_layout=zone_layout,
-                                 crop_model=crop_model, params=params)
+                                 crop_model=crop_model, params=params, cross_layer=False)
         if dry_patch and "percolation_mm_day" in state.aux:
             # Sandy / cracked patch the twin does not know about.
             state.aux["percolation_mm_day"] = (state.aux["percolation_mm_day"]

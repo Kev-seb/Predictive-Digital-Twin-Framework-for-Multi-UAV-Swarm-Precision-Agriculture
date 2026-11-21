@@ -15,14 +15,15 @@ observation noise of a sensor. A point observation (phone RGB scout, drone
 camera footprint) also updates nearby cells, with ``R`` inflated by distance,
 so a single reading informs its neighbourhood without overriding it.
 
-This is the Phase-2 baseline; it can be replaced by an ensemble Kalman filter
-over ``AgronomicDigitalTwinSimulator`` without changing the public API.
+Layers are linked through the crop model (a drying root zone lowers NDVI).
+ensemble.py adds those cross-layer links on top of this filter, so an NDVI
+reading also corrects moisture, nitrogen, fungus and the soil's leakiness.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional
 
 import numpy as np
 
@@ -67,6 +68,9 @@ class AssimilationResult:
     mean_gain: float            # average Kalman gain applied
     variance_before: float
     variance_after: float
+    # Per-cell details for the cross-layer update (twin.py / ensemble.py).
+    detail: Optional[Dict[str, Any]] = field(default=None, repr=False, compare=False)
+    cross: Dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, float]:
         return {
@@ -76,6 +80,7 @@ class AssimilationResult:
             "mean_gain": round(self.mean_gain, 5),
             "variance_before": round(self.variance_before, 6),
             "variance_after": round(self.variance_after, 6),
+            **({"cross_layer": {k: round(v, 5) for k, v in self.cross.items()}} if self.cross else {}),
         }
 
 
@@ -130,6 +135,8 @@ def kalman_update(
         p_valid = np.where(surprise, np.maximum(p_valid, innovation ** 2 - r[valid]), p_valid)
         p[valid] = p_valid
     gain = p_valid / (p_valid + r[valid])
+    detail = {"valid": valid.copy(), "innovation": innovation.astype(np.float64),
+              "p_obs": p_valid.astype(np.float64), "r": r[valid].astype(np.float64)}
 
     x[valid] = x[valid] + gain * innovation
     p[valid] = (1.0 - gain) * p[valid]
@@ -144,6 +151,7 @@ def kalman_update(
         mean_gain=float(gain.mean()),
         variance_before=p_before,
         variance_after=float(p[valid].mean()),
+        detail=detail,
     )
 
 

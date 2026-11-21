@@ -51,7 +51,7 @@ Most parts existed, but they weren't connected:
   - New `/twin/*` routes and the `/ws/twin` stream.
 - [ ] Point `mobile_api_server.py` (`/api/field/state`, `/api/field/scenario/state`) and the dashboard's twin tab at `DigitalTwin` instead of `FieldDigitalTwin`.
 
-### Phase 2: Live sync and assimilation ✅ (done, except the EnKF upgrade)
+### Phase 2: Live sync and assimilation ✅ (done)
 - [x] Per-cell Kalman filter (`src/twin_core/assimilation.py`): process noise per day, observation noise per sensor, and point observations with a distance-weighted footprint.
 - [x] Stress is diagnostic, derived from NDVI and fungus. A stress reading is assimilated as the NDVI it implies, so the simulator doesn't discard it.
 - [x] Ingestion adapters (`src/twin_core/ingest.py`):
@@ -64,7 +64,17 @@ Most parts existed, but they weren't connected:
   - `twin_error()` scoring
 - [x] API: `/twin/ingest/rgb`, `/twin/ingest/multispectral`, and `/sim/reset|advance|drone-pass|survey|error|truth/layers`.
 - [x] Live pipeline: `LiveFieldController.set_twin_sink()` + `TwinForwarder` (`src/twin_core/twin_client.py`) forward every accepted, geotagged inference from the mobile API to the twin API. It's non-blocking and can be switched off with `UAV_TWIN_FORWARD_LIVE=false`.
-- [ ] Upgrade to an ensemble Kalman filter over the simulator, so moisture and nitrogen get updated through their correlation with NDVI.
+- [x] Cross-layer correction (`src/twin_core/ensemble.py`), a hybrid ensemble Kalman filter. 24 members of the paddy model run with uncertain rain and uncertain soil percolation. They give per-cell correlations between layers, smoothed over 3 × 3 cells. The twin's tuned mean and variance stay in charge. A soil or disease reading now also corrects the layers linked to it, and the soil's leak rate, which is estimated as a parameter. Check it with `python scripts/validate_cross_layer.py` (3 seeds, 21 days, drone every 3 days, survey weekly):
+
+  | | Per-layer filter | + cross-layer | Change |
+  |---|---|---|---|
+  | Moisture RMSE | 0.0292 | **0.0243** | −17% |
+  | Nitrogen RMSE | 0.0252 | **0.0235** | −7% |
+  | NDVI, stress, fungus RMSE | 0.014, 0.018, 0.027 | same | 0% |
+  | Leaky patch: leak rate off by | ×4.55 | **×1.63** | |
+  | 7-day moisture forecast over the leaky patch | 0.159 | **0.089** | −44% |
+
+  95% coverage stays at 0.91–1.00. NDVI readings are deliberately not used for cross-layer updates. In this OSSE, the leaky patch dries without its NDVI dropping for weeks, so NDVI-driven updates made drone-only moisture 8% worse. With drones only, the twin now matches the per-layer filter. The nowcast gain needs a few surveys: after two (day 14), moisture is 7% worse, but the leak rate and the forecast are already better.
 - [ ] Point `mobile_api_server.py` `/api/field/state` at the twin API instead of `FieldDigitalTwin` survey files.
 
 #### Validation result with the original generic crop model (superseded; see Phase 5)
