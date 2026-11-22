@@ -1,7 +1,10 @@
 [theme]
 base="dark"
-primaryColor="#00FF87"
-backgroundColor="#0e1117"
-secondaryBackgroundColor="#1e293b"
-textColor="#f8fafc"
+primaryColor="#2BD67B"
+backgroundColor="#0A1020"
+secondaryBackgroundColor="#101A2E"
+textColor="#E7EDF7"
 font="sans serif"
+
+[client]
+toolbarMode = "minimal"

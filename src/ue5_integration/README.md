@@ -88,6 +88,41 @@ This path is tested against the real API with a stand-in for UE5's Python module
 
 **Want the C++ plugin instead?** Your project can compile C++ if its folder has a `Source/` folder and a `.sln` file next to the `.uproject`, and Visual Studio with the *Game development with C++* workload is installed. If not, use the Python path above; it does the same job.
 
+## Realistic PaddyTwin level (UE 5.8, recommended for presentations)
+
+`python/paddy_scene.py` builds a full level at `/Game/TwinDemo/Maps/PaddyTwin`, and `python/twin_paddy.py` drives it live from the API. It reuses `twin_live.py` for polling, frame handling, actions and the menu.
+
+**What's in the level:**
+- **Lighting:** a tropical-morning sun, SkyAtmosphere, SkyLight, VolumetricCloud and height fog, with manual exposure.
+- **Surroundings:** farmland patchwork, palms, a farm road, an irrigation canal and neighbouring paddies.
+- **Fields:** three 100 m paddies (TWIN, REALITY and FORECAST +7 DAYS) with mud bunds, labelled on dark boards.
+- **Rice:** each field has a `Rice` HISM of 400 cells, where instance = row × 20 + col. Each cell is a 5 m tile of 400 Nanite rice hills.
+  - The cell's height follows NDVI (0.3–1.0 m).
+  - `M_RiceCrop` colours the leaves from per-instance custom data 0–5, the same slots as in section 3.
+- **Water:** a `Water` HISM (custom data: moisture, NDVI, stress, std, fungus). It looks glassy when flooded and like matte, cracked mud when dry. From a distance it blends to the canopy colour, because 1 cm leaves are thinner than a pixel there.
+- **Drones:** three spray quadcopters with spinning rotors. `NS_SprayMist` runs under a drone while it sprays.
+- **Rain:** `RainStreaks` falls on days with more than 1 mm of rain, and the sky turns overcast.
+- **Control panel:** `EUW_TwinControl` has the action buttons, camera views (Overview, Close-up, Follow drone), live results, the status line and the colour legend.
+- **Outbreak target:** drag the `CellCursor` onto a cell, select it, then click *Inject outbreak*. With nothing selected, the centre of the view is used.
+
+**Run it:**
+1. Start the twin with `start_demo.bat`, or `python digital_twin_api.py`.
+2. Open the UE project. PaddyTwin is its startup map.
+3. Choose **Digital Twin → Start paddy twin**. The control panel opens; press **Start demo**.
+
+The menu entry comes from the startup script `python/init_paddy.py`, which is listed under *Project Settings → Python → Startup Scripts*. Without it, run `import twin_paddy; twin_paddy.start()` in the Python console.
+
+**Rebuild from scratch:**
+- **Inside UE:** run `import paddy_scene; paddy_scene.build_all()`. It writes the meshes, materials, level, CellCursor, RainStreaks and an empty panel asset.
+- **In a terminal, with the editor open:**
+  - `python python/paddy_fx.py` authors `NS_SprayMist` through the Niagara MCP toolset.
+  - `python python/twin_ui.py` builds the panel through the UMG MCP toolset.
+- **Required plugins:** Python Editor Script Plugin, Editor Scripting Utilities, Model Context Protocol (Unreal MCP), EditorToolset, UMGToolSet and NiagaraToolsets.
+
+**UE 5.8 notes:**
+- Python can't edit Niagara module inputs, and can't add widgets to an Editor Utility Widget. Both go through the engine's MCP toolsets instead.
+- A Niagara rain authored that way didn't render reliably, so rain uses a mesh whose material makes the streaks fall.
+
 ## 1. Install
 
 1. Copy `src/ue5_integration/TwinStream/` to `<YourProject>/Plugins/TwinStream/`.

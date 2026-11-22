@@ -848,4 +848,5 @@ def twin_live_start():
     return builtins._twin_live
 
 
-twin_live_start()
+if __name__ == "__main__":     # File > Execute Python Script; importing it (twin_paddy.py) only reuses the code
+    twin_live_start()

@@ -67,6 +67,7 @@ def _run_script():
     spec = importlib.util.spec_from_file_location("twin_live", SCRIPT)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    mod.twin_live_start()        # importing only defines it; UE's File > Execute runs it as __main__
     import builtins
     return mod, builtins._twin_live
 
