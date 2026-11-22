@@ -696,123 +696,18 @@ def load_cached_segmentation_model():
 # ──────────────────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="UAV Crop Stress Intelligence Platform",
+    page_title="PaddyTwin | Predictive Digital Twin",
+    page_icon=":material/agriculture:",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# Custom CSS for research-grade aesthetics
-
-# Set Matplotlib to natively match our dark theme
+# Application shell: theme (CSS, Plotly and Matplotlib), navigation and page chrome
 import matplotlib.pyplot as plt
-plt.style.use('dark_background')
-plt.rcParams.update({
-    "axes.facecolor": "#0e1117",
-    "figure.facecolor": "#0e1117",
-    "text.color": "#f8fafc",
-    "axes.labelcolor": "#cbd5e1",
-    "xtick.color": "#cbd5e1",
-    "ytick.color": "#cbd5e1",
-    "grid.color": "#1e293b",
-})
-
-st.markdown("""
-<style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700;800&display=swap');
-    
-    html, body, [class*="css"]  {
-        font-family: 'Inter', sans-serif !important;
-    }
-
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    header {visibility: hidden;}
-
-    .main-header {
-        font-size: 2.8rem;
-        font-weight: 800;
-        letter-spacing: -1.5px;
-        background: linear-gradient(135deg, #00FF87 0%, #0072ff 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        margin-bottom: 0rem;
-    }
-    
-    .sub-header {
-        color: var(--text-color) !important;
-        opacity: 0.7;
-        font-weight: 400;
-        font-size: 1.15rem;
-        margin-top: 0.2rem;
-        margin-bottom: 1.5rem;
-        letter-spacing: 0.5px;
-    }
-
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 12px;
-        background-color: transparent;
-    }
-    .stTabs [data-baseweb="tab"] {
-        background-color: transparent;
-        border-radius: 8px 8px 0 0;
-        padding: 12px 24px;
-        color: var(--text-color);
-        opacity: 0.8;
-        border: 1px solid var(--secondary-background-color);
-        border-bottom: none;
-        transition: all 0.3s ease;
-        font-weight: 600;
-    }
-    .stTabs [data-baseweb="tab"]:hover {
-        background-color: var(--secondary-background-color);
-        opacity: 1.0;
-    }
-    .stTabs [aria-selected="true"] {
-        background-color: var(--secondary-background-color) !important;
-        color: var(--primary-color) !important;
-        opacity: 1.0 !important;
-        border-top: 3px solid var(--primary-color) !important;
-    }
-
-    div[data-testid="stMetricValue"] {
-        font-size: 2.4rem;
-        font-weight: 800;
-        color: var(--text-color) !important;
-        letter-spacing: -0.5px;
-    }
-    div[data-testid="stMetricLabel"] {
-        font-size: 1.1rem;
-        color: var(--text-color);
-        opacity: 0.7;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 1px;
-    }
-    div[data-testid="stMetric"], div[data-testid="stFileUploader"] {
-        background: var(--secondary-background-color);
-        border: 1px solid var(--secondary-background-color);
-        border-radius: 12px;
-        padding: 15px 20px;
-        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
-        transition: transform 0.2s ease-in-out, box-shadow 0.2s;
-    }
-    div[data-testid="stMetric"]:hover, div[data-testid="stFileUploader"]:hover {
-        transform: translateY(-3px);
-        box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.2);
-        border-color: rgba(0, 255, 135, 0.3);
-    }
-
-    .stress-critical { color: #ef4444; font-weight: 800; text-shadow: 0 0 12px rgba(239,68,68,0.5); }
-    .stress-high     { color: #f97316; font-weight: 800; text-shadow: 0 0 12px rgba(249,115,22,0.5); }
-    .stress-medium   { color: #eab308; font-weight: 800; }
-    .stress-low      { color: #10b981; font-weight: 800; }
-    
-    .block-container {
-        padding-top: 2rem;
-        max-width: 95%;
-    }
-</style>
-""", unsafe_allow_html=True)
+from src.dashboard import ui_shell
+from src.dashboard.ui_shell import show_page
+ui_shell.apply_theme()
+ui_shell.matplotlib_theme()
 
 
 # ──────────────────────────────────────────────────────────────
@@ -881,90 +776,137 @@ def plot_boundaries_contours(pathogen: np.ndarray, boundaries: np.ndarray, title
 # Sidebar
 # ──────────────────────────────────────────────────────────────
 
-with st.sidebar:
-#    import os
-#    logo_path = os.path.join(os.path.dirname(__file__), "assets", "garuda_logo.jpg")
-#    if os.path.exists(logo_path):
-#        st.image(logo_path, use_container_width=True)
-    st.markdown("## UAV Crop Stress Intelligence")
-    st.markdown("**Research Platform v2.0**")
-    st.markdown("---")
+PAGE = ui_shell.sidebar_nav()
 
-
-
-    st.markdown("### Configuration")
-    crop_stage = st.selectbox("Crop Growth Stage", STAGES, index=1)
-    stress_threshold = st.slider("Stress Detection Threshold", 0.30, 0.80, 0.55, 0.05)
-    grid_size = st.slider("Field Grid Size", 3, 10, 5)
-
-    st.markdown("---")
-    st.markdown("### Field Location (for Weather)")
-    lat = st.number_input("Latitude",  value=11.0, format="%.4f")
-    lon = st.number_input("Longitude", value=79.0, format="%.4f")
+with st.sidebar.expander("Field settings", icon=":material/settings:"):
+    crop_stage = st.selectbox("Crop growth stage", STAGES, index=1)
+    stress_threshold = st.slider("Stress detection threshold", 0.30, 0.80, 0.55, 0.05)
+    grid_size = st.slider("Field grid size", 3, 10, 5)
+    st.caption("Field location (weather)")
+    if "geo_center_pending" in st.session_state:          # set by Upload from the GeoTIFF georeference
+        st.session_state["field_lat"], st.session_state["field_lon"] = st.session_state.pop("geo_center_pending")
+    lat = st.number_input("Latitude",  value=11.0, format="%.4f", key="field_lat")
+    lon = st.number_input("Longitude", value=79.0, format="%.4f", key="field_lon")
     shared_state["HOME_LAT"] = lat
     shared_state["HOME_LON"] = lon
 
-    st.markdown("---")
-    st.markdown("""
-    **Pipeline:**  
-    `Multispectral TIFF` →  
-    `Band Extraction` →  
-    `Vegetation Indices` →  
-    `Stress Segmentation` →  
-    `GIS Zoning` →  
-    `Weather Inference` →  
-    `AI Report`
-    """)
+st.sidebar.caption("Multispectral TIFF → indices → stress → GIS zones → weather → twin → AI report")
 
 
-# ──────────────────────────────────────────────────────────────
-# Main header
-# ──────────────────────────────────────────────────────────────
+def _demo_ms_image():
+    """Synthetic 256 x 256 paddy field with heterogeneous stress (the 'demo field')."""
+    rng_state = np.random.get_state()
+    np.random.seed(42)
+    H, W = 256, 256
+    base_nir = np.random.normal(0.7, 0.1, (H, W)).clip(0, 1).astype(np.float32)
+    base_red = np.random.normal(0.2, 0.05, (H, W)).clip(0, 1).astype(np.float32)
+    base_re  = np.random.normal(0.5, 0.08, (H, W)).clip(0, 1).astype(np.float32)
+    base_grn = np.random.normal(0.35, 0.06, (H, W)).clip(0, 1).astype(np.float32)
+    for _ in range(6):
+        cy, cx = np.random.randint(30, H-30), np.random.randint(30, W-30)
+        r = np.random.randint(15, 35)
+        yy, xx = np.ogrid[:H, :W]
+        circle = (yy - cy)**2 + (xx - cx)**2 < r**2
+        sev = np.random.uniform(0.3, 0.7)
+        base_nir[circle] *= (1 - sev)
+        base_red[circle] *= (1 + sev * 0.5)
+    np.random.set_state(rng_state)
+    return MultispectralImage(bands={"green": base_grn, "red": base_red, "red_edge": base_re, "nir": base_nir})
 
-st.markdown('<p class="main-header">AI-Powered UAV Crop Stress Intelligence</p>', unsafe_allow_html=True)
-st.markdown('<p class="sub-header">Temporal Precision Agriculture | Multispectral Remote Sensing | Geospatial AI</p>', unsafe_allow_html=True)
-st.markdown("---")
 
-# ──────────────────────────────────────────────────────────────
-# Tabs
-# ──────────────────────────────────────────────────────────────
-
-tabs = st.tabs([
-    "Upload & Process",
-    "Vegetation Analytics",
-    "Stress Intelligence",
-    "Temporal Analytics",
-    "Field Zoning (GIS)",
-    "Weather & Risk",
-    "Predictive Digital Twin",
-    "AI Input Optimizer",
-    "Spatial Reconstruction",
-    "Satellite Analytics",
-    "Landsat Historical Engine",
-    "Live UAV Control Center",
-    "Swarm Operations Dashboard",
-    "AI Report",
-    "🌿 Live Field Mode",
-])
+if PAGE == "overview":
+    from src.dashboard import overview
+    overview.render()
 
 
 # ══════════════════════════════════════════════════════════════
 # TAB 1 — Upload & Process
 # ══════════════════════════════════════════════════════════════
 
-with tabs[0]:
-    st.header("Multispectral Image Upload & Processing")
+if show_page(0):
+    st.header("Upload your field")
+    st.markdown("Start here. Upload a 4-band multispectral GeoTIFF of the field (Green, Red, Red Edge, NIR). "
+                "Every later step (indices, stress, zones, weather, the digital twin forecast, the treatment plan "
+                "and the report) is computed from this image.")
 
-    col1, col2 = st.columns([1, 1])
+    def _geo_center(img):
+        """(lat, lon) of the image centre from its georeference, or None."""
+        t, crs = getattr(img, "transform", None), getattr(img, "crs", None)
+        if t is None or not crs:
+            return None
+        x = t.c + t.a * img.width / 2 + t.b * img.height / 2
+        y = t.f + t.d * img.width / 2 + t.e * img.height / 2
+        if "4326" in str(crs):
+            return float(y), float(x)
+        try:
+            from rasterio.warp import transform as _warp
+            xs, ys = _warp(crs, "EPSG:4326", [x], [y])
+            return float(ys[0]), float(xs[0])
+        except Exception:
+            return None
 
-    with col1:
-        st.subheader("Upload Multispectral TIFF")
-        uploaded = st.file_uploader(
-            "Upload 4-band GeoTIFF (Green / Red / RedEdge / NIR)",
-            type=["tif", "tiff"],
-        )
+    def _set_field(img, name, source):
+        st.session_state["ms_image"] = img
+        st.session_state["indices"] = compute_all_indices(img.bands)
+        st.session_state["crop_stage"] = crop_stage
+        st.session_state["data_source"] = source
+        st.session_state["field_name"] = name
+        for k in ("weather_assessment", "simulation_result", "opt_report", "custom_interventions"):
+            st.session_state.pop(k, None)            # results of the previous field are no longer valid
+        geo = _geo_center(img)
+        st.session_state["field_geo"] = geo
+        if geo is not None:
+            st.session_state["geo_center_pending"] = geo
+        ui_shell.reset_progress()
+        ui_shell.mark_done("upload")
 
-        st.markdown("**Band layout expected:**")
+    has_field = "ms_image" in st.session_state
+    with st.container(border=True):
+        up_l, up_r = st.columns([3, 2], gap="large")
+        with up_l:
+            uploaded = st.file_uploader("Multispectral GeoTIFF (Green / Red / Red Edge / NIR)",
+                                        type=["tif", "tiff"], key="field_upload")
+        with up_r:
+            st.markdown("**No image at hand?**")
+            sample_btn = st.button("Use the sample GeoTIFF", icon=":material/landscape:", use_container_width=True,
+                                   help="data/samples/sample_paddy.tif, a georeferenced paddy field")
+            demo_btn = st.button("Use a synthetic demo field", icon=":material/science:", use_container_width=True)
+            if has_field:
+                if st.button("Remove field and start over", icon=":material/delete:", use_container_width=True):
+                    for k in ("ms_image", "indices", "data_source", "field_name", "field_geo", "upload_id",
+                              "weather_assessment", "simulation_result", "opt_report", "custom_interventions"):
+                        st.session_state.pop(k, None)
+                    ui_shell.reset_progress()
+                    st.rerun()
+
+    new_field = False
+    if uploaded is not None and st.session_state.get("upload_id") != uploaded.file_id:
+        with st.spinner("Reading the GeoTIFF and computing vegetation indices..."):
+            import tempfile
+            tmp_path = Path(tempfile.gettempdir()) / f"uploaded_{uploaded.file_id}.tif"
+            tmp_path.write_bytes(uploaded.getvalue())
+            try:
+                _set_field(load_multispectral_tiff(tmp_path), uploaded.name, "upload")
+                st.session_state["upload_id"] = uploaded.file_id
+                new_field = True
+            except Exception as e:
+                st.error(f"Could not read this file as a 4-band multispectral GeoTIFF: {e}")
+    elif sample_btn:
+        _sample = Path(__file__).resolve().parents[2] / "data" / "samples" / "sample_paddy.tif"
+        try:
+            _set_field(load_multispectral_tiff(_sample), _sample.name, "sample")
+            new_field = True
+        except Exception as e:
+            st.error(f"Sample GeoTIFF not available: {e}")
+    elif demo_btn:
+        _set_field(_demo_ms_image(), "Synthetic demo field", "demo")
+        new_field = True
+    if new_field:
+        st.rerun()        # refresh the sidebar (unlocked steps, field location) with the new field
+
+    ms_image = st.session_state.get("ms_image")
+    if ms_image is None:
+        st.markdown("**Expected band layout**")
         st.markdown("""
         | Band | Wavelength | Purpose |
         |------|------------|---------|
@@ -973,98 +915,52 @@ with tabs[0]:
         | 3    | Red Edge ~720 nm | Early stress, NDRE |
         | 4    | NIR ~840 nm | Biomass, vigour |
         """)
+    else:
+        idx = st.session_state["indices"]
+        geo = st.session_state.get("field_geo")
+        src_label = {"upload": "Uploaded", "sample": "Sample GeoTIFF", "demo": "Synthetic"}.get(
+            st.session_state.get("data_source"), "Loaded")
+        st.success(f"**{st.session_state.get('field_name', 'Field')}** is loaded. Continue to the next step below.",
+                   icon=":material/check_circle:")
+        f1, f2, f3, f4 = st.columns(4)
+        f1.metric("Source", src_label)
+        f2.metric("Size", f"{ms_image.width} × {ms_image.height} px")
+        f3.metric("Bands", f"{len(ms_image.bands)}")
+        f4.metric("Location", f"{geo[0]:.3f}, {geo[1]:.3f}" if geo else "Not set", help="Field centre (lat, lon) from the GeoTIFF")
+        if geo is None:
+            st.caption("This image has no georeference: set the field location under **Field settings** in the "
+                       "sidebar for the weather step.")
 
-    with col2:
-        st.subheader("Demo Mode (Synthetic Data)")
-        use_demo = st.checkbox("Use synthetic paddy field data", value=True)
-        if use_demo:
-            st.info("Synthetic 256×256 paddy field with stressed zones generated.")
-
-    # ── Load or generate image ────────────────────────────
-
-    ms_image = None
-
-    if uploaded is not None:
-        with st.spinner("Loading multispectral TIFF..."):
-            import tempfile
-            tmp_path = Path(tempfile.gettempdir()) / "uploaded.tif"
-            tmp_path.write_bytes(uploaded.read())
-            try:
-                ms_image = load_multispectral_tiff(tmp_path)
-                st.success(f"Loaded: {ms_image.height}×{ms_image.width} px")
-            except Exception as e:
-                st.error(f"Failed to load TIFF: {e}")
-
-    elif use_demo:
-        # Generate synthetic paddy field with heterogeneous stress
-        np.random.seed(42)
-        H, W = 256, 256
-
-        base_nir = np.random.normal(0.7, 0.1, (H, W)).clip(0, 1).astype(np.float32)
-        base_red = np.random.normal(0.2, 0.05, (H, W)).clip(0, 1).astype(np.float32)
-        base_re  = np.random.normal(0.5, 0.08, (H, W)).clip(0, 1).astype(np.float32)
-        base_grn = np.random.normal(0.35, 0.06, (H, W)).clip(0, 1).astype(np.float32)
-
-        # Inject stressed patches
-        for _ in range(6):
-            cy, cx = np.random.randint(30, H-30), np.random.randint(30, W-30)
-            r = np.random.randint(15, 35)
-            yy, xx = np.ogrid[:H, :W]
-            circle = (yy - cy)**2 + (xx - cx)**2 < r**2
-            sev = np.random.uniform(0.3, 0.7)
-            base_nir[circle] *= (1 - sev)
-            base_red[circle] *= (1 + sev * 0.5)
-
-        ms_image = MultispectralImage(bands={
-            "green":    base_grn,
-            "red":      base_red,
-            "red_edge": base_re,
-            "nir":      base_nir,
-        })
-
-    if ms_image is not None:
-        st.session_state["ms_image"]   = ms_image
-        st.session_state["crop_stage"] = crop_stage
-
-        # Compute indices
-        idx = compute_all_indices(ms_image.bands)
-        st.session_state["indices"] = idx
-
-        # Show composites
-        st.subheader("Image Composites")
+        st.subheader("Image composites")
         c1, c2, c3 = st.columns(3)
-
         with c1:
-            st.markdown("**False Color CIR** (NIR→R, Red→G, Green→B)")
+            st.markdown("**False colour CIR** (NIR→R, Red→G, Green→B)")
             st.image(ms_image.false_color_cir(), use_container_width=True)
-
         with c2:
-            st.markdown("**False Color — Vegetation Stress**")
+            st.markdown("**False colour: vegetation stress**")
             st.image(ms_image.false_color_vegetation(), use_container_width=True)
-
         with c3:
-            st.markdown("**False Color — Red Edge Emphasis**")
+            st.markdown("**False colour: red-edge emphasis**")
             st.image(ms_image.false_color_redge_emphasis(), use_container_width=True)
 
-        # Quick stats
-        st.subheader("Quick Index Summary")
+        st.subheader("Quick index summary")
         q1, q2, q3, q4, q5 = st.columns(5)
-        q1.metric("NDVI Mean",  f"{idx['ndvi'].mean():.3f}")
-        q2.metric("NDRE Mean",  f"{idx['ndre'].mean():.3f}")
-        q3.metric("NDWI Mean",  f"{idx['ndwi'].mean():.3f}")
-        q4.metric("GNDVI Mean", f"{idx['gndvi'].mean():.3f}")
-        q5.metric("Stress Score", f"{idx['stress_score'].mean():.3f}")
+        q1.metric("NDVI mean",  f"{idx['ndvi'].mean():.3f}")
+        q2.metric("NDRE mean",  f"{idx['ndre'].mean():.3f}")
+        q3.metric("NDWI mean",  f"{idx['ndwi'].mean():.3f}")
+        q4.metric("GNDVI mean", f"{idx['gndvi'].mean():.3f}")
+        q5.metric("Stress score", f"{idx['stress_score'].mean():.3f}")
 
 
 # ══════════════════════════════════════════════════════════════
 # TAB 2 — Vegetation Analytics
 # ══════════════════════════════════════════════════════════════
 
-with tabs[1]:
+if show_page(1):
     st.header("Vegetation Analytics Dashboard")
 
     if "indices" not in st.session_state:
-        st.warning("Please upload or enable demo data in Tab 1 first.")
+        st.info("No field image loaded. Open **Data & reports › Upload & process** to upload a GeoTIFF or use the demo field.")
     else:
         idx = st.session_state["indices"]
 
@@ -1159,11 +1055,11 @@ with tabs[1]:
 # TAB 3 — Stress Intelligence
 # ══════════════════════════════════════════════════════════════
 
-with tabs[2]:
+if show_page(2):
     st.header("Crop Stress Intelligence")
 
     if "ms_image" not in st.session_state:
-        st.warning("Please upload or enable demo data in Tab 1 first.")
+        st.info("No field image loaded. Open **Data & reports › Upload & process** to upload a GeoTIFF or use the demo field.")
     else:
         ms_image = st.session_state["ms_image"]
         idx      = st.session_state["indices"]
@@ -1405,7 +1301,7 @@ with tabs[2]:
 # TAB 4 — Temporal Analytics
 # ══════════════════════════════════════════════════════════════
 
-with tabs[3]:
+if show_page(3):
     st.header("Temporal Crop Intelligence")
     st.markdown("Simulated temporal analytics across Nursery → Vegetative → Flowering → Mature stages.")
 
@@ -1489,7 +1385,7 @@ with tabs[3]:
     )
 
     if "ms_image" not in st.session_state:
-        st.warning("Please upload or enable demo data in Tab 1 first.")
+        st.info("No field image loaded. Open **Data & reports › Upload & process** to upload a GeoTIFF or use the demo field.")
     else:
         ms_image = st.session_state["ms_image"]
         idx = st.session_state["indices"]
@@ -1554,12 +1450,13 @@ with tabs[3]:
 # TAB 5 — Field Zoning (GIS)
 # ══════════════════════════════════════════════════════════════
 
-with tabs[4]:
+if show_page(4):
     st.header("GIS-Ready Field Zoning & Spatial Analytics")
 
     if "ms_image" not in st.session_state:
-        st.warning("Please upload or enable demo data in Tab 1 first.")
+        st.info("No field image loaded. Open **Data & reports › Upload & process** to upload a GeoTIFF or use the demo field.")
     else:
+        ms_image = st.session_state["ms_image"]
         idx = st.session_state["indices"]
         ndvi        = idx["ndvi"]
         stress_score= idx["stress_score"]
@@ -1693,7 +1590,7 @@ with tabs[4]:
 # TAB 6 — Weather & Risk
 # ══════════════════════════════════════════════════════════════
 
-with tabs[5]:
+if show_page(5):
     st.header("Weather-Aware Crop Stress Risk Assessment")
 
     col1, col2 = st.columns([1, 2])
@@ -1842,11 +1739,11 @@ with tabs[5]:
 # TAB 7 — Predictive Digital Twin
 # ══════════════════════════════════════════════════════════════
 
-with tabs[6]:
+if show_page(6):
     st.header("Predictive Field Digital Twin Ecosystem")
     
     if "ms_image" not in st.session_state or "indices" not in st.session_state:
-        st.warning("Please upload or enable demo data in Tab 1 first.")
+        st.info("No field image loaded. Open **Data & reports › Upload & process** to upload a GeoTIFF or use the demo field.")
     else:
         import importlib
         import src.ai_engine.epidemiology
@@ -2406,11 +2303,11 @@ with tabs[6]:
 # TAB 8 — AI Input Optimizer
 # ══════════════════════════════════════════════════════════════
 
-with tabs[7]:
+if show_page(7):
     st.header("AI Input & Treatment Optimizer")
     
     if "ms_image" not in st.session_state or "indices" not in st.session_state:
-        st.warning("Please upload or enable demo data in Tab 1 first.")
+        st.info("No field image loaded. Open **Data & reports › Upload & process** to upload a GeoTIFF or use the demo field.")
     else:
         import importlib
         import src.ai_engine.treatment_recommender
@@ -2682,7 +2579,7 @@ with tabs[7]:
 # TAB 9 — Spatial Reconstruction (UAV Photogrammetry)
 # ══════════════════════════════════════════════════════════════
 
-with tabs[8]:
+if show_page(8):
     st.header("Spatial Reconstruction & UAV Photogrammetry")
     st.markdown(
         "Generate 3D Digital Surface Models (DSM), Canopy Height Models (CHM), and "
@@ -2690,7 +2587,7 @@ with tabs[8]:
     )
     
     if "ms_image" not in st.session_state or "indices" not in st.session_state:
-        st.warning("Please upload or enable demo data in Tab 1 first.")
+        st.info("No field image loaded. Open **Data & reports › Upload & process** to upload a GeoTIFF or use the demo field.")
     else:
         from src.spatial.reconstruction import UAVSpatialReconstruction
         recon = UAVSpatialReconstruction(
@@ -5630,7 +5527,7 @@ with tabs[8]:
 # TAB 14 — AI Report
 # ══════════════════════════════════════════════════════════════
 
-with tabs[13]:
+if show_page(13):
     # Inject CSS for premium aesthetics
     st.markdown("""
     <style>
@@ -5669,7 +5566,7 @@ with tabs[13]:
 
     idx = st.session_state.get("indices", {})
     if not idx:
-        st.warning("Process an image first (Tab 1).")
+        st.info("No field image processed yet. Open **Data & reports › Upload & process** first.")
     else:
         ndvi_mean  = float(idx["ndvi"].mean())
         ndre_mean  = float(idx["ndre"].mean())
@@ -6213,7 +6110,7 @@ This report is generated by an AI decision support system. All values are model-
 # TAB 10 — Satellite Analytics
 # ══════════════════════════════════════════════════════════════
 
-with tabs[9]:
+if show_page(9):
     st.header("Sentinel-2 Satellite Integration (Google Earth Engine)")
     st.markdown("Macro-scale satellite remote sensing fused with UAV inspection triggering.")
     
@@ -6331,7 +6228,7 @@ with tabs[9]:
 # TAB 12 — Landsat Historical Engine
 # ══════════════════════════════════════════════════════════════
 
-with tabs[10]:
+if show_page(10):
     st.header("Landsat 8/9 Historical Archive & Climate Resilience")
     st.markdown("Analyze 10+ years of macro-scale temporal archives to evaluate drought progression, long-term productivity trends, and climate resilience.")
 
@@ -6446,7 +6343,7 @@ with tabs[10]:
 # TAB 13 — Live UAV Control Center
 # ══════════════════════════════════════════════════════════════
 
-with tabs[11]:
+if show_page(11):
     st.header("Live UAV Telemetry & Control Center")
     st.markdown(
         "Synchronize a real-world PX4/ArduPilot telemetry connection via MAVLink (WebSockets/TCP/UDP) "
@@ -6616,7 +6513,7 @@ with tabs[11]:
         else:
             st.info("No telemetry logs buffered yet. Telemetry will begin buffering once MAVLink or SITL begins streaming.")
 
-with tabs[12]:
+if show_page(12):
     st.header("Swarm-Scale Multi-UAV Operations Control")
     st.markdown(
         "Orchestrate collaborative agricultural missions using multiple synchronized UAV simulation twins. "
@@ -6852,7 +6749,7 @@ with tabs[12]:
 # Smartphone-powered crop scouting ground station
 # ══════════════════════════════════════════════════════════════
 
-with tabs[14]:
+if show_page(14):
     try:
         from src.ground_station.live_field_tab import render_live_field_tab
         render_live_field_tab()
@@ -6865,3 +6762,7 @@ with tabs[14]:
         import traceback
         with st.expander("Error Details"):
             st.code(traceback.format_exc())
+
+
+# Workflow: progress + 'continue to the next step' at the bottom of every workflow page
+ui_shell.workflow_footer()

@@ -37,3 +37,28 @@ try:
     _register()
 except Exception as e:      # never block editor startup
     unreal.log_warning(f"[init_paddy] could not add the Digital Twin menu: {e}")
+
+
+# Opened from the dashboard's "Open in Unreal Engine" button (ue_launcher.py sets PADDYTWIN_AUTOSTART=1):
+# start the paddy twin by itself once the PaddyTwin level and its fields have loaded.
+if os.environ.get("PADDYTWIN_AUTOSTART") == "1":
+    _wait = {"t": 0.0, "handle": None}
+
+    def _autostart(dt):
+        _wait["t"] += dt
+        if _wait["t"] < 2.0:
+            return
+        _wait["t"] = 0.0
+        try:
+            actors = unreal.get_editor_subsystem(unreal.EditorActorSubsystem).get_all_level_actors()
+            if not any(a.get_actor_label() == "Field_TWIN" for a in actors):
+                return                                  # level still loading
+            unreal.unregister_slate_post_tick_callback(_wait["handle"])
+            import twin_paddy
+            twin_paddy.start()
+            unreal.log("[init_paddy] paddy twin started (opened from the dashboard)")
+        except Exception as e:
+            unreal.unregister_slate_post_tick_callback(_wait["handle"])
+            unreal.log_warning(f"[init_paddy] could not start the paddy twin: {e}")
+
+    _wait["handle"] = unreal.register_slate_post_tick_callback(_autostart)
