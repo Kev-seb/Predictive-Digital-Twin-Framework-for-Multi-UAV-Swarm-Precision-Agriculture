@@ -845,12 +845,21 @@ if show_page(0):
         except Exception:
             return None
 
-    def _set_field(img, name, source):
+    def _set_field(img, name, source, flight=False):
+        """flight=True: a new flight of the loaded field (the twin is updated, not replaced)."""
+        idx_new = compute_all_indices(img.bands)
+        if not flight:
+            st.session_state["field_name"] = name
+            st.session_state["flights"] = []
+        st.session_state["flights"] = st.session_state.get("flights", []) + [{
+            "Flight": len(st.session_state.get("flights", [])) + 1, "Image": name,
+            "Loaded": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
+            "NDVI mean": round(float(np.nanmean(idx_new["ndvi"])), 3),
+            "Stress score": round(float(np.nanmean(idx_new["stress_score"])), 3)}]
         st.session_state["ms_image"] = img
-        st.session_state["indices"] = compute_all_indices(img.bands)
+        st.session_state["indices"] = idx_new
         st.session_state["crop_stage"] = crop_stage
         st.session_state["data_source"] = source
-        st.session_state["field_name"] = name
         for k in ("weather_assessment", "simulation_result", "opt_report", "custom_interventions"):
             st.session_state.pop(k, None)            # results of the previous field are no longer valid
         geo = _geo_center(img)
@@ -859,11 +868,23 @@ if show_page(0):
             st.session_state["geo_center_pending"] = geo
         ui_shell.reset_progress()
         ui_shell.mark_done("upload")
+        from src.dashboard import twin_link
+        st.session_state["field_footprint"] = twin_link.footprint_m(img)
+        with st.spinner("Sending the field to the live twin..."):
+            st.session_state["twin_link"] = twin_link.push_field(
+                img, st.session_state["field_name"] if flight else name, geo, crop_stage,
+                mode="update" if flight else "new")
 
     has_field = "ms_image" in st.session_state
     with st.container(border=True):
         up_l, up_r = st.columns([3, 2], gap="large")
         with up_l:
+            as_flight = False
+            if has_field:
+                as_flight = st.toggle(f"Next image is a new flight of **{st.session_state.get('field_name', 'this field')}**",
+                                      value=True, key="upload_as_flight",
+                                      help="On: the twin assimilates it as a new survey of the same field (its "
+                                           "history and uncertainty carry on). Off: it becomes a new field.")
             uploaded = st.file_uploader("Multispectral GeoTIFF (Green / Red / Red Edge / NIR)",
                                         type=["tif", "tiff"], key="field_upload")
         with up_r:
@@ -874,9 +895,13 @@ if show_page(0):
             if has_field:
                 if st.button("Remove field and start over", icon=":material/delete:", use_container_width=True):
                     for k in ("ms_image", "indices", "data_source", "field_name", "field_geo", "upload_id",
+                              "flights", "field_footprint",
                               "weather_assessment", "simulation_result", "opt_report", "custom_interventions"):
                         st.session_state.pop(k, None)
                     ui_shell.reset_progress()
+                    from src.dashboard import twin_link
+                    twin_link.forget_field()
+                    st.session_state.pop("twin_link", None)
                     st.rerun()
 
     new_field = False
@@ -886,7 +911,7 @@ if show_page(0):
             tmp_path = Path(tempfile.gettempdir()) / f"uploaded_{uploaded.file_id}.tif"
             tmp_path.write_bytes(uploaded.getvalue())
             try:
-                _set_field(load_multispectral_tiff(tmp_path), uploaded.name, "upload")
+                _set_field(load_multispectral_tiff(tmp_path), uploaded.name, "upload", flight=as_flight)
                 st.session_state["upload_id"] = uploaded.file_id
                 new_field = True
             except Exception as e:
@@ -923,13 +948,26 @@ if show_page(0):
         st.success(f"**{st.session_state.get('field_name', 'Field')}** is loaded. Continue to the next step below.",
                    icon=":material/check_circle:")
         f1, f2, f3, f4 = st.columns(4)
+        fp = st.session_state.get("field_footprint")
         f1.metric("Source", src_label)
-        f2.metric("Size", f"{ms_image.width} × {ms_image.height} px")
-        f3.metric("Bands", f"{len(ms_image.bands)}")
+        f2.metric("Size", f"{ms_image.width} × {ms_image.height} px",
+                  help=f"Ground footprint {fp[0]:.0f} × {fp[1]:.0f} m ({fp[0] * fp[1] / 10000:.2f} ha)" if fp else None)
+        f3.metric("Flights", f"{len(st.session_state.get('flights', [])) or 1}")
         f4.metric("Location", f"{geo[0]:.3f}, {geo[1]:.3f}" if geo else "Not set", help="Field centre (lat, lon) from the GeoTIFF")
         if geo is None:
             st.caption("This image has no georeference: set the field location under **Field settings** in the "
                        "sidebar for the weather step.")
+        link = st.session_state.get("twin_link")
+        if link:
+            (st.info if link[0] else st.warning)(link[1], icon=":material/hub:" if link[0] else ":material/cloud_off:")
+
+        flights = st.session_state.get("flights", [])
+        if len(flights) > 1:
+            st.subheader("Flight history")
+            fl = pd.DataFrame(flights)
+            st.dataframe(fl, hide_index=True, use_container_width=True)
+            d = fl["NDVI mean"].iloc[-1] - fl["NDVI mean"].iloc[-2]
+            st.caption(f"Since the previous flight, mean NDVI {'rose' if d >= 0 else 'fell'} by {abs(d):.3f}.")
 
         st.subheader("Image composites")
         c1, c2, c3 = st.columns(3)
@@ -1741,6 +1779,8 @@ if show_page(5):
 
 if show_page(6):
     st.header("Predictive Field Digital Twin Ecosystem")
+    from src.dashboard import validation as _validation
+    _validation.render()
     
     if "ms_image" not in st.session_state or "indices" not in st.session_state:
         st.info("No field image loaded. Open **Data & reports › Upload & process** to upload a GeoTIFF or use the demo field.")

@@ -94,6 +94,14 @@ def _offline() -> None:
         st.caption("Every other page in the sidebar works without the API.")
 
 
+def _send_field() -> None:
+    from src.dashboard import twin_link
+    ss = st.session_state
+    ss["twin_link"] = twin_link.push_field(ss["ms_image"], ss.get("field_name", "Uploaded field"),
+                                          ss.get("field_geo"), ss.get("crop_stage"))
+    ss["ue_open_msg"] = ss["twin_link"]
+
+
 def _open_unreal() -> None:
     try:
         from src.ue5_integration.ue_launcher import open_paddy_twin
@@ -106,9 +114,13 @@ def _open_unreal() -> None:
 # ----------------------------------------------------------------- page
 def render() -> None:
     st.markdown('<div class="pt-crumb">Live operations &nbsp;›&nbsp; <b>Live twin &amp; drones</b></div>', unsafe_allow_html=True)
+    from src.dashboard import twin_link
+    src = twin_link.twin_source() or {}
+    uploaded = src.get("source") == "upload"
+    title = src.get("name", "Field Alpha") if uploaded else "Field Alpha (simulated)"
     head_l, head_r = st.columns([3, 2], vertical_alignment="bottom")
     with head_l:
-        st.markdown('<div class="pt-title">Field Alpha &nbsp;·&nbsp; Paddy rice</div>'
+        st.markdown(f'<div class="pt-title">{title} &nbsp;·&nbsp; Paddy rice</div>'
                     '<div class="pt-sub">The twin estimates the field from drone scouting, forecasts the next 7 days, '
                     'and sends the drones to spray only where it matters.</div>', unsafe_allow_html=True)
     with head_r:
@@ -119,6 +131,13 @@ def render() -> None:
                      use_container_width=True, on_click=_open_unreal,
                      help="Opens the 3D PaddyTwin level in Unreal Engine on this PC (or brings it to the front) "
                           "and starts the paddy twin there. Actions on this page then move the drones in Unreal too.")
+    if src and not uploaded and "ms_image" in st.session_state:
+        c1, c2 = st.columns([4, 1.3], vertical_alignment="center")
+        c1.info(f"The live twin is showing the simulated field, not **{st.session_state.get('field_name', 'your field')}**.",
+                icon=":material/info:")
+        c2.button("Send to live twin", icon=":material/upload:", use_container_width=True, on_click=_send_field)
+    elif not src and "ms_image" in st.session_state:
+        pass                                      # API offline: the panel below explains how to start it
     msg = st.session_state.pop("ue_open_msg", None)
     if msg:
         (st.success if msg[0] else st.error)(msg[1], icon=":material/sports_esports:")
@@ -161,8 +180,11 @@ def _status_row(frame, field, m, status) -> None:
     flying = sum(1 for p in drones.values() if p and p[2] > 1.5)
     spraying = sum(1 for p in drones.values() if p and p[3])
     rain = (frame.get("weather") or {}).get("precipitation_mm", 0.0)
+    fs = frame.get("field_source") or {}
     pills = [
         (C["accent"], "Twin API connected"),
+        (C["accent"] if fs.get("source") == "upload" else C["muted"],
+         "Your uploaded field" if fs.get("source") == "upload" else "Simulated field"),
         (C["amber"] if running else C["muted"], "Demo running" if running else "Demo idle"),
         (C["blue"], f"Day {m.get('sim_day', field.get('sim_day', '-'))} · {m.get('growth_stage', field.get('growth_stage', ''))}"),
         (C["violet"] if flying else C["muted"], f"{flying}/{len(drones) or 3} drones airborne" + (f" · {spraying} spraying" if spraying else "")),
