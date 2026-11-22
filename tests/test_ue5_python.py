@@ -296,3 +296,116 @@ def test_project_assets_and_rain(fake_unreal, api):
     finally:
         mod.twin_live_stop()
     assert not fake_unreal._LEVEL
+
+
+def test_paddy_field_built_from_generated_assets(fake_unreal, api):
+    mod, live = _run_script()
+    try:
+        assets = mod.paddy_assets()
+        mesh = assets["mesh"]
+        assert isinstance(live.twin_field, mod.PaddyField) and len(live.twin_field.cells) == 400
+        assert mesh.n_tris == 2800 and mesh.material is assets["rice"]
+        assert mesh.box.min.z == pytest.approx(0.0, abs=0.5) and 60 < mesh.box.max.z < 100   # upright, ~1 m
+        rice = assets["rice"]
+        assert rice.compiled and rice.props["two_sided"]
+        outputs = {getattr(e, "material_output", None) for e in rice.expressions}
+        assert {"base_color", "roughness", "wpo"} <= outputs                   # colour, sheen, wind sway
+        color = next(e for e in rice.expressions if e.props.get("parameter_name") == "Color")
+        assert color.kind == "MaterialExpressionVectorParameter"
+        water_outputs = {getattr(e, "material_output", None) for e in assets["water"].expressions}
+        assert {"base_color", "roughness"} <= water_outputs
+        # Patches use the rice material; the field has water and four bunds.
+        actor, mid, _ = live.twin_field.cells[0]
+        assert actor.static_mesh_component.material is rice and actor.get_actor_label() == "Twin_00_00"
+        assert len(live.twin_field.extras) == 5 and live.ground is not None
+        assert _pump_until(fake_unreal, live, lambda: live.seq > 0)
+        heights = {round(a.scale.z, 3) for a, _, _ in live.twin_field.cells}
+        assert min(heights) >= 0.35 * live.twin_field.k
+        # Water follows soil moisture: glassy when flooded, matte when dry.
+        wm = live.twin_field.water_mid
+        live.twin_field.apply([0.7] * 400, [0.1] * 400, [0.0] * 400, None, [0.95] * 400)
+        assert wm.params["Roughness"] < 0.2
+        live.twin_field.apply([0.7] * 400, [0.1] * 400, [0.0] * 400, None, [0.5] * 400)
+        assert wm.params["Roughness"] > 0.8
+    finally:
+        mod.twin_live_stop()
+    assert not fake_unreal._LEVEL
+    # A second run reuses the saved assets instead of rebuilding them.
+    built = dict(fake_unreal.ASSETS)
+    mod._PADDY.clear()
+    assert mod.paddy_assets()["mesh"] is built[f"{mod.ASSET_DIR}/SM_RicePatch_v{mod.ASSET_VERSION}"]
+
+
+def test_paddy_import_on_its_side_is_stood_up(fake_unreal, api):
+    fake_unreal.IMPORT_UP = "y"
+    mod, live = _run_script()
+    try:
+        rot = mod.paddy_assets()["rotation"]
+        assert rot.rotate_vector(fake_unreal.Vector(0, 1, 0)).z == pytest.approx(1.0)
+        f = live.twin_field
+        assert f.up == 1
+        f.apply([0.9] * 400, [0.0] * 400, [0.0] * 400, None)
+        s = f.cells[0][0].scale
+        assert s.y > s.x                       # height scaled along the mesh's own up axis
+    finally:
+        mod.twin_live_stop()
+
+
+def test_falls_back_to_blocks_when_assets_cannot_be_built(fake_unreal, api):
+    fake_unreal.FAIL_ASSET_BUILD = True
+    mod, live = _run_script()
+    try:
+        assert type(live.twin_field) is mod.BlocksField
+        assert any("could not build the paddy assets" in m for m in fake_unreal.LOG)
+    finally:
+        mod.twin_live_stop()
+
+
+def test_toolbar_and_camera_views(fake_unreal, api):
+    mod, live = _run_script()
+    try:
+        bar = fake_unreal.ToolMenus._menus["LevelEditor.LevelEditorToolBar.User"]
+        labels = [e.label for _, e in bar.entries]
+        assert labels[:3] == ["Demo", "Stop", "Next day"] and "Follow drone" in labels
+        assert all(e.type == "tool_bar_button" and e.tip for _, e in bar.entries)
+        # Close-up: low, near the twin field, looking into the crop.
+        mod.twin_live_view("closeup")
+        loc, rot = fake_unreal.UnrealEditorSubsystem.camera
+        size = live.twin_field.size_cm()
+        assert loc.z < size * 0.15 and -40 < rot.pitch < 0
+        # Follow: the camera chases a drone.
+        live._apply_drones({"d1": [5.0, 5.0, 4.0, False, 90.0]})
+        mod.twin_live_view("follow")
+        fake_unreal._tick_all()
+        d = live.drones["d1"]["pos"]
+        cam = fake_unreal.UnrealEditorSubsystem.camera[0]
+        assert (cam - d).length() < size * 0.4
+        live._apply_drones({"d1": [15.0, 15.0, 4.0, False, 90.0]})
+        for _ in range(60):
+            fake_unreal._tick_all()
+        cam2 = fake_unreal.UnrealEditorSubsystem.camera[0]
+        assert (cam2 - live.drones["d1"]["pos"]).length() < size * 0.4 and (cam2 - cam).length() > size * 0.2
+        mod.twin_live_camera()                         # back to the overview stops following
+        assert live.view == "overview"
+    finally:
+        mod.twin_live_stop()
+
+
+def test_rice_patch_mesh():
+    import importlib.util as iu
+    src = SCRIPT.read_text()
+    ns = {"math": math, "PATCH_CM": 500.0}
+    exec(src[src.index("def rice_patch_obj"):src.index("def _asset_tools")], ns)
+    obj = ns["rice_patch_obj"]()
+    v = [l for l in obj.splitlines() if l.startswith("v ")]
+    vt = [tuple(map(float, l.split()[1:])) for l in obj.splitlines() if l.startswith("vt ")]
+    f = [l for l in obj.splitlines() if l.startswith("f ")]
+    assert len(v) == len(vt) == 10 * 10 * 7 * 3 * 2 and len(f) == 10 * 10 * 7 * 2 * 2
+    heights = [float(l.split()[2]) for l in v]                 # OBJ Y = up
+    assert min(heights) == pytest.approx(0.0) and 60 < max(heights) < 100
+    assert {u for u, _ in vt} >= {0.0, 1.0} and all(0 <= u <= 1 for u, _ in vt)
+    n_v, n_n = len(v), sum(1 for l in obj.splitlines() if l.startswith("vn "))
+    for line in f:
+        for corner in line.split()[1:]:
+            a, b, c = (int(x) for x in corner.split("/"))
+            assert 1 <= a <= n_v and 1 <= b <= n_v and 1 <= c <= n_n
