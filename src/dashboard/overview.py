@@ -142,6 +142,7 @@ def render() -> None:
     if msg:
         (st.success if msg[0] else st.error)(msg[1], icon=":material/sports_esports:")
     _live_panel(live)
+    _missions()
     st.markdown("<div style='height:.6rem'></div>", unsafe_allow_html=True)
     st.markdown("##### How the twin works")
     steps = [("01", "Sense", "Drones fly multispectral scouting passes over the paddy."),
@@ -283,6 +284,75 @@ def _controls(frame) -> None:
             st.button("Inject", type="primary", use_container_width=True, on_click=_act,
                       args=("Outbreak", "/live/action", {"action": "outbreak", "row": r + 0.5, "col": c + 0.5}))
 
+
+
+MANUAL_CHECKS = [
+    "Batteries charged and spares ready",
+    "Propellers, arms and spray nozzles inspected",
+    "Tank filled with the right product and dose",
+    "Flight area checked for no-fly zones (Digital Sky / local rules) and people",
+    "Buffer kept from houses, water bodies and other crops",
+    "Operator and helper wearing protective equipment (PPE)",
+]
+
+
+def _missions() -> None:
+    """Drone mission files for real flights, and a pre-flight checklist."""
+    with st.expander("Drone missions for real flights", icon=":material/flight_takeoff:"):
+        st.caption("The twin plans each drone's route. Download it as QGroundControl waypoint files "
+                   "(.waypoints, one per drone) for Mission Planner / QGroundControl and ArduPilot drones.")
+        left, right = st.columns([1, 1.3], gap="large")
+        with left:
+            kind = st.segmented_control("Mission", ["scout", "spray"], default="scout", key="ov_mission_kind",
+                                        format_func=lambda k: {"scout": "Scout the field", "spray": "Spray flagged zones"}[k])
+            if st.button("Plan mission files", icon=":material/route:", key="ov_plan_mission"):
+                try:
+                    st.session_state["ov_missions"] = _post("/swarm/mission-files", {"kind": kind or "scout"}, timeout=60)
+                except Exception as e:
+                    st.session_state["ov_missions"] = {"error": str(e)}
+            res = st.session_state.get("ov_missions")
+            if res and "error" in res:
+                st.error(f"Could not plan the mission: {res['error']}")
+            elif res:
+                ms = res.get("missions", {})
+                if not ms:
+                    st.info("Nothing to fly: no zone needs this mission right now.")
+                else:
+                    import io
+                    import zipfile
+                    buf = io.BytesIO()
+                    with zipfile.ZipFile(buf, "w") as z:
+                        for d_id, m in ms.items():
+                            z.writestr(f"{res['kind']}_{d_id}.waypoints", m["waypoints"])
+                    st.download_button(f"Download {len(ms)} mission file(s) (.zip)", buf.getvalue(),
+                                       f"paddytwin_{res['kind']}_missions.zip", "application/zip",
+                                       type="primary", use_container_width=True)
+                    st.caption(" · ".join(f"{d}: {m['items']} waypoints" for d, m in ms.items())
+                               + (f" · {len(res['unassigned'])} task(s) unassigned" if res.get("unassigned") else ""))
+        with right:
+            st.markdown("**Pre-flight checklist**")
+            try:
+                w = _get("/ue5/frame?since=0").get("weather") or {}
+            except Exception:
+                w = {}
+            wind, rain, temp = w.get("wind_speed_m_s"), w.get("precipitation_mm"), w.get("temperature_c")
+            spray = (st.session_state.get("ov_mission_kind") or "scout") == "spray"
+            auto = [("Wind", wind is not None and wind <= (5.0 if spray else 10.0),
+                     f"{wind:.1f} m/s" if wind is not None else "unknown",
+                     "spraying drifts above ~5 m/s" if spray else "above ~10 m/s is unsafe to fly"),
+                    ("Rain", rain is not None and rain <= 1.0, f"{rain:.1f} mm today" if rain is not None else "unknown",
+                     "rain washes the spray off and grounds most drones"),
+                    ("Heat", temp is not None and temp <= 35.0, f"{temp:.0f} °C" if temp is not None else "unknown",
+                     "spray evaporates in strong heat: fly early morning or evening")]
+            for name, ok, val, why in auto:
+                icon = "✅" if ok else "⚠️"
+                st.markdown(f"{icon} **{name}:** {val}" + ("" if ok else f" <span style='color:{C['amber']}'>({why})</span>"),
+                            unsafe_allow_html=True)
+            done = sum(st.checkbox(t, key=f"ov_chk_{i}") for i, t in enumerate(MANUAL_CHECKS))
+            if done == len(MANUAL_CHECKS) and all(ok for _, ok, _, _ in auto):
+                st.success("All checks passed. Ready to fly.", icon=":material/check_circle:")
+            else:
+                st.caption(f"{done}/{len(MANUAL_CHECKS)} manual checks done.")
 
 
 def _error_chart(m) -> None:

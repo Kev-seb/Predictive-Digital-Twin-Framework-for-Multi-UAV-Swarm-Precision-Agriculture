@@ -2633,35 +2633,117 @@ if show_page(7):
                     for a in day_actions:
                         st.markdown(f"- {a}")
                         
-            # Export GIS VRA map
-            st.subheader("Export Precision Agriculture GIS Layer")
-            st.markdown(
-                "Export variable-rate application maps in standard GIS GeoJSON format. "
-                "This format is directly compatible with modern onboard tractor computer control units."
-            )
-            
-            # Generate export path
-            export_path = "outputs/prescriptions/field_vra_prescription.geojson"
-            recommender.export_gis_geojson(
-                prescriptions=prescriptions,
-                zone_labels=zone_labels,
-                center_lat=lat,
-                center_lon=lon,
-                output_file=export_path
-            )
-            
+            # Prescription maps for field machines (src/gis/prescription_export.py)
+            st.subheader("Prescription map for your machines")
+            st.markdown("One polygon per management zone, traced with the uploaded image's georeference, with "
+                        "numeric rates (`N_KG_HA`, `P_KG_HA`, `K_KG_HA`, `IRR_MM`, `FUNG_L_HA`) that variable-rate "
+                        "controllers and spray drones read.")
+            from src.gis import prescription_export as _pe
+            cell_m = st.select_slider("Prescription cell size", options=[1.0, 2.0, 3.0, 5.0, 10.0], value=2.0,
+                                      format_func=lambda v: f"{v:g} m",
+                                      help="Each cell takes its majority zone. Match it to your sprayer or "
+                                           "drone swath; smaller cells give finer, larger files.")
             try:
-                with open(export_path, "r") as f:
-                    geojson_data = f.read()
-                    
-                st.download_button(
-                    label="Download VRA GIS Layer (GeoJSON)",
-                    data=geojson_data,
-                    file_name="field_vra_prescription.geojson",
-                    mime="application/geo+json"
-                )
-            except FileNotFoundError:
-                st.error("GeoJSON export failed. File not found.")
+                _gdf = _pe.zones_gdf(zone_labels, _pe.zone_rates(prescriptions),
+                                     image=st.session_state.get("ms_image"), center=(lat, lon), cell_m=cell_m)
+                _sum = _pe.summary(_gdf)
+                e1, e2, e3, e4 = st.columns(4)
+                e1.metric("Field area", f"{_sum['area_ha']:.2f} ha")
+                e2.metric("Nitrogen to apply", f"{_sum['N_KG_total']:.1f} kg")
+                e3.metric("Fungicide to apply", f"{_sum['FUNG_L_total']:.3g} L",
+                          help=f"Sprayed on {_sum['FUNG_area_ha']:.2f} ha only")
+                e4.metric("Zones", f"{len(_gdf)}")
+                st.dataframe(_gdf.drop(columns="geometry"), hide_index=True, use_container_width=True)
+                stem = (st.session_state.get("field_name") or "field").rsplit(".", 1)[0].replace(" ", "_")
+                d1, d2, d3, d4, d5 = st.columns(5)
+                d1.download_button("Shapefile (.zip)", _pe.to_shapefile_zip(_gdf, f"{stem}_prescription"),
+                                   f"{stem}_prescription_shp.zip", "application/zip", use_container_width=True,
+                                   help="DJI Terra / Agras, John Deere Operations Center, most VRA controllers")
+                d2.download_button("ISOXML (ISOBUS)", _pe.to_isoxml_zip(_gdf, f"{stem} prescription", stem),
+                                   f"{stem}_TASKDATA.zip", "application/zip", use_container_width=True,
+                                   help="Basic ISO 11783-10 task: test on your terminal before field use")
+                d3.download_button("GeoJSON", _pe.to_geojson(_gdf), f"{stem}_prescription.geojson",
+                                   "application/geo+json", use_container_width=True)
+                d4.download_button("KML (Google Earth)", _pe.to_kml(_gdf, f"{stem} prescription"),
+                                   f"{stem}_prescription.kml", "application/vnd.google-earth.kml+xml",
+                                   use_container_width=True)
+                d5.download_button("CSV", _pe.to_csv(_gdf), f"{stem}_prescription.csv", "text/csv",
+                                   use_container_width=True)
+                if st.session_state.get("field_geo") is None:
+                    st.caption("This image has no georeference, so the map is centred on the Field settings "
+                               "location with 5 cm pixels. Use a georeferenced GeoTIFF for real field work.")
+            except Exception as _e:
+                st.error(f"Could not build the prescription map: {_e}")
+
+            # Costs and returns in rupees (src/ai_engine/economics.py)
+            if "_gdf" in dir() and _gdf is not None and len(_gdf):
+                from src.ai_engine import economics as _econ
+                st.subheader("Costs and returns (₹)")
+                _pr = st.session_state.setdefault("prices", _econ.Prices())
+                with st.expander("Your prices", icon=":material/currency_rupee:"):
+                    st.caption("Typical Indian prices to start from. Replace them with what you pay and receive.")
+                    q1, q2, q3 = st.columns(3)
+                    _pr.paddy_rs_quintal = q1.number_input("Paddy price (₹/quintal)", 0.0, 10000.0,
+                                                           _pr.paddy_rs_quintal, 10.0, help="MSP common grade")
+                    _pr.urea_rs_bag45 = q2.number_input("Urea (₹ per 45 kg bag)", 0.0, 5000.0, _pr.urea_rs_bag45, 1.0)
+                    _pr.dap_rs_bag50 = q3.number_input("DAP (₹ per 50 kg bag)", 0.0, 5000.0, _pr.dap_rs_bag50, 10.0)
+                    _pr.mop_rs_bag50 = q1.number_input("MOP (₹ per 50 kg bag)", 0.0, 5000.0, _pr.mop_rs_bag50, 10.0)
+                    _pr.fungicide_rs_l = q2.number_input("Fungicide (₹ per litre)", 0.0, 20000.0,
+                                                         _pr.fungicide_rs_l, 50.0)
+                    _pr.drone_rs_acre = q3.number_input("Drone spraying hire (₹ per acre)", 0.0, 5000.0,
+                                                        _pr.drone_rs_acre, 10.0)
+                _gain = None
+                try:
+                    from src.dashboard import twin_link as _tl
+                    _f = _tl._request("GET", "/ue5/frame?since=-1", timeout=15.0)
+                    if (_f.get("field_source") or {}).get("source") == "upload" and _f.get("metrics"):
+                        _h = _f["metrics"]["harvest_t_ha"]
+                        _gain = max(0.0, _h["in_7d_if_sprayed"] - _h["in_7d_no_spray"])
+                except Exception:
+                    pass
+                _ec = _econ.plan_economics(_sum, float(_gdf["FUNG_L_HA"].max()), _pr, _gain)
+                r1, r2, r3, r4 = st.columns(4)
+                r1.metric("Cost of this plan", f"₹{_ec['plan_total_rs']:,.0f}",
+                          help=f"Fertiliser ₹{_ec['fertiliser_rs']:,.0f} + spraying ₹{_ec['spray_rs']:,.0f}")
+                r2.metric("Spraying the whole field", f"₹{_ec['blanket_spray_rs']:,.0f}",
+                          help=f"{_ec['blanket_fungicide_l']:.2f} L at the highest zone rate on every hectare")
+                r3.metric("Saved by targeting", f"₹{_ec['spray_saving_rs']:,.0f}",
+                          delta=f"{_ec['fungicide_saved_pct']:.0f}% less fungicide" if _ec["blanket_fungicide_l"] else None)
+                if _gain is not None:
+                    r4.metric("Yield value protected", f"₹{_ec['yield_value_rs']:,.0f}",
+                              delta=f"net ₹{_ec['net_benefit_rs']:,.0f}",
+                              help="From the live twin's 7-day forecast: harvest if sprayed minus harvest if not, "
+                                   "times field area and paddy price")
+                else:
+                    r4.metric("Yield value protected", "–",
+                              help="Send the field to the live twin (Upload step) to price the yield it protects")
+
+            # Field tasks: plan -> done -> verified
+            st.subheader("Field tasks")
+            st.caption("Track each action from plan to done to verified. Mark a task **Verified** once a later "
+                       "scout flight (or a leaf check) confirms the zone improved.")
+            _tkey = f"tasks::{st.session_state.get('field_name', 'field')}::{report.timestamp}"
+            if _tkey not in st.session_state:
+                st.session_state[_tkey] = pd.DataFrame([{
+                    "Zone": a.zone_name, "Action": a.action_type, "Dose": a.action_dosage,
+                    "Planned day": f"Day {a.suggested_day}", "Priority": a.priority, "Status": "Planned",
+                    "Done on": None, "Note": ""} for a in report.actions if a.action_type != "No Action"])
+            _tasks = st.data_editor(
+                st.session_state[_tkey], key=f"ed_{_tkey}", hide_index=True, use_container_width=True,
+                disabled=["Zone", "Action", "Dose", "Planned day", "Priority"],
+                column_config={"Status": st.column_config.SelectboxColumn("Status", options=["Planned", "Done", "Verified"],
+                                                                          required=True),
+                               "Done on": st.column_config.DateColumn("Done on"),
+                               "Note": st.column_config.TextColumn("Note", width="medium")})
+            st.session_state[_tkey] = _tasks
+            if len(_tasks):
+                _c = _tasks["Status"].value_counts()
+                t1, t2, t3, t4 = st.columns([1, 1, 1, 1.4])
+                t1.metric("Planned", int(_c.get("Planned", 0)))
+                t2.metric("Done", int(_c.get("Done", 0)))
+                t3.metric("Verified", int(_c.get("Verified", 0)))
+                t4.download_button("Download task list (CSV)", _tasks.to_csv(index=False).encode("utf-8"),
+                                   "field_tasks.csv", "text/csv", use_container_width=True)
 
 # ══════════════════════════════════════════════════════════════
 # TAB 9 — Spatial Reconstruction (UAV Photogrammetry)
