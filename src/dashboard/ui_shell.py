@@ -58,6 +58,7 @@ STEP_ACTION = {"weather": "Press **Fetch Weather Data** above: the twin forecast
                "optimizer": "Press **Run AI Optimization Solver** above: the report includes its treatment plan."}
 
 NAV: list[tuple[str, list[Page]]] = [
+    ("Home", [Page("farm", "Farm home", ":material/home:", None, "The field in plain words, and what to do")]),
     ("Workflow", WORKFLOW),
     ("Live operations", [
         Page("overview", "Live twin & drones", ":material/space_dashboard:", None, "Live mission control for the field twin"),
@@ -75,6 +76,15 @@ NAV: list[tuple[str, list[Page]]] = [
 ]
 WORKFLOW_KEYS = [p.key for p in WORKFLOW]
 NEEDS_FIELD = set(WORKFLOW_KEYS[1:]) | {"temporal", "reconstruction"}
+
+# Who sees what. Researcher (default) sees everything; a farmer gets a short, simple menu.
+ROLES = {"farmer": "role_farmer", "agronomist": "role_agronomist", "research": "role_research"}
+ROLE_PAGES = {
+    "farmer": ["farm", "upload", "leafcheck", "optimizer", "overview"],
+    "agronomist": ["farm"] + WORKFLOW_KEYS + ["overview", "leafcheck", "swarm", "uav", "livefield"],
+    "research": None,
+}
+ROLE_HOME = {"farmer": "farm", "agronomist": "farm", "research": "upload"}
 
 PAGES = {p.key: p for _, pages in NAV for p in pages}
 GROUP_OF = {p.key: g for g, pages in NAV for p in pages}
@@ -225,14 +235,46 @@ def _set_page(key: str) -> None:
     st.query_params["page"] = key
 
 
+def role() -> str:
+    if "pt_role" not in st.session_state:
+        q = st.query_params.get("role", "research")
+        st.session_state["pt_role"] = q if q in ROLES else "research"
+    return st.session_state["pt_role"]
+
+
+def visible(key: str) -> bool:
+    allowed = ROLE_PAGES[role()]
+    return allowed is None or key in allowed
+
+
 def current_page() -> str:
+    home = ROLE_HOME[role()]
     if "pt_page" not in st.session_state:
-        q = st.query_params.get("page", "upload")
-        st.session_state["pt_page"] = q if q in PAGES else "upload"
+        q = st.query_params.get("page", home)
+        st.session_state["pt_page"] = q if q in PAGES else home
     page = st.session_state["pt_page"]
+    if not visible(page):
+        page = st.session_state["pt_page"] = home
     if page in NEEDS_FIELD and not has_field():
         page = st.session_state["pt_page"] = "upload"      # every step starts from the uploaded field
     return page
+
+
+def _on_role_change() -> None:
+    r = st.session_state["pt_role"]
+    st.query_params["role"] = r
+    st.session_state["pt_page"] = ROLE_HOME[r]
+
+
+def _role_lang_selectors() -> None:
+    """The widgets own pt_role / pt_lang (role() seeds pt_role from ?role= on the first run)."""
+    from src.dashboard.i18n import LANGS, t
+    role()
+    st.session_state.setdefault("pt_lang", "en")
+    c1, c2 = st.sidebar.columns(2)
+    c1.selectbox(t("view"), list(ROLES), format_func=lambda k: t(ROLES[k]), key="pt_role",
+                 on_change=_on_role_change)
+    c2.selectbox(t("language"), list(LANGS), format_func=lambda k: LANGS[k], key="pt_lang")
 
 
 def has_field() -> bool:
@@ -263,21 +305,28 @@ def sidebar_nav() -> str:
         f'<div class="pt-brand"><div class="pt-logo">PT</div><div>'
         f'<div class="pt-brand-name">{APP_NAME}</div><div class="pt-brand-sub">{APP_TAGLINE}</div></div></div>',
         unsafe_allow_html=True)
+    _role_lang_selectors()
     if field:
         name = st.session_state.get("field_name", "Field")
         st.sidebar.markdown(f'<div class="pt-fieldcard"><span class="pt-dot" style="background:{C["accent"]}"></span>'
                             f'<b>{name}</b></div>', unsafe_allow_html=True)
-    for group, pages in NAV:
+    for group, all_pages in NAV:
+        pages = [p for p in all_pages if visible(p.key)]
+        if not pages:
+            continue
         done_n = sum(step_done(p.key) for p in pages) if group == "Workflow" else None
-        label = f"{group} &nbsp;<span class='pt-navcount'>{done_n}/{len(pages)}</span>" if done_n is not None else group
+        from src.dashboard.i18n import T as _T, t as _t
+        gname = _t(f"grp_{group}") if f"grp_{group}" in _T else group
+        label = f"{gname} &nbsp;<span class='pt-navcount'>{done_n}/{len(pages)}</span>" if done_n is not None else gname
         st.sidebar.markdown(f'<div class="pt-navgroup">{label}</div>', unsafe_allow_html=True)
         for i, p in enumerate(pages):
             locked = p.key in NEEDS_FIELD and not field
+            plabel = _t(f"nav_{p.key}") if f"nav_{p.key}" in _T else p.label
             if group == "Workflow":
                 mark = "✓" if step_done(p.key) else str(i + 1)
-                text = f"{mark}   {p.label}"
+                text = f"{mark}   {plabel}"
             else:
-                text = p.label
+                text = plabel
             st.sidebar.button(text, key=f"nav_{p.key}", icon=None if group == "Workflow" else p.icon,
                               on_click=_set_page, args=(p.key,), disabled=locked,
                               help="Upload a field image first" if locked else p.blurb,

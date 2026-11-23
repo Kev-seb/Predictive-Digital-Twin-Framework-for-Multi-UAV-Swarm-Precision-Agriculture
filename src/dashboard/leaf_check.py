@@ -34,11 +34,11 @@ def _send_to_twin(row: int, col: int, fungal: float, label: str) -> tuple[bool, 
 
 def render() -> None:
     from src.ai_engine import leaf_disease as ld
+    from src.dashboard.i18n import t
     st.markdown('<div class="pt-crumb">Live operations &nbsp;›&nbsp; <b>Leaf disease check</b></div>',
                 unsafe_allow_html=True)
-    st.header("Leaf disease check")
-    st.markdown("Take or upload a **close-up photo of one rice leaf**. The AI suggests the most likely disease, "
-                "and you can add the finding to the live twin at the spot where the leaf was taken.")
+    st.header(t("leaf_title"))
+    st.markdown(t("leaf_intro"))
     if not ld.available():
         st.warning("The disease model has not been trained yet: run `python research/10_train_disease_model.py`.")
         return
@@ -73,17 +73,16 @@ def render() -> None:
         top = results[0]
         conf = top["probability"]
         colour = C["accent"] if top["disease"] == "Healthy" else (C["red"] if conf >= 0.6 else C["amber"])
-        st.markdown(f"<div class='pt-kpi'><div class='pt-kpi-label'>Most likely</div>"
-                    f"<div class='pt-kpi-value' style='color:{colour}'>{top['disease']}</div>"
+        st.markdown(f"<div class='pt-kpi'><div class='pt-kpi-label'>{t('leaf_most_likely')}</div>"
+                    f"<div class='pt-kpi-value' style='color:{colour}'>{t(top['disease'])}</div>"
                     f"<div class='pt-kpi-foot'>{conf * 100:.0f}% confidence · {top.get('kind', '')}</div></div>",
                     unsafe_allow_html=True)
         if conf < 0.5:
-            st.warning("The model is unsure about this photo. Take another, closer photo in daylight, or ask an "
-                       "agronomist.", icon=":material/help:")
+            st.warning(t("leaf_unsure"), icon=":material/help:")
         st.markdown(f"**What it means:** {top.get('note', '')}")
         st.markdown("**Other possibilities**")
         for r in results[1:3]:
-            st.progress(min(1.0, r["probability"]), text=f"{r['disease']} · {r['probability'] * 100:.0f}%")
+            st.progress(min(1.0, r["probability"]), text=f"{t(r['disease'])} · {r['probability'] * 100:.0f}%")
         fungal = ld.fungal_probability(results)
 
         with st.container(border=True):
@@ -97,8 +96,7 @@ def render() -> None:
                 ok, msg = _send_to_twin(int(row), int(col), fungal, top["disease"])
                 (st.success if ok else st.warning)(msg)
         st.caption(f"Model tested on leaves it never saw: {ev.get('test_accuracy', 0) * 100:.0f}% overall, "
-                   f"{(ev.get('field_photos_accuracy') or 0) * 100:.0f}% on real field photos. A photo is not a "
-                   "diagnosis: confirm with an agronomist before treating.")
+                   f"{(ev.get('field_photos_accuracy') or 0) * 100:.0f}% on real field photos. " + t("leaf_not_diagnosis"))
         _credits(card)
 
 
