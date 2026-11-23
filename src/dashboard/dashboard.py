@@ -855,9 +855,11 @@ if show_page(0):
         except Exception:
             return None
 
-    def _set_field(img, name, source, flight=False):
-        """flight=True: a new flight of the loaded field (the twin is updated, not replaced)."""
+    def _set_field(img, name, source, flight=False, path=None, report=None, saved_field_id=None):
+        """flight=True: a new flight of the loaded field (the twin is updated, not replaced).
+        path: the GeoTIFF, saved to the field store; saved_field_id: reopening a saved field (no new save)."""
         idx_new = compute_all_indices(img.bands)
+        st.session_state["load_report"] = report
         if not flight:
             st.session_state["field_name"] = name
             st.session_state["flights"] = []
@@ -880,12 +882,57 @@ if show_page(0):
         ui_shell.mark_done("upload")
         from src.dashboard import twin_link
         st.session_state["field_footprint"] = twin_link.footprint_m(img)
+        # field store: every field and flight is kept (outputs/paddytwin.db)
+        from src.storage import field_store as _fs
+        if saved_field_id is not None:
+            st.session_state["field_id"] = saved_field_id
+        elif source != "demo":
+            try:
+                fp = st.session_state["field_footprint"] or (None, None)
+                if not flight or "field_id" not in st.session_state:
+                    st.session_state["field_id"] = _fs.create_field(name, *(geo or (None, None)), *fp)
+                _fs.add_flight(st.session_state["field_id"], name, path,
+                               float(np.nanmean(idx_new["ndvi"])), float(np.nanmean(idx_new["stress_score"])),
+                               (report or {}).get("units", ""))
+            except Exception as _e:
+                st.warning(f"The field could not be saved: {_e}")
+        else:
+            st.session_state.pop("field_id", None)
         with st.spinner("Sending the field to the live twin..."):
             st.session_state["twin_link"] = twin_link.push_field(
                 img, st.session_state["field_name"] if flight else name, geo, crop_stage,
                 mode="update" if flight else "new")
 
     has_field = "ms_image" in st.session_state
+    from src.storage import field_store as _fs
+    _saved = _fs.list_fields()
+    if _saved:
+        with st.expander(f"Your saved fields ({len(_saved)})", icon=":material/folder_open:",
+                         expanded=not has_field):
+            _labels = {f["id"]: f"{f['name']} · {f['flights']} flight(s) · "
+                                f"{pd.Timestamp(f['last_flight'] or f['created'], unit='s').strftime('%d %b %Y %H:%M')}"
+                       for f in _saved}
+            _pick = st.selectbox("Field", list(_labels), format_func=_labels.get, key="saved_field_pick")
+            _o1, _o2 = st.columns(2)
+            if _o1.button("Open this field", icon=":material/open_in_new:", type="primary", use_container_width=True):
+                _fl = _fs.flights(_pick)
+                _last = next((x for x in reversed(_fl) if x["path"] and Path(x["path"]).exists()), None)
+                if _last is None:
+                    st.error("This field's image files are missing.")
+                else:
+                    from src.core.field_image import load_field_image
+                    _img, _rep = load_field_image(_last["path"])
+                    _fname = next(f["name"] for f in _saved if f["id"] == _pick)
+                    _set_field(_img, _fname, "saved", report=_rep, saved_field_id=_pick)
+                    st.session_state["flights"] = [{"Flight": i + 1, "Image": x["name"],
+                                                    "Loaded": pd.Timestamp(x["loaded_at"], unit="s").strftime("%Y-%m-%d %H:%M"),
+                                                    "NDVI mean": round(x["ndvi_mean"] or 0, 3),
+                                                    "Stress score": round(x["stress_mean"] or 0, 3)}
+                                                   for i, x in enumerate(_fl)]
+                    st.rerun()
+            if _o2.button("Delete this field", icon=":material/delete:", use_container_width=True):
+                _fs.delete_field(_pick)
+                st.rerun()
     with st.container(border=True):
         up_l, up_r = st.columns([3, 2], gap="large")
         with up_l:
@@ -921,7 +968,9 @@ if show_page(0):
             tmp_path = Path(tempfile.gettempdir()) / f"uploaded_{uploaded.file_id}.tif"
             tmp_path.write_bytes(uploaded.getvalue())
             try:
-                _set_field(load_multispectral_tiff(tmp_path), uploaded.name, "upload", flight=as_flight)
+                from src.core.field_image import load_field_image
+                _img, _rep = load_field_image(tmp_path)
+                _set_field(_img, uploaded.name, "upload", flight=as_flight, path=tmp_path, report=_rep)
                 st.session_state["upload_id"] = uploaded.file_id
                 new_field = True
             except Exception as e:
@@ -929,7 +978,9 @@ if show_page(0):
     elif sample_btn:
         _sample = Path(__file__).resolve().parents[2] / "data" / "samples" / "sample_paddy.tif"
         try:
-            _set_field(load_multispectral_tiff(_sample), _sample.name, "sample")
+            from src.core.field_image import load_field_image
+            _img, _rep = load_field_image(_sample)
+            _set_field(_img, _sample.name, "sample", path=_sample, report=_rep)
             new_field = True
         except Exception as e:
             st.error(f"Sample GeoTIFF not available: {e}")
@@ -967,6 +1018,13 @@ if show_page(0):
         if geo is None:
             st.caption("This image has no georeference: set the field location under **Field settings** in the "
                        "sidebar for the weather step.")
+        _lr = st.session_state.get("load_report")
+        if _lr:
+            st.caption(f"Read as {_lr['units']}; {_lr['used_px'][0]} × {_lr['used_px'][1]} px used"
+                       + (f" (from {_lr['original_px'][0]} × {_lr['original_px'][1]})" if _lr["downsampled"] else "")
+                       + f"; NDVI 5th–95th percentile {_lr['ndvi_p5']:.2f} – {_lr['ndvi_p95']:.2f}.")
+            for _w in _lr["warnings"]:
+                st.warning(_w, icon=":material/report:")
         link = st.session_state.get("twin_link")
         if link:
             (st.info if link[0] else st.warning)(link[1], icon=":material/hub:" if link[0] else ":material/cloud_off:")
@@ -2726,6 +2784,12 @@ if show_page(7):
             st.caption("Track each action from plan to done to verified. Mark a task **Verified** once a later "
                        "scout flight (or a leaf check) confirms the zone improved.")
             _tkey = f"tasks::{st.session_state.get('field_name', 'field')}::{report.timestamp}"
+            _fid = st.session_state.get("field_id")
+            if _tkey not in st.session_state and _fid is not None:
+                from src.storage import field_store as _fs
+                _stored = _fs.load_tasks(_fid)
+                if _stored:
+                    st.session_state[_tkey] = pd.DataFrame(_stored)
             if _tkey not in st.session_state:
                 st.session_state[_tkey] = pd.DataFrame([{
                     "Zone": a.zone_name, "Action": a.action_type, "Dose": a.action_dosage,
@@ -2739,6 +2803,10 @@ if show_page(7):
                                "Done on": st.column_config.DateColumn("Done on"),
                                "Note": st.column_config.TextColumn("Note", width="medium")})
             st.session_state[_tkey] = _tasks
+            if _fid is not None:
+                from src.storage import field_store as _fs
+                _fs.save_tasks(_fid, _tasks.to_dict("records"))
+                st.caption("Saved with this field.")
             if len(_tasks):
                 _c = _tasks["Status"].value_counts()
                 t1, t2, t3, t4 = st.columns([1, 1, 1, 1.4])
