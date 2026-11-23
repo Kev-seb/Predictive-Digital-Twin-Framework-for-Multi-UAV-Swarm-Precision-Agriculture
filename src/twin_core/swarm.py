@@ -48,6 +48,24 @@ MISSION_OVERHEAD_S = 21.0       # take-off, climbs and descents, landing
 WORK_SPEED_M_S = 5.0            # scouting / spraying lanes
 TRANSIT_SPEED_M_S = 6.0         # to and from the work, climbs and descents
 LANE_SETTLE_S = 1.0             # extra pump-on time per lane end (carrot catch-up)
+# Field limits: spray drift above ~5 m/s (label guidance for drone spraying); small
+# multirotors lose control margin above ~10 m/s. Wind costs time and energy: a round
+# trip at airspeed v against wind w takes 1 / (1 - (w/v)^2) longer, and holding
+# position costs extra thrust ~ (w/v)^2.
+SPRAY_WIND_MAX_M_S = 5.0
+SCOUT_WIND_MAX_M_S = 10.0
+AIRSPEED_MAX_M_S = 12.0
+REFILL_S = 120.0                # land, refill the tank, swap the battery, take off
+
+
+def wind_factors(wind_m_s: float) -> Tuple[float, float]:
+    """(time factor, battery drain factor) for flying in a steady wind."""
+    r = min(0.8, max(0.0, wind_m_s) / AIRSPEED_MAX_M_S) ** 2
+    return 1.0 / (1.0 - r), 1.0 + r
+
+
+def wind_limit(kind: str) -> float:
+    return SPRAY_WIND_MAX_M_S if kind == "spray" else SCOUT_WIND_MAX_M_S
 
 
 @dataclass
@@ -88,18 +106,21 @@ class Assignment:
     est_time_s: float = 0.0
     est_battery_pct: float = 0.0
     payload_kg: float = 0.0
+    sorties: int = 1                # > 1: the drone lands to refill and swap batteries
 
     def to_dict(self) -> Dict[str, Any]:
         return {"drone_id": self.drone_id, "tasks": [t.task_id for t in self.tasks],
                 "est_time_s": round(self.est_time_s, 1),
                 "est_battery_pct": round(self.est_battery_pct, 1),
-                "payload_kg": round(self.payload_kg, 3)}
+                "payload_kg": round(self.payload_kg, 3), "sorties": self.sorties if self.tasks else 0}
 
 
 @dataclass
 class Plan:
     assignments: Dict[str, Assignment]
     unassigned: List[Task]
+    wind_m_s: float = 0.0
+    blocked: Optional[str] = None   # why nothing can fly (e.g. too windy to spray)
 
     @property
     def makespan_s(self) -> float:
@@ -108,7 +129,8 @@ class Plan:
     def to_dict(self) -> Dict[str, Any]:
         return {"makespan_s": round(self.makespan_s, 1),
                 "assignments": {k: a.to_dict() for k, a in self.assignments.items()},
-                "unassigned": [t.to_dict() for t in self.unassigned]}
+                "unassigned": [t.to_dict() for t in self.unassigned],
+                "wind_m_s": round(self.wind_m_s, 1), "blocked": self.blocked}
 
 
 # ====================================================================== geometry
@@ -203,10 +225,14 @@ def tasks_from_twin(twin, kind: str, frame: LocalFrame, spec: DroneSpec = DroneS
 
 # ==================================================================== allocation
 def _estimate(start: Tuple[float, float], tasks: List[Task], home: Tuple[float, float],
-              speed: float = PLANNING_SPEED_M_S) -> Tuple[float, float]:
+              speed: float = PLANNING_SPEED_M_S, wind_m_s: float = 0.0) -> Tuple[float, float]:
     """(time_s, battery_pct) for flying ``tasks`` in order from ``start`` and back home."""
     if not tasks:
         return 0.0, 0.0
+    if wind_m_s > 0:
+        tf, df = wind_factors(wind_m_s)
+        t, pct = _estimate(start, tasks, home, speed)
+        return t * tf, pct * tf * df
     pos, t, spray_t = start, MISSION_OVERHEAD_S, 0.0
     for task in tasks:
         t += _dist(pos, task.legs[0]) / speed
@@ -217,6 +243,55 @@ def _estimate(start: Tuple[float, float], tasks: List[Task], home: Tuple[float, 
         pos = task.legs[-1]
     t += _dist(pos, home) / speed
     return t, t * DRAIN_FLY_PCT_S + spray_t * DRAIN_SPRAY_PCT_S
+
+
+def _estimate_sorties(home: Tuple[float, float], tasks: List[Task], tank_kg: float,
+                      speed: float = PLANNING_SPEED_M_S, wind_m_s: float = 0.0) -> Tuple[float, float, int]:
+    """
+    (time_s, worst sortie battery_pct, sorties) when the drone returns to its pad
+    to refill and swap batteries whenever the next task would overflow the tank.
+    """
+    if not tasks:
+        return 0.0, 0.0, 0
+    sorties = sortie_groups(tasks, tank_kg)
+    total, worst = 0.0, 0.0
+    for chunk in sorties:
+        t_s, pct = _estimate(home, chunk, home, speed, wind_m_s)
+        total += t_s
+        worst = max(worst, pct)
+    return total + REFILL_S * (len(sorties) - 1), worst, len(sorties)
+
+
+def sortie_groups(tasks: List[Task], tank_kg: float) -> List[List[Task]]:
+    """The tasks of one drone cut into sorties, each within one tank."""
+    groups: List[List[Task]] = [[]]
+    load = 0.0
+    for t in tasks:
+        if groups[-1] and load + t.payload_kg > tank_kg + 1e-9:
+            groups.append([])
+            load = 0.0
+        groups[-1].append(t)
+        load += t.payload_kg
+    return [g for g in groups if g]
+
+
+def split_for_tank(task: Task, tank_kg: float) -> List[Task]:
+    """Split a spray task whose dose exceeds one tank into lane groups that each fit."""
+    if task.payload_kg <= tank_kg + 1e-9 or len(task.legs) < 4:
+        return [task]
+    lanes = [task.legs[k:k + 2] for k in range(0, len(task.legs) - 1, 2)]
+    k = min(len(lanes), math.ceil(task.payload_kg / tank_kg))
+    while True:
+        size = math.ceil(len(lanes) / k)
+        groups = [lanes[i:i + size] for i in range(0, len(lanes), size)]
+        total = sum(_dist(*lane) for lane in lanes)
+        loads = [task.payload_kg * sum(_dist(*lane) for lane in g) / max(total, 1e-9) for g in groups]
+        if max(loads) <= tank_kg + 1e-9 or size == 1:
+            break
+        k += 1
+    return [Task(f"{task.task_id}.{i + 1}", task.kind, task.zone_id, [p for lane in g for p in lane],
+                 task.priority, round(load, 3), task.alt_m)
+            for i, (g, load) in enumerate(zip(groups, loads))]
 
 
 def _orient(route: List[Task], start: Tuple[float, float]) -> List[Task]:
@@ -289,7 +364,7 @@ def _coverage_partition(tasks: List[Task], drones: Dict[str, Dict[str, Any]],
 
 
 def allocate(tasks: List[Task], drones: Dict[str, Dict[str, Any]],
-             speed: float = PLANNING_SPEED_M_S) -> Plan:
+             speed: float = PLANNING_SPEED_M_S, wind_m_s: float = 0.0, refills: bool = False) -> Plan:
     """
     Greedy min-makespan allocation with cheapest insertion. ``drones`` maps
     id -> {"home": (x, y), "battery": pct, "tank_kg": capacity}. Tasks are
@@ -298,23 +373,47 @@ def allocate(tasks: List[Task], drones: Dict[str, Dict[str, Any]],
     grows least, among drones that keep their battery reserve and tank
     capacity. Inserting (rather than appending) keeps each drone's route
     compact, so drones do not criss-cross the field between zones.
+
+    ``wind_m_s``: steady wind; flights take longer and drain more, and nothing
+    is planned above the spray / scout wind limit (``Plan.blocked`` says why).
+    ``refills``: drones may land to refill and swap batteries between sorties
+    (zones larger than a tank are split into lane groups); without it every
+    drone flies one sortie on one tank and one battery.
     """
-    if tasks and all(t.kind == "scout" for t in tasks):
+    kinds = {t.kind for t in tasks}
+    too_windy = [k for k in sorted(kinds) if wind_m_s > wind_limit(k)]
+    if too_windy:
+        return Plan({d: Assignment(d) for d in drones}, list(tasks), wind_m_s,
+                    f"Wind {wind_m_s:.1f} m/s is above the {too_windy[0]} limit of "
+                    f"{wind_limit(too_windy[0]):.0f} m/s")
+    if refills:
+        tank = min((info.get("tank_kg", 10.0) for info in drones.values()), default=10.0)
+        tasks = [part for t in tasks for part in split_for_tank(t, tank)]
+    if tasks and all(t.kind == "scout" for t in tasks) and wind_m_s <= 0:
         plan = _coverage_partition(tasks, drones, speed)
         if plan is not None:
             return plan
+
+    def cost(info, route):
+        if refills:
+            t, pct, n = _estimate_sorties(info["home"], route, info.get("tank_kg", 10.0), speed, wind_m_s)
+            return t, pct, n, 100.0
+        t, pct = _estimate(info["home"], route, info["home"], speed, wind_m_s)
+        return t, pct, 1, info.get("battery", 100.0)
+
     assignments = {d: Assignment(d) for d in drones}
     unassigned: List[Task] = []
     for task in sorted(tasks, key=lambda t: -t.priority):
         best, best_time, best_pos = None, math.inf, 0
         for d_id, info in drones.items():
             a = assignments[d_id]
-            if a.payload_kg + task.payload_kg > info.get("tank_kg", 10.0) + 1e-9:
+            tank = info.get("tank_kg", 10.0)
+            if (task.payload_kg if refills else a.payload_kg + task.payload_kg) > tank + 1e-9:
                 continue
             for pos in range(len(a.tasks) + 1):
                 route = a.tasks[:pos] + [task] + a.tasks[pos:]
-                t, pct = _estimate(info["home"], route, info["home"], speed)
-                if info.get("battery", 100.0) - pct < BATTERY_RESERVE_PCT:
+                t, pct, _, battery = cost(info, route)
+                if battery - pct < BATTERY_RESERVE_PCT:
                     continue
                 if t < best_time - 1e-9:
                     best, best_time, best_pos = d_id, t, pos
@@ -325,9 +424,8 @@ def allocate(tasks: List[Task], drones: Dict[str, Dict[str, Any]],
         a.tasks.insert(best_pos, task)
         a.tasks = _orient(a.tasks, drones[best]["home"])
         a.payload_kg += task.payload_kg
-        a.est_time_s, a.est_battery_pct = _estimate(drones[best]["home"], a.tasks,
-                                                    drones[best]["home"], speed)
-    return Plan(assignments, unassigned)
+        a.est_time_s, a.est_battery_pct, a.sorties, _ = cost(drones[best], a.tasks)
+    return Plan(assignments, unassigned, wind_m_s)
 
 
 # ========================================================================= fleet

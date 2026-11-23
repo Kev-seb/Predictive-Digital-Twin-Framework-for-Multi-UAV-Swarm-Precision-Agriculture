@@ -85,7 +85,8 @@ from pydantic import BaseModel, Field
 from src.config.config import settings
 from src.twin_core import LAYERS, DigitalTwin, FieldGrid
 from src.twin_core.ingest import bands_to_layers, ingest_multispectral, ingest_rgb_result
-from src.twin_core.swarm import Fleet, allocate, tasks_from_twin
+from src.twin_core.swarm import Assignment, Fleet, allocate, sortie_groups, tasks_from_twin
+from src.twin_core.decisions import scouting_targets, spray_options, zone_risk
 from src.twin_core import mavlink_mission as mm
 from src.twin_core.virtual_field import VirtualField, serpentine_waypoints
 from src.twin_core.weather_feed import get_weather, synthetic_weather
@@ -218,6 +219,12 @@ class MissionRequest(BaseModel):
     dose_l_per_ha:    float = Field(25.0, gt=0.0, le=200.0)
     zones:            Optional[List[int]] = None
     include_track:    bool = False
+    adaptive: bool = Field(False, description="scout only the zones where the twin is unsure "
+                                              "whether the spray threshold is crossed")
+    wind_m_s: Optional[float] = Field(None, ge=0.0, le=40.0,
+                                      description="planning wind; None = the forecast for tomorrow")
+    refills: bool = Field(False, description="allow landing to refill / swap batteries (planning and "
+                                             "mission files only; the in-process flight is one sortie)")
     backend: Literal["physics", "mavlink"] = Field(
         "physics", description="physics = in-process 6-DOF fleet; mavlink = upload and fly over MAVLink "
                                "(UAV_TWIN_MAVLINK_MODE: emulated vehicles or ArduPilot SITL)")
@@ -275,6 +282,17 @@ class WhatIfRequest(BaseModel):
     days:          int = Field(7, ge=1, le=60)
     weather:       Optional[List[Dict[str, float]] | Dict[str, float]] = None
     interventions: List[Intervention] = []
+
+
+class SprayDecisionRequest(BaseModel):
+    zones:             Optional[List[int]] = None
+    fungus_threshold:  float = Field(0.2, ge=0.0, le=1.0)
+    min_infected_frac: float = Field(0.1, gt=0.0, le=1.0)
+    delays:            List[int] = Field([0, 2], description="days to wait before spraying (0 = tomorrow)")
+    horizon_days:      int = Field(21, ge=3, le=60)
+    samples:           int = Field(8, ge=2, le=32)
+    product_l_ha:      float = Field(1.0, gt=0.0, le=10.0, description="formulated fungicide, L/ha")
+    weather_source:    Optional[WeatherSource] = None
 
 
 class StageRequest(BaseModel):
@@ -357,17 +375,34 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
             ctx["mavlink"] = emu
         return dict(emu.connections)
 
-    def plan_mission(kind: str, req: "MissionRequest"):
+    def plan_mission(kind: str, req: "MissionRequest", flying: bool = False):
         fleet, twin = get_fleet(), get_twin()
         if req.zones:
             bad = [z for z in req.zones if z not in twin.zone_names]
             if bad:
                 raise HTTPException(400, f"Unknown zone_id(s) {bad}. Valid: {sorted(twin.zone_names)}")
+        zones = req.zones
+        if kind == "scout" and req.adaptive and not zones:
+            zones = scouting_targets(twin, req.fungus_threshold) or None
         tasks = tasks_from_twin(twin, kind, fleet.frame, fleet.spec,
                                 fungus_threshold=req.fungus_threshold,
-                                dose_l_per_ha=req.dose_l_per_ha, zones=req.zones,
+                                dose_l_per_ha=req.dose_l_per_ha, zones=zones,
                                 min_infected_frac=req.min_infected_frac)
-        return tasks, allocate(tasks, fleet.drone_info())
+        wind = req.wind_m_s
+        if wind is None:
+            wind = 0.0 if flying else planning_wind()   # the in-process flight has no wind
+        return tasks, allocate(tasks, fleet.drone_info(), wind_m_s=wind,
+                               refills=req.refills and not flying)
+
+    def planning_wind() -> float:
+        """Tomorrow's forecast wind (m/s) for a real field; calm for the simulated one."""
+        if not ctx.get("user_field"):
+            return 0.0
+        try:
+            w, _ = forecast("auto", 1, get_twin().state.sim_day + 1)
+            return float(w[0].get("wind_speed", 0.0)) / 3.6
+        except Exception:
+            return 0.0
 
     def forecast(source: str, days: int, start_day: int) -> tuple:
         lat, lon = get_twin().state.grid.center_latlon()
@@ -1042,7 +1077,7 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
         wind = twin.state.last_weather or None
         reports = []
         for kind in (("scout", "spray") if req.kind == "auto" else (req.kind,)):
-            tasks, plan = plan_mission(kind, req)
+            tasks, plan = plan_mission(kind, req, flying=True)
             if req.backend == "mavlink":
                 report = mm.execute_plan_mavlink(
                     plan, fleet.frame, mavlink_connections(), homes=drone_homes(),
@@ -1106,14 +1141,21 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
         _, plan = plan_mission(req.kind, req)
         homes = drone_homes()
         out = {}
+        lane_model = mm.lane_model_for(settings.twin_mavlink_mode, settings.twin_params_file.parent)
         for k, (d_id, a) in enumerate(plan.assignments.items()):
-            if a.tasks:
-                mission = mm.compile_mission(
-                    a, fleet.frame, transit_alt=14.0 + 2.0 * k, home=homes[d_id],
-                    lane_model=mm.lane_model_for(settings.twin_mavlink_mode, settings.twin_params_file.parent))
-                out[d_id] = {"items": len(mission.items), "pump_pwm": mission.spray_pwm,
-                             "waypoints": mm.to_qgc_wpl(mission)}
-        return {"kind": req.kind, "missions": out, "unassigned": [t.task_id for t in plan.unassigned]}
+            if not a.tasks:
+                continue
+            groups = sortie_groups(a.tasks, fleet.spec.tank_kg) if req.refills else [a.tasks]
+            for n, group in enumerate(groups, start=1):
+                part = Assignment(d_id, group, payload_kg=sum(t.payload_kg for t in group))
+                mission = mm.compile_mission(part, fleet.frame, transit_alt=14.0 + 2.0 * k,
+                                             home=homes[d_id], lane_model=lane_model)
+                key = d_id if len(groups) == 1 else f"{d_id}_sortie{n}"
+                out[key] = {"items": len(mission.items), "pump_pwm": mission.spray_pwm,
+                            "waypoints": mm.to_qgc_wpl(mission)}
+        return {"kind": req.kind, "missions": out, "unassigned": [t.task_id for t in plan.unassigned],
+                "blocked": plan.blocked, "wind_m_s": plan.wind_m_s,
+                "est_time_s": round(plan.makespan_s, 1)}
 
     @app.get("/swarm/sitl-homes", summary="One ArduCopter SITL instance per drone, at its launch pad")
     def swarm_sitl_homes():
@@ -1204,7 +1246,7 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
     async def fly(kind: str, req: DemoRequest) -> Dict[str, Any]:
         mreq = MissionRequest(kind=kind, backend=req.backend, fungus_threshold=req.fungus_threshold)
         fleet = get_fleet()
-        tasks, plan = plan_mission(kind, mreq)
+        tasks, plan = plan_mission(kind, mreq, flying=True)
         if not tasks:
             return {"tasks": 0}
         if req.backend == "mavlink":
@@ -1419,6 +1461,24 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
         _check_zones(twin, req.interventions)
         return twin.what_if(days=req.days, weather=req.weather,
                             interventions=[i.model_dump() for i in req.interventions])
+
+    @app.post("/twin/spray-decision", summary="Spray now, later or not at all: rupees, risk and timing")
+    def twin_spray_decision(req: SprayDecisionRequest):
+        twin = get_twin()
+        if req.zones:
+            _check_zones(twin, [Intervention(zone_id=z, type="Fungicide Spray") for z in req.zones])
+        source = req.weather_source or ("auto" if ctx.get("user_field") else "synthetic")
+        weather, used = forecast(source, req.horizon_days, twin.state.sim_day + 1)
+        out = spray_options(twin, lambda t: expected_harvest_t_ha(t), weather, zones=req.zones,
+                            threshold=req.fungus_threshold, min_infected_frac=req.min_infected_frac,
+                            delays=req.delays, horizon_days=req.horizon_days, samples=req.samples,
+                            product_l_ha=req.product_l_ha)
+        return {**out, "weather_source": used}
+
+    @app.get("/twin/scouting-targets", summary="Zones where scouting would change the spray decision most")
+    def twin_scouting_targets(fungus_threshold: float = 0.2):
+        twin = get_twin()
+        return {"zones": scouting_targets(twin, fungus_threshold), "zone_risk": zone_risk(twin, fungus_threshold)}
 
     @app.post("/twin/stage", summary="Set the paddy growth stage")
     def twin_stage(req: StageRequest):

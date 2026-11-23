@@ -142,6 +142,7 @@ def render() -> None:
     if msg:
         (st.success if msg[0] else st.error)(msg[1], icon=":material/sports_esports:")
     _live_panel(live)
+    _spray_decision()
     _missions()
     st.markdown("<div style='height:.6rem'></div>", unsafe_allow_html=True)
     st.markdown("##### How the twin works")
@@ -296,6 +297,46 @@ MANUAL_CHECKS = [
 ]
 
 
+def _spray_decision() -> None:
+    """Spray now, later or not at all: the twin runs each option forward under the forecast."""
+    with st.expander("Should we spray? (twin decision)", icon=":material/balance:"):
+        st.caption("The twin runs the field forward three weeks under the weather forecast, for several "
+                   "plausible versions of the disease map (from its uncertainty), with and without spraying. "
+                   "Gains are harvest value minus fungicide and drone hire, in ₹.")
+        c1, c2 = st.columns([1, 3])
+        if c1.button("Compare spray options", icon=":material/compare_arrows:", key="ov_spray_dec", type="primary"):
+            with st.spinner("Running the options on the twin..."):
+                try:
+                    st.session_state["ov_spray_decision"] = _post("/twin/spray-decision", {}, timeout=180)
+                except Exception as e:
+                    st.session_state["ov_spray_decision"] = {"error": str(e)}
+        res = st.session_state.get("ov_spray_decision")
+        if not res:
+            return
+        if "error" in res:
+            st.error(f"Could not compare the options: {res['error']}")
+            return
+        rec = res["recommendation"]
+        (st.warning if res.get("scout_first") else st.success)(rec["text"], icon=":material/lightbulb:")
+        if res["options"]:
+            rows = [{"Option": o["option"].capitalize(),
+                     "Gain vs no spray (₹)": f"{o['gain_rs']:,.0f}",
+                     "Likely range (₹)": f"{o['gain_rs_p10']:,.0f} to {o['gain_rs_p90']:,.0f}" if "gain_rs_p10" in o else "–",
+                     "Chance it pays": f"{o['p_better_than_none'] * 100:.0f}%" if "p_better_than_none" in o else "–",
+                     "Harvest (t/ha)": f"{o['harvest_t_ha']:.2f}",
+                     "Weather that day": (f"{o['rain_mm']:.0f} mm, wind {o['wind_m_s']:.1f} m/s" if "rain_mm" in o else "–")
+                                         + (f" ⚠️ {o['notes']}" if o.get("notes") else "")}
+                    for o in res["options"]]
+            st.dataframe(rows, hide_index=True, use_container_width=True)
+            names = {r["zone_id"]: r["zone"] for r in res["zone_risk"]}
+            st.caption(f"Zones: {', '.join(names.get(z, str(z)) for z in res['zones'])} · "
+                       f"{res['spray_area_ha']:.2f} ha · spray cost ₹{res['spray_cost_rs']:,.0f} · "
+                       f"weather: {res.get('weather_source', '')}")
+        if res.get("scout_first"):
+            st.info("Plan a scouting flight with **Only where the twin is unsure** below, then compare again.",
+                    icon=":material/travel_explore:")
+
+
 def _missions() -> None:
     """Drone mission files for real flights, and a pre-flight checklist."""
     with st.expander("Drone missions for real flights", icon=":material/flight_takeoff:"):
@@ -305,9 +346,16 @@ def _missions() -> None:
         with left:
             kind = st.segmented_control("Mission", ["scout", "spray"], default="scout", key="ov_mission_kind",
                                         format_func=lambda k: {"scout": "Scout the field", "spray": "Spray flagged zones"}[k])
+            body = {"kind": kind or "scout"}
+            if (kind or "scout") == "scout":
+                body["adaptive"] = st.toggle("Only where the twin is unsure", key="ov_adaptive",
+                                             help="Fly only the zones where a closer look could change the "
+                                                  "spray decision (uncertain and near the threshold).")
+            body["refills"] = st.toggle("Allow refills and battery swaps", value=True, key="ov_refills",
+                                        help="Big jobs are split into sorties: one mission file per sortie.")
             if st.button("Plan mission files", icon=":material/route:", key="ov_plan_mission"):
                 try:
-                    st.session_state["ov_missions"] = _post("/swarm/mission-files", {"kind": kind or "scout"}, timeout=60)
+                    st.session_state["ov_missions"] = _post("/swarm/mission-files", body, timeout=60)
                 except Exception as e:
                     st.session_state["ov_missions"] = {"error": str(e)}
             res = st.session_state.get("ov_missions")
@@ -315,7 +363,9 @@ def _missions() -> None:
                 st.error(f"Could not plan the mission: {res['error']}")
             elif res:
                 ms = res.get("missions", {})
-                if not ms:
+                if res.get("blocked"):
+                    st.error(f"{res['blocked']}. Wait for calmer weather.", icon=":material/air:")
+                elif not ms:
                     st.info("Nothing to fly: no zone needs this mission right now.")
                 else:
                     import io
@@ -328,6 +378,8 @@ def _missions() -> None:
                                        f"paddytwin_{res['kind']}_missions.zip", "application/zip",
                                        type="primary", use_container_width=True)
                     st.caption(" · ".join(f"{d}: {m['items']} waypoints" for d, m in ms.items())
+                               + (f" · about {res['est_time_s'] / 60:.0f} min with wind {res['wind_m_s']:.1f} m/s"
+                                  if res.get("est_time_s") else "")
                                + (f" · {len(res['unassigned'])} task(s) unassigned" if res.get("unassigned") else ""))
         with right:
             st.markdown("**Pre-flight checklist**")
