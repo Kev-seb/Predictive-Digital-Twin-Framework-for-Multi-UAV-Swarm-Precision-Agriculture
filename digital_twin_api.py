@@ -529,7 +529,8 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
         t = vf.truth.state
         return {"truth_stress": flat(t.resample("stress", UE5_GRID, UE5_GRID)),
                 "truth_fungus": flat(t.resample("fungus", UE5_GRID, UE5_GRID)),
-                "truth_ndvi": flat(np.clip(t.resample("ndvi", UE5_GRID, UE5_GRID), 0.0, 1.0))}
+                "truth_ndvi": flat(np.clip(t.resample("ndvi", UE5_GRID, UE5_GRID), 0.0, 1.0)),
+                "truth_moisture": flat(t.resample("moisture", UE5_GRID, UE5_GRID))}
 
     # ---------------- UE5-resolution helpers ----------------
     def ue5_grids() -> Dict[str, np.ndarray]:

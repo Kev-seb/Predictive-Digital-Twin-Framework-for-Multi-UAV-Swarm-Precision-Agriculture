@@ -40,6 +40,13 @@ class Rotator:
     def __init__(self, roll=0.0, pitch=0.0, yaw=0.0):
         self.roll, self.pitch, self.yaw = roll, pitch, yaw
 
+    def rotate_vector(self, v):
+        """Roll about X, then pitch about Y (nose up = +), then yaw about Z."""
+        r, p, y = (math.radians(a) for a in (self.roll, self.pitch, self.yaw))
+        x1, y1, z1 = v.x, v.y * math.cos(r) - v.z * math.sin(r), v.y * math.sin(r) + v.z * math.cos(r)
+        x2, z2 = x1 * math.cos(p) - z1 * math.sin(p), x1 * math.sin(p) + z1 * math.cos(p)
+        return Vector(x2 * math.cos(y) - y1 * math.sin(y), x2 * math.sin(y) + y1 * math.cos(y), z2)
+
     def get_forward_vector(self):
         p, y = math.radians(self.pitch), math.radians(self.yaw)
         return Vector(math.cos(p) * math.cos(y), math.cos(p) * math.sin(y), math.sin(p))
@@ -66,6 +73,9 @@ class _MID:
     def set_vector_parameter_value(self, name, value):
         self.params[name] = value
 
+    def set_scalar_parameter_value(self, name, value):
+        self.params[name] = value
+
 
 class _MeshComponent:
     def __init__(self):
@@ -74,6 +84,9 @@ class _MeshComponent:
 
     def set_static_mesh(self, mesh):
         self.mesh = mesh
+
+    def set_material(self, index, material):
+        self.material = material
 
     def create_dynamic_material_instance(self, index, source=None, name=None):
         self.mid = _MID()
@@ -242,6 +255,7 @@ _EDITOR = UnrealEditorSubsystem()
 
 class MultiBlockType:
     MENU_ENTRY = "menu_entry"
+    TOOL_BAR_BUTTON = "tool_bar_button"
 
 
 class ToolMenuStringCommandType:
@@ -250,10 +264,13 @@ class ToolMenuStringCommandType:
 
 class ToolMenuEntry:
     def __init__(self, name="", type=None):
-        self.name, self.type, self.label, self.command = name, type, "", None
+        self.name, self.type, self.label, self.command, self.tip = name, type, "", None, ""
 
     def set_label(self, label):
         self.label = label
+
+    def set_tool_tip(self, tip):
+        self.tip = tip
 
     def set_string_command(self, kind, custom_type, command):
         self.command = (kind, command)
@@ -267,6 +284,9 @@ class ToolMenu:
         sub = ToolMenu(f"{self.name}.{name}", label)
         ToolMenus._menus[sub.name] = sub
         return sub
+
+    def add_section(self, name, label=""):
+        self.sections = getattr(self, "sections", []) + [name]
 
     def add_menu_entry(self, section, entry):
         self.entries = [e for e in self.entries if e[1].name != entry.name] + [(section, entry)]
@@ -282,6 +302,7 @@ class ToolMenus:
         if cls._instance is None:
             cls._instance = ToolMenus()
             cls._menus["LevelEditor.MainMenu"] = ToolMenu("LevelEditor.MainMenu")
+            cls._menus["LevelEditor.LevelEditorToolBar.User"] = ToolMenu("LevelEditor.LevelEditorToolBar.User")
         return cls._instance
 
     def find_menu(self, name):
@@ -296,10 +317,142 @@ def get_editor_subsystem(cls):
 
 
 MISSING_ASSETS = set()
+ASSETS = {}            # generated assets (imported meshes, created materials) by path
+IMPORT_UP = "z"        # which axis the fake importer leaves pointing up ("z" or "y")
+FAIL_ASSET_BUILD = False
 
 
 def load_asset(path):
+    if path in ASSETS:
+        return ASSETS[path]
     return None if path in MISSING_ASSETS else path
+
+
+class _Box:
+    def __init__(self, lo, hi):
+        self.min, self.max = lo, hi
+
+
+class StaticMesh:
+    def __init__(self, path, obj_text):
+        self.path, self.material = path, None
+        vs = [tuple(float(x) for x in l.split()[1:]) for l in obj_text.splitlines() if l.startswith("v ")]
+        # OBJ is Y-up: (x, up, -y). A correct importer turns it Z-up.
+        pts = [(x, -z, y) if IMPORT_UP == "z" else (x, y, -z) for x, y, z in vs]
+        self.n_verts = len(vs)
+        self.n_tris = sum(1 for l in obj_text.splitlines() if l.startswith("f "))
+        lo = Vector(*(min(p[i] for p in pts) for i in range(3)))
+        hi = Vector(*(max(p[i] for p in pts) for i in range(3)))
+        self.box = _Box(lo, hi)
+
+    def get_bounding_box(self):
+        return self.box
+
+    def set_material(self, index, material):
+        self.material = material
+
+
+class AssetImportTask:
+    def __init__(self):
+        self.props = {}
+
+    def set_editor_property(self, k, v):
+        self.props[k] = v
+
+
+class FbxImportUI(AssetImportTask):
+    pass
+
+
+class _AssetTools:
+    def import_asset_tasks(self, tasks):
+        if FAIL_ASSET_BUILD:
+            raise RuntimeError("import failed")
+        for t in tasks:
+            path = f"{t.props['destination_path']}/{t.props['destination_name']}"
+            with open(t.props["filename"]) as f:
+                ASSETS[path] = StaticMesh(path, f.read())
+
+    def create_asset(self, name, folder, cls, factory):
+        m = cls()
+        m.path = f"{folder}/{name}"
+        ASSETS[m.path] = m
+        return m
+
+
+class AssetToolsHelpers:
+    @staticmethod
+    def get_asset_tools():
+        return _AssetTools()
+
+
+class Material:
+    def __init__(self):
+        self.props, self.expressions, self.outputs, self.compiled = {}, [], {}, False
+
+    def set_editor_property(self, k, v):
+        self.props[k] = v
+
+
+class MaterialFactoryNew:
+    pass
+
+
+class MaterialProperty:
+    MP_BASE_COLOR = "base_color"
+    MP_ROUGHNESS = "roughness"
+    MP_SPECULAR = "specular"
+    MP_WORLD_POSITION_OFFSET = "wpo"
+
+
+class _Expression:
+    def __init__(self, kind):
+        self.kind, self.props, self.inputs = kind, {}, {}
+
+    def set_editor_property(self, k, v):
+        self.props[k] = v
+
+
+class MaterialEditingLibrary:
+    @staticmethod
+    def create_material_expression(mat, cls, x, y):
+        e = _Expression(cls)
+        mat.expressions.append(e)
+        return e
+
+    @staticmethod
+    def connect_material_expressions(a, out, b, pin):
+        b.inputs[pin or "Input"] = a
+        return True
+
+    @staticmethod
+    def connect_material_property(e, out, prop):
+        e.material_output = prop
+        return True
+
+    @staticmethod
+    def recompile_material(mat):
+        mat.compiled = True
+
+
+class EditorAssetLibrary:
+    @staticmethod
+    def does_asset_exist(path):
+        return path in ASSETS
+
+    @staticmethod
+    def delete_asset(path):
+        ASSETS.pop(path, None)
+
+    @staticmethod
+    def save_loaded_asset(asset):
+        return True
+
+
+def __getattr__(name):
+    if name.startswith("MaterialExpression"):
+        return name                         # expression classes: only their names matter here
+    raise AttributeError(name)
 
 
 def register_slate_post_tick_callback(fn):
@@ -319,6 +472,9 @@ def _reset():
     ToolMenus._menus.clear()
     ToolMenus._instance = None
     MISSING_ASSETS.clear()
+    ASSETS.clear()
+    global IMPORT_UP, FAIL_ASSET_BUILD
+    IMPORT_UP, FAIL_ASSET_BUILD = "z", False
     _TICKS.clear()
     _LEVEL.clear()
     LOG.clear()

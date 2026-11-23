@@ -20,7 +20,15 @@ The `TwinStream` C++ plugin (sections 1–7) connects a UE5 level to the digital
    Options: `--ue-project path/to/Game.uproject` opens UE5 with the script running, `--demo` starts the story at once, and `--fresh` resets the field to day 0. To start the twin on its own, run `python digital_twin_api.py`.
 
 3. **Run the script in UE5:** *File → Execute Python Script…* and pick `src/ue5_integration/python/twin_live.py`.
-   - **Empty level:** the script builds three 20×20 block fields side by side. Block colour shows stress and fungus, and block height shows NDVI.
+   - **Empty level:** the script builds three paddy fields side by side, each 100 m square, on farmland.
+     - Each field is 20 × 20 patches of rice, planted in rows and standing in water inside mud bunds.
+     - Plant height follows NDVI, from 30 cm seedlings to a 1 m canopy.
+     - Leaf colour follows health: green when healthy, yellow when stressed, red-brown when diseased, grey where the twin is unsure.
+     - The water is glassy while the field is flooded and turns to brown mud as the soil dries.
+
+     On the first run, the script generates the rice mesh and the leaf and water materials into `/Game/TwinDemo`; this takes about a minute. Later runs reuse them. The leaves sway in the wind.
+
+     Set `FIELD_LOOK = "blocks"` for the old coloured cubes. Those also appear automatically if the assets can't be built, and the Output Log says why. Your own `CROP_MESH` takes priority over the generated rice.
      - **TWIN:** what the twin believes now.
      - **REALITY:** the hidden truth.
      - **FORECAST +7 DAYS:** what the twin predicts a week ahead if nothing is done. It's faded where the prediction is uncertain. This is the "predictive" part of a predictive digital twin.
@@ -51,7 +59,7 @@ The `TwinStream` C++ plugin (sections 1–7) connects a UE5 level to the digital
    ```
 
    Quadcopters (hub, X arms, spinning rotors, spray tank) take off, scout, and spray, with a blue cone under them while they spray. The twin field changes under them as they fly. A caption above the field narrates each step and shows the twin-vs-reality error.
-5. **Digital Twin menu:** the script adds a **Digital Twin** menu to the editor's menu bar, so you can run the show live without a browser or terminal.
+5. **Controls:** **Digital Twin buttons on the toolbar above the viewport:** Demo, Stop, Next day, Scout, Spray, Outbreak, Reset, then the camera views Overview, Close-up and Follow drone. Hover a button to see what it does. The same actions are in the **Digital Twin** menu on the editor's menu bar, so you can run the show live without a browser or terminal.
 
    | Menu entry | What happens |
    |---|---|
@@ -60,7 +68,9 @@ The `TwinStream` C++ plugin (sections 1–7) connects a UE5 level to the digital
    | Scout now / Spray now / Scout + spray | the drones fly that mission, animated |
    | **Inject outbreak** | plants a new disease patch in the hidden **Reality** field, at the field block you've selected, or else where the centre of your view meets a field. The twin isn't told, so "Scout now" shows it finding the patch. |
    | Reset field | starts again with a new hidden outbreak |
-   | Re-frame camera | jumps back to the overview |
+   | Overview camera | all three fields |
+   | Close-up of the crop | low over the twin's rice, to see the plants and water |
+   | Follow a drone | the camera chases a drone (the one spraying, if any) while it flies; Overview stops it |
 
    Only one step runs at a time. A second click while drones are flying logs "busy" in the Output Log.
 

@@ -495,6 +495,7 @@ def start():
     builtins._twin_live = live
     builtins.twin_live_action = tl.twin_live_action
     builtins.twin_live_camera = live.frame_camera
+    builtins.twin_live_view = tl.twin_live_view       # the menu's camera entries
     builtins.twin_paddy = sys.modules[__name__]
     tl._register_menu()
     unreal.log(f"[twin_paddy] running against {tl.API}; twin_paddy.stop() to stop")
