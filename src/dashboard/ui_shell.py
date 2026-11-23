@@ -98,7 +98,12 @@ def apply_theme() -> None:
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500&display=swap');
 html, body, [class*="css"], .stMarkdown, button, input, textarea, select {{ font-family: 'Inter', sans-serif !important; }}
 #MainMenu, footer {{ visibility: hidden; }}
-header[data-testid="stHeader"] {{ background: transparent; height: 0; }}
+header[data-testid="stHeader"] {{ background: transparent; }}
+/* the "open sidebar" arrow lives in the header: keep it visible and easy to find */
+[data-testid="stExpandSidebarButton"], [data-testid="stSidebarCollapsedControl"], [data-testid="collapsedControl"] {{
+    display:flex !important; visibility:visible !important; opacity:1 !important; z-index:1000;
+    background:{C['surface2']}; border:1px solid {C['accent']}; border-radius:8px; color:{C['accent']};
+}}
 .stApp {{ background: radial-gradient(1200px 600px at 75% -10%, rgba(43,214,123,0.06), transparent 60%), {C['bg']}; }}
 .block-container {{ padding-top: 1.4rem; padding-bottom: 3rem; max-width: 1500px; }}
 
@@ -124,7 +129,7 @@ section[data-testid="stSidebar"] .stButton {{ margin-bottom:-.55rem; }}
 section[data-testid="stSidebar"] .stButton button > div {{ justify-content:flex-start; width:100%; }}
 section[data-testid="stSidebar"] .stButton button p {{ text-align:left; }}
 section[data-testid="stSidebar"] .stButton button[disabled] {{ opacity:.45; background:transparent; border-color:transparent; }}
-[data-testid="stToolbar"], [data-testid="stDecoration"], .stDeployButton {{ display:none !important; }}
+[data-testid="stToolbarActions"], [data-testid="stDecoration"], .stDeployButton {{ display:none !important; }}
 section[data-testid="stSidebar"] [data-testid="stExpander"] {{ border:1px solid {C['border']}; border-radius:10px; background:{C['bg']}; }}
 
 /* ---------- page chrome ---------- */
