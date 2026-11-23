@@ -13,3 +13,12 @@ pymavlink
 requests
 websockets
 pytest
+# GIS, reports and the dashboard helpers used by the newer tests
+rasterio
+geopandas
+shapely
+affine
+pandas
+streamlit>=1.50
+plotly
+fpdf2

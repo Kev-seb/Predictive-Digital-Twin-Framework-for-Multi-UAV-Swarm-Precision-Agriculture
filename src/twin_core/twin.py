@@ -31,6 +31,7 @@ import copy
 import datetime as _dt
 import json
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional
 
@@ -204,7 +205,7 @@ class DigitalTwin:
             self.history = []
             self._record_history("reset")
             self._emit("twin.reset", {})
-            self.save()
+            self.save(force=True)
 
     # ============================================================ crop model
     def _model(self):
@@ -266,7 +267,7 @@ class DigitalTwin:
                 self._record_history("predict")
             summary = self.state.summary()
             self._emit("twin.stepped", {"days": days, "logs": logs[-50:], "summary": summary})
-            self.save()
+            self.save(force=True)
         return {"sim_day": self.state.sim_day, "logs": logs, "summary": summary}
 
     # =========================================================== assimilate
@@ -293,7 +294,7 @@ class DigitalTwin:
             out = [result.to_dict()]
             self._record_history(f"observe:{source}")
             self._emit("twin.observed", {"kind": "grid", "source": source, "results": out})
-            self.save()
+            self.save(force=False)
         return out
 
     def observe_point(
@@ -340,7 +341,7 @@ class DigitalTwin:
             self._record_history(f"observe:{source}")
             self._emit("twin.observed", {"kind": "point", "source": source, "lat": lat,
                                          "lon": lon, "results": results})
-            self.save()
+            self.save(force=False)
         return results
 
     def _ensemble(self):
@@ -392,7 +393,7 @@ class DigitalTwin:
             self._refresh_stress()
             self._emit("twin.stage", {"growth_stage": self.state.growth_stage,
                                       "gdd": self.state.scalars.get("gdd")})
-            self.save()
+            self.save(force=True)
 
     # ============================================================ scenarios
     def fork(self) -> "DigitalTwin":
@@ -465,9 +466,23 @@ class DigitalTwin:
         if len(self.history) > 2000:
             self.history = self.history[-2000:]
 
-    def save(self) -> None:
+    SAVE_MIN_INTERVAL_S = 5.0
+
+    def save(self, force: bool = True) -> None:
+        """Persist the twin. Observations call save(force=False): at most every SAVE_MIN_INTERVAL_S (a drone
+        mission assimilates hundreds of frames, each full write ~10 ms of disk I/O), the last one at exit.
+        Steps, resets and explicit saves write immediately."""
         if self.storage_dir is None:
             return
+        now = time.monotonic()
+        if not force and now - getattr(self, "_last_save", -1e9) < self.SAVE_MIN_INTERVAL_S:
+            if not getattr(self, "_flush_registered", False):
+                import atexit
+                atexit.register(self.save, True)
+                self._flush_registered = True
+            self._dirty = True
+            return
+        self._last_save, self._dirty = now, False
         self.state.save(self.storage_dir / "state.npz")
         (self.storage_dir / "history.json").write_text(json.dumps(self.history), encoding="utf-8")
 

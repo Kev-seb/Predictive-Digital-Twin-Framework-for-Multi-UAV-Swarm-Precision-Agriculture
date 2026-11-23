@@ -1,0 +1,14 @@
+.venv
+.git
+**/__pycache__
+.pytest_cache
+data/*
+!data/samples
+outputs
+results
+experiments
+logs
+scratch
+notebooks
+academic_paper*
+*.log

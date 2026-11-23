@@ -1,0 +1,28 @@
+# docker compose up --build
+services:
+  api:
+    build: .
+    command: python digital_twin_api.py
+    environment:
+      UAV_TWIN_API_HOST: 0.0.0.0
+      UAV_TWIN_API_PORT: "8008"
+    ports: ["8008:8008"]
+    volumes: ["paddytwin-outputs:/app/outputs"]
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8008/docs"]
+      interval: 15s
+      retries: 10
+
+  dashboard:
+    build: .
+    command: streamlit run src/dashboard/dashboard.py --server.address 0.0.0.0 --server.port 8501 --server.headless true
+    environment:
+      UAV_TWIN_API_HOST: api
+      UAV_TWIN_API_PORT: "8008"
+    ports: ["8501:8501"]
+    volumes: ["paddytwin-outputs:/app/outputs"]
+    depends_on:
+      api: {condition: service_healthy}
+
+volumes:
+  paddytwin-outputs:

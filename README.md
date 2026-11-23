@@ -612,6 +612,19 @@ python src/classification/train_classifier.py \
 
 ---
 
+### Run with Docker
+
+```bash
+docker compose up --build
+```
+
+The dashboard runs at http://localhost:8501 and the twin API at http://localhost:8008/docs. Fields, flights and tasks are kept in the `paddytwin-outputs` volume. This build uses CPU PyTorch. Unreal Engine and the drone links still run on the host.
+
+### Safety switches
+
+- The public phone tunnel (localtunnel) only starts when `PADDYTWIN_PUBLIC_TUNNEL=1` is set.
+- The dashboard's telemetry server uses ports 8010 to 8030, which leaves port 8000 free for Unreal's MCP server.
+
 ## 6. Test Suite
 
 ```bash

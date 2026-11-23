@@ -779,8 +779,13 @@ def start_mobile_api_server(controller, port: int = API_PORT) -> int:
     time.sleep(0.5)  # Let the server start
     print(f"Live Field Mode API server started on http://0.0.0.0:{actual_port}")
 
-    # Launch automatic localhost.run tunnel in background
-    _start_tunnel_process(controller, actual_port)
+    # A public internet tunnel only when asked for (PADDYTWIN_PUBLIC_TUNNEL=1): it exposes this API to
+    # anyone with the URL. Phones on the same Wi-Fi reach the server without it.
+    import os
+    if os.environ.get("PADDYTWIN_PUBLIC_TUNNEL") == "1":
+        _start_tunnel_process(controller, actual_port)
+    else:
+        print("[Tunnel] Public tunnel off (set PADDYTWIN_PUBLIC_TUNNEL=1 to enable).")
 
     return actual_port
 

@@ -101,7 +101,7 @@ def get_shared_state():
         "SWARM_WARNINGS": [],
         "ACTIVE_PARTICLES": np.zeros((0, 3), dtype=np.float32),
         "WS_CLIENTS": set(),
-        "TELEMETRY_PORT": 8000,
+        "TELEMETRY_PORT": 8010,          # 8000 is the Unreal Engine MCP server
         "WEBSOCKET_PORT": 8765,
         # Fleet size for the swarm simulation (UAV_DASHBOARD_SWARM_SIZE, default 2);
         # can be changed live from the Swarm tab.
@@ -208,7 +208,7 @@ class TelemetryRequestHandler(BaseHTTPRequestHandler):
 
 def run_http_server():
     global TELEMETRY_PORT
-    for port in range(8000, 8021):
+    for port in range(8010, 8031):       # stay off 8000 (Unreal MCP) and 8008 (twin API)
         try:
             server_address = ('127.0.0.1', port)
             httpd = HTTPServer(server_address, TelemetryRequestHandler)
@@ -3030,7 +3030,7 @@ if show_page(8):
             # Three.js Dynamic WebGL Viewport
             import time
             WEBSOCKET_PORT = shared_state.get("WEBSOCKET_PORT", 8765)
-            TELEMETRY_PORT = shared_state.get("TELEMETRY_PORT", 8000)
+            TELEMETRY_PORT = shared_state.get("TELEMETRY_PORT", 8010)
             three_html = f"""\n<!-- Cache Buster: {time.time()} -->\n<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -6726,7 +6726,7 @@ if show_page(11):
         st.subheader(" Real-time CV Crop Stress Intelligence Overlay")
         st.markdown("Dynamic down-looking camera view rendered with aviation-style HUD and real-time contour stress intelligence.")
         
-        telemetry_port = shared_state.get("TELEMETRY_PORT", 8000)
+        telemetry_port = shared_state.get("TELEMETRY_PORT", 8010)
         
         # Display the live stream using st.components.v1.html for continuous frame updates
         st.components.v1.html(
