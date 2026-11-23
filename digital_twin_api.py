@@ -821,6 +821,17 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
             out = np.where(np.isnan(out), np.nanmean(out) if np.isfinite(out).any() else 0.0, out)
         return out.astype(np.float32)
 
+    # What a drone image reliably says about the field: NDVI. Not "moisture": over a green rice canopy the
+    # image's NDWI (green/NIR) is strongly negative, which would read a flooded paddy as drying out. Not
+    # "nitrogen" either: the red-edge proxy (CIre / 5) is uncalibrated for these sensors and drove the
+    # forecast into false nitrogen deficiency. Both stay with the crop model until calibrated.
+    IMAGE_LAYERS = ("ndvi",)
+
+    def _assimilate_image(twin, layers: Dict[str, np.ndarray], source: str) -> None:
+        for name in IMAGE_LAYERS:
+            if name in layers:
+                twin.observe_grid(name, layers[name], source=source)
+
     def build_user_field(seed: int = 42, outbreaks=None, reset_twin: bool = True) -> Dict[str, Any]:
         """Rebuild the twin and the 'real' field from the stored upload.
 
@@ -834,7 +845,7 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
         layers = uf["layers"]
         if reset_twin:
             twin.reset()
-            ingest_multispectral(twin, uf["bands"], source=f"upload:{uf['name']}")
+            _assimilate_image(twin, layers, source=f"upload:{uf['name']}")
             ctx["anomalies"].clear()
             ctx["ue5_snapshot"] = ue5_grids()
         ctx["pending_interventions"] = []
@@ -843,9 +854,9 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
                           propagation_model=twin.propagation_model, zone_layout=twin.zone_layout,
                           crop_model=twin.crop_model, params=twin.params)
         m = vf.truth.state.mean
-        for name, arr in layers.items():
-            if name in m:
-                m[name] = np.clip(arr, -1.0 if name == "ndvi" else 0.0, 1.0).astype(np.float32)
+        for name in IMAGE_LAYERS:
+            if name in layers and name in m:
+                m[name] = np.clip(layers[name], -1.0 if name == "ndvi" else 0.0, 1.0).astype(np.float32)
         g = twin.state.grid
         if outbreaks is None:      # demo / reset story: one disease patch the twin has not been told about
             outbreaks = [{"row": g.rows * 0.3, "col": g.cols * 0.65, "radius": g.rows * 0.12, "load": 0.55}]
@@ -932,11 +943,11 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
         layers = bands_to_layers(bands)
         before = vf.twin_error(twin)
         std_before = float(np.sqrt(twin.state.var["ndvi"]).mean())
-        ingest_multispectral(twin, bands, source=f"flight:{req.name}")
+        _assimilate_image(twin, layers, source=f"flight:{req.name}")
         m = vf.truth.state.mean
-        for name, arr in layers.items():
-            if name in m:
-                m[name] = np.clip(arr, -1.0 if name == "ndvi" else 0.0, 1.0).astype(np.float32)
+        for name in IMAGE_LAYERS:
+            if name in layers and name in m:
+                m[name] = np.clip(layers[name], -1.0 if name == "ndvi" else 0.0, 1.0).astype(np.float32)
         vf.truth._refresh_stress()
         for name in LAYERS:
             vf.truth.state.var[name][:] = 0.0
