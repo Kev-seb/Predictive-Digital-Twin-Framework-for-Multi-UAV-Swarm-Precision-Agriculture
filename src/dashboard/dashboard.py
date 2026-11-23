@@ -821,6 +821,9 @@ def _demo_ms_image():
 if PAGE == "overview":
     from src.dashboard import overview
     overview.render()
+if PAGE == "leafcheck":
+    from src.dashboard import leaf_check
+    leaf_check.render()
 
 
 # ══════════════════════════════════════════════════════════════

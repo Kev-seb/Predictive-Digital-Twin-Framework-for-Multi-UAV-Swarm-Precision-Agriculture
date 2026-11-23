@@ -61,6 +61,7 @@ NAV: list[tuple[str, list[Page]]] = [
     ("Workflow", WORKFLOW),
     ("Live operations", [
         Page("overview", "Live twin & drones", ":material/space_dashboard:", None, "Live mission control for the field twin"),
+        Page("leafcheck", "Leaf disease check", ":material/local_florist:", None, "Photo of a leaf: likely disease"),
         Page("swarm", "Swarm operations", ":material/scatter_plot:", 12, "Fleet planning and missions"),
         Page("uav", "UAV control center", ":material/flight:", 11, "Live single-drone control"),
         Page("livefield", "Live field mode", ":material/sensors:", 14, "Real-time field feed"),
