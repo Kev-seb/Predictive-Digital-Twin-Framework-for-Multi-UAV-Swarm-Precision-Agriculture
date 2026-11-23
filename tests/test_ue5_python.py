@@ -410,3 +410,35 @@ def test_rice_patch_mesh():
         for corner in line.split()[1:]:
             a, b, c = (int(x) for x in corner.split("/"))
             assert 1 <= a <= n_v and 1 <= b <= n_v and 1 <= c <= n_n
+
+
+def test_twin_paddy_style_subclass_keeps_working(fake_unreal, api):
+    """twin_paddy.TwinPaddy subclasses TwinLive without its __init__: _tick and the view menu must cope."""
+    mod, live = _run_script()
+    try:
+        calls = []
+
+        class PaddyLike(mod.TwinLive):
+            def __init__(self, base):
+                self.__dict__.update({k: v for k, v in base.__dict__.items() if k != "view"})
+
+            def frame_camera(self):
+                calls.append("overview")
+
+            def closeup_camera(self):
+                calls.append("closeup")
+
+            def follow_camera(self, d_id=None):
+                calls.append("follow")
+
+        sub = PaddyLike(live)
+        assert not hasattr(sub, "view")
+        sub._tick(0.05)                                   # no AttributeError
+        import builtins
+        builtins._twin_live = sub
+        for v in ("closeup", "follow", "overview"):
+            mod.twin_live_view(v)
+        assert calls == ["closeup", "follow", "overview"]
+        builtins._twin_live = live
+    finally:
+        mod.twin_live_stop()

@@ -944,7 +944,7 @@ class TwinLive:
             _set_text(self.caption, f"Digital twin: cannot reach {API}")
         self._smooth_drones(delta_seconds)
         self._update_rain(delta_seconds)
-        if self.view == "follow":
+        if getattr(self, "view", None) == "follow":     # subclasses (twin_paddy) run their own cameras
             self._follow_drone()
         cam = _get_camera()
         if cam is not None:
@@ -1271,8 +1271,13 @@ def twin_live_view(view="overview"):
     """Camera presets: 'overview', 'closeup' or 'follow'."""
     import builtins
     live = getattr(builtins, "_twin_live", None)
-    if live is not None:
+    if live is None:
+        return
+    if hasattr(live, "set_view") and not hasattr(live, "closeup_camera"):
         live.set_view(view)
+    else:   # twin_paddy.TwinPaddy (PaddyTwin level) has its own camera methods
+        {"overview": live.frame_camera, "closeup": live.closeup_camera,
+         "follow": live.follow_camera}.get(view, live.frame_camera)()
 
 
 def twin_live_camera():
