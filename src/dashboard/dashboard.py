@@ -779,7 +779,11 @@ def plot_boundaries_contours(pathogen: np.ndarray, boundaries: np.ndarray, title
 PAGE = ui_shell.sidebar_nav()
 
 with st.sidebar.expander("Field settings", icon=":material/settings:"):
-    crop_stage = st.selectbox("Crop growth stage", STAGES, index=1)
+    if "stage_pending" in st.session_state:               # set by "Use this stage" on Upload
+        st.session_state["crop_stage_sel"] = st.session_state.pop("stage_pending")
+    crop_stage = st.selectbox("Crop growth stage", STAGES, index=1, key="crop_stage_sel")
+    transplant_date = st.date_input("Transplanting date (optional)", value=None, key="transplant_date",
+                                    help="Lets the app work out the growth stage from the field's real temperatures")
     stress_threshold = st.slider("Stress detection threshold", 0.30, 0.80, 0.55, 0.05)
     grid_size = st.slider("Field grid size", 3, 10, 5)
     st.caption("Field location (weather)")
@@ -968,6 +972,47 @@ if show_page(0):
             st.dataframe(fl, hide_index=True, use_container_width=True)
             d = fl["NDVI mean"].iloc[-1] - fl["NDVI mean"].iloc[-2]
             st.caption(f"Since the previous flight, mean NDVI {'rose' if d >= 0 else 'fell'} by {abs(d):.3f}.")
+
+        st.subheader("Growth stage")
+        from src.ai_engine import crop_stage as _cs
+        g1, g2 = st.columns(2, gap="medium")
+        with g1, st.container(border=True):
+            st.markdown("**From the transplanting date** · primary")
+            if transplant_date is None:
+                st.caption("Set the transplanting date under **Field settings** in the sidebar. The stage then "
+                           "comes from the field's real temperatures since transplanting (correct on all 20 "
+                           "flights of the project's dataset).")
+            else:
+                _key = ("stage_gdd", str(transplant_date), round(lat, 3), round(lon, 3), str(pd.Timestamp.now().date()))
+                if st.session_state.get("stage_gdd_key") != _key:
+                    with st.spinner("Reading the field's temperatures since transplanting..."):
+                        st.session_state["stage_gdd"] = _cs.stage_from_transplanting(transplant_date, lat, lon)
+                    st.session_state["stage_gdd_key"] = _key
+                sg = st.session_state["stage_gdd"]
+                st.metric("Stage", sg["stage"], help=f"{sg['gdd']:.0f} growing degree-days, weather: {sg['weather']}")
+                st.caption(f"Day {sg['days_after_transplanting']} after transplanting · {sg['gdd']:.0f} degree-days · "
+                           f"{sg['next_stage']} in about {sg['days_to_next']} days")
+                if sg["stage"] in STAGES and sg["stage"] != crop_stage:
+                    if st.button(f"Use {sg['stage']} for the analysis", key="use_stage_gdd"):
+                        st.session_state["stage_pending"] = sg["stage"]
+                        st.rerun()
+        with g2, st.container(border=True):
+            st.markdown("**From the image** · AI estimate")
+            card = _cs.stage_model_card()
+            if card is None:
+                st.caption("No stage model trained yet (research/09_train_stage_model.py).")
+            else:
+                _ikey = ("stage_img", st.session_state.get("field_name"), len(st.session_state.get("flights", [])))
+                if st.session_state.get("stage_img_key") != _ikey:
+                    with st.spinner("Running the stage model..."):
+                        st.session_state["stage_img"] = _cs.stage_from_image(ms_image.bands)
+                    st.session_state["stage_img_key"] = _ikey
+                si = st.session_state["stage_img"]
+                st.metric("Stage", si["stage"], help=f"Average over {si['patches']} image patches")
+                ev = card["evaluation"]
+                st.caption(f"Confidence {si['confidence'] * 100:.0f}%. Tested on drone flights it never saw: "
+                           f"{ev['test_acc'] * 100:.0f}% of patches right (guessing: {card['chance_accuracy'] * 100:.0f}%). "
+                           "Treat it as a hint; the transplanting date is more reliable.")
 
         st.subheader("Image composites")
         c1, c2, c3 = st.columns(3)
