@@ -94,6 +94,14 @@ def _offline() -> None:
         st.caption("Every other page in the sidebar works without the API.")
 
 
+def _send_field() -> None:
+    from src.dashboard import twin_link
+    ss = st.session_state
+    ss["twin_link"] = twin_link.push_field(ss["ms_image"], ss.get("field_name", "Uploaded field"),
+                                          ss.get("field_geo"), ss.get("crop_stage"))
+    ss["ue_open_msg"] = ss["twin_link"]
+
+
 def _open_unreal() -> None:
     try:
         from src.ue5_integration.ue_launcher import open_paddy_twin
@@ -106,9 +114,13 @@ def _open_unreal() -> None:
 # ----------------------------------------------------------------- page
 def render() -> None:
     st.markdown('<div class="pt-crumb">Live operations &nbsp;›&nbsp; <b>Live twin &amp; drones</b></div>', unsafe_allow_html=True)
+    from src.dashboard import twin_link
+    src = twin_link.twin_source() or {}
+    uploaded = src.get("source") == "upload"
+    title = src.get("name", "Field Alpha") if uploaded else "Field Alpha (simulated)"
     head_l, head_r = st.columns([3, 2], vertical_alignment="bottom")
     with head_l:
-        st.markdown('<div class="pt-title">Field Alpha &nbsp;·&nbsp; Paddy rice</div>'
+        st.markdown(f'<div class="pt-title">{title} &nbsp;·&nbsp; Paddy rice</div>'
                     '<div class="pt-sub">The twin estimates the field from drone scouting, forecasts the next 7 days, '
                     'and sends the drones to spray only where it matters.</div>', unsafe_allow_html=True)
     with head_r:
@@ -119,10 +131,19 @@ def render() -> None:
                      use_container_width=True, on_click=_open_unreal,
                      help="Opens the 3D PaddyTwin level in Unreal Engine on this PC (or brings it to the front) "
                           "and starts the paddy twin there. Actions on this page then move the drones in Unreal too.")
+    if src and not uploaded and "ms_image" in st.session_state:
+        c1, c2 = st.columns([4, 1.3], vertical_alignment="center")
+        c1.info(f"The live twin is showing the simulated field, not **{st.session_state.get('field_name', 'your field')}**.",
+                icon=":material/info:")
+        c2.button("Send to live twin", icon=":material/upload:", use_container_width=True, on_click=_send_field)
+    elif not src and "ms_image" in st.session_state:
+        pass                                      # API offline: the panel below explains how to start it
     msg = st.session_state.pop("ue_open_msg", None)
     if msg:
         (st.success if msg[0] else st.error)(msg[1], icon=":material/sports_esports:")
     _live_panel(live)
+    _spray_decision()
+    _missions()
     st.markdown("<div style='height:.6rem'></div>", unsafe_allow_html=True)
     st.markdown("##### How the twin works")
     steps = [("01", "Sense", "Drones fly multispectral scouting passes over the paddy."),
@@ -161,8 +182,11 @@ def _status_row(frame, field, m, status) -> None:
     flying = sum(1 for p in drones.values() if p and p[2] > 1.5)
     spraying = sum(1 for p in drones.values() if p and p[3])
     rain = (frame.get("weather") or {}).get("precipitation_mm", 0.0)
+    fs = frame.get("field_source") or {}
     pills = [
         (C["accent"], "Twin API connected"),
+        (C["accent"] if fs.get("source") == "upload" else C["muted"],
+         "Your uploaded field" if fs.get("source") == "upload" else "Simulated field"),
         (C["amber"] if running else C["muted"], "Demo running" if running else "Demo idle"),
         (C["blue"], f"Day {m.get('sim_day', field.get('sim_day', '-'))} · {m.get('growth_stage', field.get('growth_stage', ''))}"),
         (C["violet"] if flying else C["muted"], f"{flying}/{len(drones) or 3} drones airborne" + (f" · {spraying} spraying" if spraying else "")),
@@ -261,6 +285,126 @@ def _controls(frame) -> None:
             st.button("Inject", type="primary", use_container_width=True, on_click=_act,
                       args=("Outbreak", "/live/action", {"action": "outbreak", "row": r + 0.5, "col": c + 0.5}))
 
+
+
+MANUAL_CHECKS = [
+    "Batteries charged and spares ready",
+    "Propellers, arms and spray nozzles inspected",
+    "Tank filled with the right product and dose",
+    "Flight area checked for no-fly zones (Digital Sky / local rules) and people",
+    "Buffer kept from houses, water bodies and other crops",
+    "Operator and helper wearing protective equipment (PPE)",
+]
+
+
+def _spray_decision() -> None:
+    """Spray now, later or not at all: the twin runs each option forward under the forecast."""
+    with st.expander("Should we spray? (twin decision)", icon=":material/balance:"):
+        st.caption("The twin runs the field forward three weeks under the weather forecast, for several "
+                   "plausible versions of the disease map (from its uncertainty), with and without spraying. "
+                   "Gains are harvest value minus fungicide and drone hire, in ₹.")
+        c1, c2 = st.columns([1, 3])
+        if c1.button("Compare spray options", icon=":material/compare_arrows:", key="ov_spray_dec", type="primary"):
+            with st.spinner("Running the options on the twin..."):
+                try:
+                    st.session_state["ov_spray_decision"] = _post("/twin/spray-decision", {}, timeout=180)
+                except Exception as e:
+                    st.session_state["ov_spray_decision"] = {"error": str(e)}
+        res = st.session_state.get("ov_spray_decision")
+        if not res:
+            return
+        if "error" in res:
+            st.error(f"Could not compare the options: {res['error']}")
+            return
+        rec = res["recommendation"]
+        (st.warning if res.get("scout_first") else st.success)(rec["text"], icon=":material/lightbulb:")
+        if res["options"]:
+            rows = [{"Option": o["option"].capitalize(),
+                     "Gain vs no spray (₹)": f"{o['gain_rs']:,.0f}",
+                     "Likely range (₹)": f"{o['gain_rs_p10']:,.0f} to {o['gain_rs_p90']:,.0f}" if "gain_rs_p10" in o else "–",
+                     "Chance it pays": f"{o['p_better_than_none'] * 100:.0f}%" if "p_better_than_none" in o else "–",
+                     "Harvest (t/ha)": f"{o['harvest_t_ha']:.2f}",
+                     "Weather that day": (f"{o['rain_mm']:.0f} mm, wind {o['wind_m_s']:.1f} m/s" if "rain_mm" in o else "–")
+                                         + (f" ⚠️ {o['notes']}" if o.get("notes") else "")}
+                    for o in res["options"]]
+            st.dataframe(rows, hide_index=True, use_container_width=True)
+            names = {r["zone_id"]: r["zone"] for r in res["zone_risk"]}
+            st.caption(f"Zones: {', '.join(names.get(z, str(z)) for z in res['zones'])} · "
+                       f"{res['spray_area_ha']:.2f} ha · spray cost ₹{res['spray_cost_rs']:,.0f} · "
+                       f"weather: {res.get('weather_source', '')}")
+        if res.get("scout_first"):
+            st.info("Plan a scouting flight with **Only where the twin is unsure** below, then compare again.",
+                    icon=":material/travel_explore:")
+
+
+def _missions() -> None:
+    """Drone mission files for real flights, and a pre-flight checklist."""
+    with st.expander("Drone missions for real flights", icon=":material/flight_takeoff:"):
+        st.caption("The twin plans each drone's route. Download it as QGroundControl waypoint files "
+                   "(.waypoints, one per drone) for Mission Planner / QGroundControl and ArduPilot drones.")
+        left, right = st.columns([1, 1.3], gap="large")
+        with left:
+            kind = st.segmented_control("Mission", ["scout", "spray"], default="scout", key="ov_mission_kind",
+                                        format_func=lambda k: {"scout": "Scout the field", "spray": "Spray flagged zones"}[k])
+            body = {"kind": kind or "scout"}
+            if (kind or "scout") == "scout":
+                body["adaptive"] = st.toggle("Only where the twin is unsure", key="ov_adaptive",
+                                             help="Fly only the zones where a closer look could change the "
+                                                  "spray decision (uncertain and near the threshold).")
+            body["refills"] = st.toggle("Allow refills and battery swaps", value=True, key="ov_refills",
+                                        help="Big jobs are split into sorties: one mission file per sortie.")
+            if st.button("Plan mission files", icon=":material/route:", key="ov_plan_mission"):
+                try:
+                    st.session_state["ov_missions"] = _post("/swarm/mission-files", body, timeout=60)
+                except Exception as e:
+                    st.session_state["ov_missions"] = {"error": str(e)}
+            res = st.session_state.get("ov_missions")
+            if res and "error" in res:
+                st.error(f"Could not plan the mission: {res['error']}")
+            elif res:
+                ms = res.get("missions", {})
+                if res.get("blocked"):
+                    st.error(f"{res['blocked']}. Wait for calmer weather.", icon=":material/air:")
+                elif not ms:
+                    st.info("Nothing to fly: no zone needs this mission right now.")
+                else:
+                    import io
+                    import zipfile
+                    buf = io.BytesIO()
+                    with zipfile.ZipFile(buf, "w") as z:
+                        for d_id, m in ms.items():
+                            z.writestr(f"{res['kind']}_{d_id}.waypoints", m["waypoints"])
+                    st.download_button(f"Download {len(ms)} mission file(s) (.zip)", buf.getvalue(),
+                                       f"paddytwin_{res['kind']}_missions.zip", "application/zip",
+                                       type="primary", use_container_width=True)
+                    st.caption(" · ".join(f"{d}: {m['items']} waypoints" for d, m in ms.items())
+                               + (f" · about {res['est_time_s'] / 60:.0f} min with wind {res['wind_m_s']:.1f} m/s"
+                                  if res.get("est_time_s") else "")
+                               + (f" · {len(res['unassigned'])} task(s) unassigned" if res.get("unassigned") else ""))
+        with right:
+            st.markdown("**Pre-flight checklist**")
+            try:
+                w = _get("/ue5/frame?since=0").get("weather") or {}
+            except Exception:
+                w = {}
+            wind, rain, temp = w.get("wind_speed_m_s"), w.get("precipitation_mm"), w.get("temperature_c")
+            spray = (st.session_state.get("ov_mission_kind") or "scout") == "spray"
+            auto = [("Wind", wind is not None and wind <= (5.0 if spray else 10.0),
+                     f"{wind:.1f} m/s" if wind is not None else "unknown",
+                     "spraying drifts above ~5 m/s" if spray else "above ~10 m/s is unsafe to fly"),
+                    ("Rain", rain is not None and rain <= 1.0, f"{rain:.1f} mm today" if rain is not None else "unknown",
+                     "rain washes the spray off and grounds most drones"),
+                    ("Heat", temp is not None and temp <= 35.0, f"{temp:.0f} °C" if temp is not None else "unknown",
+                     "spray evaporates in strong heat: fly early morning or evening")]
+            for name, ok, val, why in auto:
+                icon = "✅" if ok else "⚠️"
+                st.markdown(f"{icon} **{name}:** {val}" + ("" if ok else f" <span style='color:{C['amber']}'>({why})</span>"),
+                            unsafe_allow_html=True)
+            done = sum(st.checkbox(t, key=f"ov_chk_{i}") for i, t in enumerate(MANUAL_CHECKS))
+            if done == len(MANUAL_CHECKS) and all(ok for _, ok, _, _ in auto):
+                st.success("All checks passed. Ready to fly.", icon=":material/check_circle:")
+            else:
+                st.caption(f"{done}/{len(MANUAL_CHECKS)} manual checks done.")
 
 
 def _error_chart(m) -> None:

@@ -84,8 +84,9 @@ from pydantic import BaseModel, Field
 
 from src.config.config import settings
 from src.twin_core import LAYERS, DigitalTwin, FieldGrid
-from src.twin_core.ingest import ingest_multispectral, ingest_rgb_result
-from src.twin_core.swarm import Fleet, allocate, tasks_from_twin
+from src.twin_core.ingest import bands_to_layers, ingest_multispectral, ingest_rgb_result
+from src.twin_core.swarm import Assignment, Fleet, allocate, sortie_groups, tasks_from_twin
+from src.twin_core.decisions import scouting_targets, spray_options, zone_risk
 from src.twin_core import mavlink_mission as mm
 from src.twin_core.virtual_field import VirtualField, serpentine_waypoints
 from src.twin_core.weather_feed import get_weather, synthetic_weather
@@ -180,11 +181,26 @@ class SimReset(BaseModel):
     outbreaks: Optional[List[Dict[str, float]]] = Field(
         None, description="[{row, col, radius, load}] in twin grid cells; default = one hidden outbreak")
     reset_twin: bool = True
+    simulated: bool = Field(False, description="Ignore an uploaded field and build a random virtual field")
+
+
+class FieldFromImage(BaseModel):
+    name: str = "Uploaded field"
+    bands: Dict[str, List[List[Optional[float]]]] = Field(
+        ..., description="green, red, red_edge, nir reflectance (0-1), any resolution; resampled onto the twin grid")
+    center_lat: Optional[float] = Field(None, ge=-90, le=90)
+    center_lon: Optional[float] = Field(None, ge=-180, le=180)
+    width_m: Optional[float] = Field(None, gt=0, description="ground width of the image (from its georeference)")
+    height_m: Optional[float] = Field(None, gt=0, description="ground height of the image")
+    growth_stage: Optional[str] = None
+    mode: Literal["new", "update"] = Field(
+        "new", description="'new' field, or 'update': a new flight of the loaded field, assimilated by the twin")
 
 
 class SimAdvance(BaseModel):
     days:           int = Field(1, ge=1, le=60)
-    weather_source: Literal["synthetic", "openmeteo", "auto"] = "synthetic"
+    weather_source: Optional[Literal["synthetic", "openmeteo", "auto"]] = Field(
+        None, description="default: the real forecast for an uploaded field ('auto'), synthetic otherwise")
     interventions:  List[Intervention] = []
 
 
@@ -203,6 +219,12 @@ class MissionRequest(BaseModel):
     dose_l_per_ha:    float = Field(25.0, gt=0.0, le=200.0)
     zones:            Optional[List[int]] = None
     include_track:    bool = False
+    adaptive: bool = Field(False, description="scout only the zones where the twin is unsure "
+                                              "whether the spray threshold is crossed")
+    wind_m_s: Optional[float] = Field(None, ge=0.0, le=40.0,
+                                      description="planning wind; None = the forecast for tomorrow")
+    refills: bool = Field(False, description="allow landing to refill / swap batteries (planning and "
+                                             "mission files only; the in-process flight is one sortie)")
     backend: Literal["physics", "mavlink"] = Field(
         "physics", description="physics = in-process 6-DOF fleet; mavlink = upload and fly over MAVLink "
                                "(UAV_TWIN_MAVLINK_MODE: emulated vehicles or ArduPilot SITL)")
@@ -262,6 +284,17 @@ class WhatIfRequest(BaseModel):
     interventions: List[Intervention] = []
 
 
+class SprayDecisionRequest(BaseModel):
+    zones:             Optional[List[int]] = None
+    fungus_threshold:  float = Field(0.2, ge=0.0, le=1.0)
+    min_infected_frac: float = Field(0.1, gt=0.0, le=1.0)
+    delays:            List[int] = Field([0, 2], description="days to wait before spraying (0 = tomorrow)")
+    horizon_days:      int = Field(21, ge=3, le=60)
+    samples:           int = Field(8, ge=2, le=32)
+    product_l_ha:      float = Field(1.0, gt=0.0, le=10.0, description="formulated fungicide, L/ha")
+    weather_source:    Optional[WeatherSource] = None
+
+
 class StageRequest(BaseModel):
     growth_stage: str
 
@@ -293,7 +326,7 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
                            "fleet": None, "pending_interventions": [], "field_listeners": set(),
                            "last_track": None, "mavlink": None,
                            "demo": {"task": None, "phase": "idle", "text": "", "day": 0, "error": None},
-                           "metrics": None}
+                           "metrics": None, "user_field": None}
 
     def get_twin() -> DigitalTwin:
         if ctx["twin"] is None:
@@ -342,17 +375,34 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
             ctx["mavlink"] = emu
         return dict(emu.connections)
 
-    def plan_mission(kind: str, req: "MissionRequest"):
+    def plan_mission(kind: str, req: "MissionRequest", flying: bool = False):
         fleet, twin = get_fleet(), get_twin()
         if req.zones:
             bad = [z for z in req.zones if z not in twin.zone_names]
             if bad:
                 raise HTTPException(400, f"Unknown zone_id(s) {bad}. Valid: {sorted(twin.zone_names)}")
+        zones = req.zones
+        if kind == "scout" and req.adaptive and not zones:
+            zones = scouting_targets(twin, req.fungus_threshold) or None
         tasks = tasks_from_twin(twin, kind, fleet.frame, fleet.spec,
                                 fungus_threshold=req.fungus_threshold,
-                                dose_l_per_ha=req.dose_l_per_ha, zones=req.zones,
+                                dose_l_per_ha=req.dose_l_per_ha, zones=zones,
                                 min_infected_frac=req.min_infected_frac)
-        return tasks, allocate(tasks, fleet.drone_info())
+        wind = req.wind_m_s
+        if wind is None:
+            wind = 0.0 if flying else planning_wind()   # the in-process flight has no wind
+        return tasks, allocate(tasks, fleet.drone_info(), wind_m_s=wind,
+                               refills=req.refills and not flying)
+
+    def planning_wind() -> float:
+        """Tomorrow's forecast wind (m/s) for a real field; calm for the simulated one."""
+        if not ctx.get("user_field"):
+            return 0.0
+        try:
+            w, _ = forecast("auto", 1, get_twin().state.sim_day + 1)
+            return float(w[0].get("wind_speed", 0.0)) / 3.6
+        except Exception:
+            return 0.0
 
     def forecast(source: str, days: int, start_day: int) -> tuple:
         lat, lon = get_twin().state.grid.center_latlon()
@@ -480,7 +530,11 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
         if cached is not None and cached["version"] == version:
             return cached
         twin = get_twin()
-        weather = synthetic_weather(FORECAST_DAYS, start_day=twin.state.sim_day + 1)
+        if ctx.get("user_field"):          # an uploaded field: forecast with its real weather (synthetic offline)
+            lat, lon = twin.state.grid.center_latlon()
+            weather, _ = get_weather(lat, lon, FORECAST_DAYS, source="auto", start_day=twin.state.sim_day + 1)
+        else:
+            weather = synthetic_weather(FORECAST_DAYS, start_day=twin.state.sim_day + 1)
         fleet = get_fleet()
         spray_tasks = tasks_from_twin(twin, "spray", fleet.frame, fleet.spec, fungus_threshold=0.15)
         plan = [{"day": 1, "zone_id": t.zone_id, "type": "Fungicide Spray"} for t in spray_tasks]
@@ -766,6 +820,9 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
 
     @app.post("/sim/reset", summary="Create a new hidden virtual field")
     def sim_reset(req: SimReset):
+        if ctx.get("user_field") and not req.simulated:
+            # An uploaded field is loaded: start again from it (the demo story hides one outbreak in it).
+            return build_user_field(seed=req.seed, outbreaks=req.outbreaks, reset_twin=req.reset_twin)
         twin = get_twin()
         if req.reset_twin:
             twin.reset()
@@ -779,11 +836,195 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
                                       params=twin.params)
         return {"status": "ok", "seed": req.seed, "error": ctx["virtual"].twin_error(twin)}
 
+    # ============================================================
+    # USER FIELD (an uploaded multispectral image becomes the twin's field)
+    # ============================================================
+
+    def _resample_to_grid(arr: np.ndarray, shape) -> np.ndarray:
+        """Area-average a (H, W) array onto the twin grid; NaNs (no-data) are ignored."""
+        rows, cols = shape
+        h, w = arr.shape
+        ri = (np.arange(h) * rows // h)
+        ci = (np.arange(w) * cols // w)
+        valid = np.isfinite(arr)
+        s = np.zeros(shape, np.float64)
+        n = np.zeros(shape, np.float64)
+        np.add.at(s, (ri[:, None].repeat(w, 1)[valid], ci[None, :].repeat(h, 0)[valid]), arr[valid])
+        np.add.at(n, (ri[:, None].repeat(w, 1)[valid], ci[None, :].repeat(h, 0)[valid]), 1.0)
+        out = np.where(n > 0, s / np.maximum(n, 1), np.nan)
+        if np.isnan(out).any():                          # cells with no data at all: field mean
+            out = np.where(np.isnan(out), np.nanmean(out) if np.isfinite(out).any() else 0.0, out)
+        return out.astype(np.float32)
+
+    # What a drone image reliably says about the field: NDVI. Not "moisture": over a green rice canopy the
+    # image's NDWI (green/NIR) is strongly negative, which would read a flooded paddy as drying out. Not
+    # "nitrogen" either: the red-edge proxy (CIre / 5) is uncalibrated for these sensors and drove the
+    # forecast into false nitrogen deficiency. Both stay with the crop model until calibrated.
+    IMAGE_LAYERS = ("ndvi",)
+
+    def _assimilate_image(twin, layers: Dict[str, np.ndarray], source: str) -> None:
+        for name in IMAGE_LAYERS:
+            if name in layers:
+                twin.observe_grid(name, layers[name], source=source)
+
+    def build_user_field(seed: int = 42, outbreaks=None, reset_twin: bool = True) -> Dict[str, Any]:
+        """Rebuild the twin and the 'real' field from the stored upload.
+
+        REALITY = the field exactly as the image shows it (NDVI, moisture, nitrogen), evolving with the
+        crop model; outbreaks=[] adds no disease, None hides the default one (demo story).
+        TWIN    = its prior, then the image assimilated as a multispectral survey, so it starts close
+        to the real field with honest uncertainty, and drone scouting refines it from there.
+        """
+        uf = ctx["user_field"]
+        twin = get_twin()
+        layers = uf["layers"]
+        if reset_twin:
+            twin.reset()
+            _assimilate_image(twin, layers, source=f"upload:{uf['name']}")
+            ctx["anomalies"].clear()
+            ctx["ue5_snapshot"] = ue5_grids()
+        ctx["pending_interventions"] = []
+        ctx["metrics"] = new_metrics()
+        vf = VirtualField(twin.state.grid, seed=seed, outbreaks=[], dry_patch={},
+                          propagation_model=twin.propagation_model, zone_layout=twin.zone_layout,
+                          crop_model=twin.crop_model, params=twin.params)
+        m = vf.truth.state.mean
+        for name in IMAGE_LAYERS:
+            if name in layers and name in m:
+                m[name] = np.clip(layers[name], -1.0 if name == "ndvi" else 0.0, 1.0).astype(np.float32)
+        g = twin.state.grid
+        if outbreaks is None:      # demo / reset story: one disease patch the twin has not been told about
+            outbreaks = [{"row": g.rows * 0.3, "col": g.cols * 0.65, "radius": g.rows * 0.12, "load": 0.55}]
+        for ob in outbreaks:
+            vf.inject_outbreak(ob["row"], ob["col"], radius_cells=ob.get("radius", 3.0), load=ob.get("load", 0.5))
+        vf.truth._refresh_stress()
+        for name in LAYERS:
+            vf.truth.state.var[name][:] = 0.0
+        ctx["virtual"] = vf
+        ctx["field_version"] = ctx.get("field_version", 0) + 1
+        return {"status": "ok", "source": "upload", "name": uf["name"], "seed": seed,
+                "error": vf.twin_error(twin)}
+
+    @app.post("/field/from-image", summary="Make an uploaded multispectral image the twin's field")
+    def field_from_image(req: FieldFromImage):
+        need = ("green", "red", "red_edge", "nir")
+        missing = [b for b in need if b not in req.bands]
+        if missing:
+            raise HTTPException(400, f"Missing bands {missing}; expected {list(need)}")
+        twin = get_twin()
+        if req.mode == "update":
+            if not ctx.get("user_field"):
+                raise HTTPException(409, "No uploaded field to update: send it with mode 'new' first")
+            return field_update(req, need)
+        g0 = twin.state.grid
+        cell = settings.twin_cell_size_m
+        size_note = None
+        if req.width_m and req.height_m:
+            side = max(req.width_m, req.height_m)
+            if 40.0 <= side <= 3000.0:                    # a plausible field: the grid covers it exactly
+                cell = side / g0.rows
+            else:
+                size_note = (f"The image covers {req.width_m:.0f} x {req.height_m:.0f} m, so it is shown on the "
+                             f"default {g0.rows * settings.twin_cell_size_m:.0f} m grid.")
+        g = twin.state.grid
+        lat, lon = (req.center_lat, req.center_lon) if req.center_lat is not None and req.center_lon is not None \
+            else g.center_latlon()
+        grid = FieldGrid.centered_on(lat, lon, rows=g.rows, cols=g.cols, cell_size_m=cell)
+        if (round(grid.origin_lat, 7), round(grid.origin_lon, 7), round(grid.cell_size_m, 4)) != (
+                round(g.origin_lat, 7), round(g.origin_lon, 7), round(g.cell_size_m, 4)):
+            # Same number of cells, anchored on (and sized to) the real field: a fresh twin, fleet and pads.
+            # It keeps the old twin's storage (none in tests), so it never writes over another twin's files.
+            ctx["twin"] = DigitalTwin(field_id=twin.field_id, grid=grid,
+                                      storage_dir=twin.storage_dir.parent if twin.storage_dir else None,
+                                      propagation_model=twin.propagation_model, crop_model=twin.crop_model,
+                                      zone_layout=twin.zone_layout, params=twin.params)
+            ctx["_versioned"] = False
+            ctx["fleet"] = None
+            twin = get_twin()
+        if req.growth_stage:
+            try:
+                twin.set_growth_stage(req.growth_stage)
+            except Exception:
+                pass
+        bands = _bands_on_grid(req, need, twin.state.grid.shape)
+        layers = bands_to_layers(bands)
+        means = {k: round(float(np.nanmean(v)), 4) for k, v in layers.items()}
+        ctx["user_field"] = {"name": req.name, "bands": bands, "layers": layers,
+                             "center": twin.state.grid.center_latlon(), "loaded_at": time.time(),
+                             "flights": [{"name": req.name, "at": time.time(), "sim_day": 0, "means": means}]}
+        out = build_user_field(seed=42, outbreaks=[])
+        g = twin.state.grid
+        out.update({"grid": {"rows": g.rows, "cols": g.cols, "cell_size_m": round(g.cell_size_m, 3),
+                             "center": g.center_latlon(), "area_ha": round(g.area_m2 / 10000.0, 3)},
+                    "means": means, "size_note": size_note})
+        return out
+
+    def _bands_on_grid(req, need, shape) -> Dict[str, np.ndarray]:
+        bands = {}
+        for b in need:
+            arr = np.array([[np.nan if v is None else v for v in row] for row in req.bands[b]], dtype=np.float32)
+            if arr.ndim != 2 or arr.size == 0:
+                raise HTTPException(400, f"Band '{b}' must be a non-empty 2D list")
+            if np.nanmax(arr) > 1.5:                      # 0-10000 / 0-65535 scaled reflectance
+                arr = arr / (10000.0 if np.nanmax(arr) <= 10000 else 65535.0)
+            bands[b] = _resample_to_grid(arr, shape)
+        return bands
+
+    def field_update(req, need) -> Dict[str, Any]:
+        """A new flight of the loaded field: the twin assimilates it as a survey (its uncertainty
+        shrinks), and the real field takes the observed values (its disease state is kept)."""
+        twin, vf, uf = get_twin(), get_virtual(), ctx["user_field"]
+        bands = _bands_on_grid(req, need, twin.state.grid.shape)
+        layers = bands_to_layers(bands)
+        before = vf.twin_error(twin)
+        std_before = float(np.sqrt(twin.state.var["ndvi"]).mean())
+        _assimilate_image(twin, layers, source=f"flight:{req.name}")
+        m = vf.truth.state.mean
+        for name in IMAGE_LAYERS:
+            if name in layers and name in m:
+                m[name] = np.clip(layers[name], -1.0 if name == "ndvi" else 0.0, 1.0).astype(np.float32)
+        vf.truth._refresh_stress()
+        for name in LAYERS:
+            vf.truth.state.var[name][:] = 0.0
+        means = {k: round(float(np.nanmean(v)), 4) for k, v in layers.items()}
+        uf.update({"bands": bands, "layers": layers})
+        uf.setdefault("flights", []).append({"name": req.name, "at": time.time(),
+                                            "sim_day": twin.state.sim_day, "means": means})
+        detect_anomalies()
+        ctx["field_version"] = ctx.get("field_version", 0) + 1
+        return {"status": "ok", "source": "upload", "mode": "update", "name": uf["name"],
+                "flights": len(uf["flights"]), "means": means, "error_before": before,
+                "error_after": vf.twin_error(twin),
+                "ndvi_uncertainty": {"before": round(std_before, 4),
+                                     "after": round(float(np.sqrt(twin.state.var["ndvi"]).mean()), 4)}}
+
+    @app.get("/field/flights", summary="Flights (uploads) of the current field")
+    def field_flights():
+        uf = ctx.get("user_field")
+        return {"name": uf["name"] if uf else None, "flights": (uf or {}).get("flights", [])}
+
+    @app.delete("/field/user", summary="Forget the uploaded field and go back to the simulated one")
+    def field_forget():
+        ctx["user_field"] = None
+        return sim_reset(SimReset(simulated=True))
+
+    @app.get("/field/source", summary="Which field the twin is tracking")
+    def field_source():
+        return field_source_view()
+
+    def field_source_view() -> Dict[str, Any]:
+        uf = ctx.get("user_field")
+        if uf:
+            lat, lon = uf["center"]
+            return {"source": "upload", "name": uf["name"], "center": [round(lat, 6), round(lon, 6)]}
+        return {"source": "simulated", "name": "Field Alpha (simulated)", "center": None}
+
     @app.post("/sim/advance", summary="Advance the virtual field and the twin together")
     def sim_advance(req: SimAdvance):
         twin, vf = get_twin(), get_virtual()
         _check_zones(twin, req.interventions)
-        weather, used = forecast(req.weather_source, req.days, vf.sim_day + 1)
+        source = req.weather_source or ("auto" if ctx.get("user_field") else "synthetic")
+        weather, used = forecast(source, req.days, vf.sim_day + 1)
         plan = [i.model_dump() for i in req.interventions]
         # Sprays flown by the fleet since the last advance take effect on day 1.
         flown = [{"day": 1, "zone_id": p["zone_id"], "type": p["type"]}
@@ -836,7 +1077,7 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
         wind = twin.state.last_weather or None
         reports = []
         for kind in (("scout", "spray") if req.kind == "auto" else (req.kind,)):
-            tasks, plan = plan_mission(kind, req)
+            tasks, plan = plan_mission(kind, req, flying=True)
             if req.backend == "mavlink":
                 report = mm.execute_plan_mavlink(
                     plan, fleet.frame, mavlink_connections(), homes=drone_homes(),
@@ -900,14 +1141,21 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
         _, plan = plan_mission(req.kind, req)
         homes = drone_homes()
         out = {}
+        lane_model = mm.lane_model_for(settings.twin_mavlink_mode, settings.twin_params_file.parent)
         for k, (d_id, a) in enumerate(plan.assignments.items()):
-            if a.tasks:
-                mission = mm.compile_mission(
-                    a, fleet.frame, transit_alt=14.0 + 2.0 * k, home=homes[d_id],
-                    lane_model=mm.lane_model_for(settings.twin_mavlink_mode, settings.twin_params_file.parent))
-                out[d_id] = {"items": len(mission.items), "pump_pwm": mission.spray_pwm,
-                             "waypoints": mm.to_qgc_wpl(mission)}
-        return {"kind": req.kind, "missions": out, "unassigned": [t.task_id for t in plan.unassigned]}
+            if not a.tasks:
+                continue
+            groups = sortie_groups(a.tasks, fleet.spec.tank_kg) if req.refills else [a.tasks]
+            for n, group in enumerate(groups, start=1):
+                part = Assignment(d_id, group, payload_kg=sum(t.payload_kg for t in group))
+                mission = mm.compile_mission(part, fleet.frame, transit_alt=14.0 + 2.0 * k,
+                                             home=homes[d_id], lane_model=lane_model)
+                key = d_id if len(groups) == 1 else f"{d_id}_sortie{n}"
+                out[key] = {"items": len(mission.items), "pump_pwm": mission.spray_pwm,
+                            "waypoints": mm.to_qgc_wpl(mission)}
+        return {"kind": req.kind, "missions": out, "unassigned": [t.task_id for t in plan.unassigned],
+                "blocked": plan.blocked, "wind_m_s": plan.wind_m_s,
+                "est_time_s": round(plan.makespan_s, 1)}
 
     @app.get("/swarm/sitl-homes", summary="One ArduCopter SITL instance per drone, at its launch pad")
     def swarm_sitl_homes():
@@ -998,7 +1246,7 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
     async def fly(kind: str, req: DemoRequest) -> Dict[str, Any]:
         mreq = MissionRequest(kind=kind, backend=req.backend, fungus_threshold=req.fungus_threshold)
         fleet = get_fleet()
-        tasks, plan = plan_mission(kind, mreq)
+        tasks, plan = plan_mission(kind, mreq, flying=True)
         if not tasks:
             return {"tasks": 0}
         if req.backend == "mavlink":
@@ -1155,6 +1403,7 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
             "field": field_snapshot(version) if version != since else None,
             "metrics": metrics_view(),
             "weather": frame_weather(),
+            "field_source": field_source_view(),
         }
 
     def frame_weather():
@@ -1212,6 +1461,24 @@ def create_app(twin: Optional[DigitalTwin] = None) -> FastAPI:
         _check_zones(twin, req.interventions)
         return twin.what_if(days=req.days, weather=req.weather,
                             interventions=[i.model_dump() for i in req.interventions])
+
+    @app.post("/twin/spray-decision", summary="Spray now, later or not at all: rupees, risk and timing")
+    def twin_spray_decision(req: SprayDecisionRequest):
+        twin = get_twin()
+        if req.zones:
+            _check_zones(twin, [Intervention(zone_id=z, type="Fungicide Spray") for z in req.zones])
+        source = req.weather_source or ("auto" if ctx.get("user_field") else "synthetic")
+        weather, used = forecast(source, req.horizon_days, twin.state.sim_day + 1)
+        out = spray_options(twin, lambda t: expected_harvest_t_ha(t), weather, zones=req.zones,
+                            threshold=req.fungus_threshold, min_infected_frac=req.min_infected_frac,
+                            delays=req.delays, horizon_days=req.horizon_days, samples=req.samples,
+                            product_l_ha=req.product_l_ha)
+        return {**out, "weather_source": used}
+
+    @app.get("/twin/scouting-targets", summary="Zones where scouting would change the spray decision most")
+    def twin_scouting_targets(fungus_threshold: float = 0.2):
+        twin = get_twin()
+        return {"zones": scouting_targets(twin, fungus_threshold), "zone_risk": zone_risk(twin, fungus_threshold)}
 
     @app.post("/twin/stage", summary="Set the paddy growth stage")
     def twin_stage(req: StageRequest):

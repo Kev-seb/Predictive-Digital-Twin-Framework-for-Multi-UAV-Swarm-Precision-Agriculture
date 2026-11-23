@@ -101,7 +101,7 @@ def get_shared_state():
         "SWARM_WARNINGS": [],
         "ACTIVE_PARTICLES": np.zeros((0, 3), dtype=np.float32),
         "WS_CLIENTS": set(),
-        "TELEMETRY_PORT": 8000,
+        "TELEMETRY_PORT": 8010,          # 8000 is the Unreal Engine MCP server
         "WEBSOCKET_PORT": 8765,
         # Fleet size for the swarm simulation (UAV_DASHBOARD_SWARM_SIZE, default 2);
         # can be changed live from the Swarm tab.
@@ -208,7 +208,7 @@ class TelemetryRequestHandler(BaseHTTPRequestHandler):
 
 def run_http_server():
     global TELEMETRY_PORT
-    for port in range(8000, 8021):
+    for port in range(8010, 8031):       # stay off 8000 (Unreal MCP) and 8008 (twin API)
         try:
             server_address = ('127.0.0.1', port)
             httpd = HTTPServer(server_address, TelemetryRequestHandler)
@@ -779,7 +779,11 @@ def plot_boundaries_contours(pathogen: np.ndarray, boundaries: np.ndarray, title
 PAGE = ui_shell.sidebar_nav()
 
 with st.sidebar.expander("Field settings", icon=":material/settings:"):
-    crop_stage = st.selectbox("Crop growth stage", STAGES, index=1)
+    if "stage_pending" in st.session_state:               # set by "Use this stage" on Upload
+        st.session_state["crop_stage_sel"] = st.session_state.pop("stage_pending")
+    crop_stage = st.selectbox("Crop growth stage", STAGES, index=1, key="crop_stage_sel")
+    transplant_date = st.date_input("Transplanting date (optional)", value=None, key="transplant_date",
+                                    help="Lets the app work out the growth stage from the field's real temperatures")
     stress_threshold = st.slider("Stress detection threshold", 0.30, 0.80, 0.55, 0.05)
     grid_size = st.slider("Field grid size", 3, 10, 5)
     st.caption("Field location (weather)")
@@ -817,6 +821,12 @@ def _demo_ms_image():
 if PAGE == "overview":
     from src.dashboard import overview
     overview.render()
+if PAGE == "farm":
+    from src.dashboard import farm_home
+    farm_home.render()
+if PAGE == "leafcheck":
+    from src.dashboard import leaf_check
+    leaf_check.render()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -845,12 +855,23 @@ if show_page(0):
         except Exception:
             return None
 
-    def _set_field(img, name, source):
+    def _set_field(img, name, source, flight=False, path=None, report=None, saved_field_id=None):
+        """flight=True: a new flight of the loaded field (the twin is updated, not replaced).
+        path: the GeoTIFF, saved to the field store; saved_field_id: reopening a saved field (no new save)."""
+        idx_new = compute_all_indices(img.bands)
+        st.session_state["load_report"] = report
+        if not flight:
+            st.session_state["field_name"] = name
+            st.session_state["flights"] = []
+        st.session_state["flights"] = st.session_state.get("flights", []) + [{
+            "Flight": len(st.session_state.get("flights", [])) + 1, "Image": name,
+            "Loaded": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
+            "NDVI mean": round(float(np.nanmean(idx_new["ndvi"])), 3),
+            "Stress score": round(float(np.nanmean(idx_new["stress_score"])), 3)}]
         st.session_state["ms_image"] = img
-        st.session_state["indices"] = compute_all_indices(img.bands)
+        st.session_state["indices"] = idx_new
         st.session_state["crop_stage"] = crop_stage
         st.session_state["data_source"] = source
-        st.session_state["field_name"] = name
         for k in ("weather_assessment", "simulation_result", "opt_report", "custom_interventions"):
             st.session_state.pop(k, None)            # results of the previous field are no longer valid
         geo = _geo_center(img)
@@ -859,11 +880,68 @@ if show_page(0):
             st.session_state["geo_center_pending"] = geo
         ui_shell.reset_progress()
         ui_shell.mark_done("upload")
+        from src.dashboard import twin_link
+        st.session_state["field_footprint"] = twin_link.footprint_m(img)
+        # field store: every field and flight is kept (outputs/paddytwin.db)
+        from src.storage import field_store as _fs
+        if saved_field_id is not None:
+            st.session_state["field_id"] = saved_field_id
+        elif source != "demo":
+            try:
+                fp = st.session_state["field_footprint"] or (None, None)
+                if not flight or "field_id" not in st.session_state:
+                    st.session_state["field_id"] = _fs.create_field(name, *(geo or (None, None)), *fp)
+                _fs.add_flight(st.session_state["field_id"], name, path,
+                               float(np.nanmean(idx_new["ndvi"])), float(np.nanmean(idx_new["stress_score"])),
+                               (report or {}).get("units", ""))
+            except Exception as _e:
+                st.warning(f"The field could not be saved: {_e}")
+        else:
+            st.session_state.pop("field_id", None)
+        with st.spinner("Sending the field to the live twin..."):
+            st.session_state["twin_link"] = twin_link.push_field(
+                img, st.session_state["field_name"] if flight else name, geo, crop_stage,
+                mode="update" if flight else "new")
 
     has_field = "ms_image" in st.session_state
+    from src.storage import field_store as _fs
+    _saved = _fs.list_fields()
+    if _saved:
+        with st.expander(f"Your saved fields ({len(_saved)})", icon=":material/folder_open:",
+                         expanded=not has_field):
+            _labels = {f["id"]: f"{f['name']} · {f['flights']} flight(s) · "
+                                f"{pd.Timestamp(f['last_flight'] or f['created'], unit='s').strftime('%d %b %Y %H:%M')}"
+                       for f in _saved}
+            _pick = st.selectbox("Field", list(_labels), format_func=_labels.get, key="saved_field_pick")
+            _o1, _o2 = st.columns(2)
+            if _o1.button("Open this field", icon=":material/open_in_new:", type="primary", use_container_width=True):
+                _fl = _fs.flights(_pick)
+                _last = next((x for x in reversed(_fl) if x["path"] and Path(x["path"]).exists()), None)
+                if _last is None:
+                    st.error("This field's image files are missing.")
+                else:
+                    from src.core.field_image import load_field_image
+                    _img, _rep = load_field_image(_last["path"])
+                    _fname = next(f["name"] for f in _saved if f["id"] == _pick)
+                    _set_field(_img, _fname, "saved", report=_rep, saved_field_id=_pick)
+                    st.session_state["flights"] = [{"Flight": i + 1, "Image": x["name"],
+                                                    "Loaded": pd.Timestamp(x["loaded_at"], unit="s").strftime("%Y-%m-%d %H:%M"),
+                                                    "NDVI mean": round(x["ndvi_mean"] or 0, 3),
+                                                    "Stress score": round(x["stress_mean"] or 0, 3)}
+                                                   for i, x in enumerate(_fl)]
+                    st.rerun()
+            if _o2.button("Delete this field", icon=":material/delete:", use_container_width=True):
+                _fs.delete_field(_pick)
+                st.rerun()
     with st.container(border=True):
         up_l, up_r = st.columns([3, 2], gap="large")
         with up_l:
+            as_flight = False
+            if has_field:
+                as_flight = st.toggle(f"Next image is a new flight of **{st.session_state.get('field_name', 'this field')}**",
+                                      value=True, key="upload_as_flight",
+                                      help="On: the twin assimilates it as a new survey of the same field (its "
+                                           "history and uncertainty carry on). Off: it becomes a new field.")
             uploaded = st.file_uploader("Multispectral GeoTIFF (Green / Red / Red Edge / NIR)",
                                         type=["tif", "tiff"], key="field_upload")
         with up_r:
@@ -874,9 +952,13 @@ if show_page(0):
             if has_field:
                 if st.button("Remove field and start over", icon=":material/delete:", use_container_width=True):
                     for k in ("ms_image", "indices", "data_source", "field_name", "field_geo", "upload_id",
+                              "flights", "field_footprint",
                               "weather_assessment", "simulation_result", "opt_report", "custom_interventions"):
                         st.session_state.pop(k, None)
                     ui_shell.reset_progress()
+                    from src.dashboard import twin_link
+                    twin_link.forget_field()
+                    st.session_state.pop("twin_link", None)
                     st.rerun()
 
     new_field = False
@@ -886,7 +968,9 @@ if show_page(0):
             tmp_path = Path(tempfile.gettempdir()) / f"uploaded_{uploaded.file_id}.tif"
             tmp_path.write_bytes(uploaded.getvalue())
             try:
-                _set_field(load_multispectral_tiff(tmp_path), uploaded.name, "upload")
+                from src.core.field_image import load_field_image
+                _img, _rep = load_field_image(tmp_path)
+                _set_field(_img, uploaded.name, "upload", flight=as_flight, path=tmp_path, report=_rep)
                 st.session_state["upload_id"] = uploaded.file_id
                 new_field = True
             except Exception as e:
@@ -894,7 +978,9 @@ if show_page(0):
     elif sample_btn:
         _sample = Path(__file__).resolve().parents[2] / "data" / "samples" / "sample_paddy.tif"
         try:
-            _set_field(load_multispectral_tiff(_sample), _sample.name, "sample")
+            from src.core.field_image import load_field_image
+            _img, _rep = load_field_image(_sample)
+            _set_field(_img, _sample.name, "sample", path=_sample, report=_rep)
             new_field = True
         except Exception as e:
             st.error(f"Sample GeoTIFF not available: {e}")
@@ -923,13 +1009,74 @@ if show_page(0):
         st.success(f"**{st.session_state.get('field_name', 'Field')}** is loaded. Continue to the next step below.",
                    icon=":material/check_circle:")
         f1, f2, f3, f4 = st.columns(4)
+        fp = st.session_state.get("field_footprint")
         f1.metric("Source", src_label)
-        f2.metric("Size", f"{ms_image.width} × {ms_image.height} px")
-        f3.metric("Bands", f"{len(ms_image.bands)}")
+        f2.metric("Size", f"{ms_image.width} × {ms_image.height} px",
+                  help=f"Ground footprint {fp[0]:.0f} × {fp[1]:.0f} m ({fp[0] * fp[1] / 10000:.2f} ha)" if fp else None)
+        f3.metric("Flights", f"{len(st.session_state.get('flights', [])) or 1}")
         f4.metric("Location", f"{geo[0]:.3f}, {geo[1]:.3f}" if geo else "Not set", help="Field centre (lat, lon) from the GeoTIFF")
         if geo is None:
             st.caption("This image has no georeference: set the field location under **Field settings** in the "
                        "sidebar for the weather step.")
+        _lr = st.session_state.get("load_report")
+        if _lr:
+            st.caption(f"Read as {_lr['units']}; {_lr['used_px'][0]} × {_lr['used_px'][1]} px used"
+                       + (f" (from {_lr['original_px'][0]} × {_lr['original_px'][1]})" if _lr["downsampled"] else "")
+                       + f"; NDVI 5th–95th percentile {_lr['ndvi_p5']:.2f} – {_lr['ndvi_p95']:.2f}.")
+            for _w in _lr["warnings"]:
+                st.warning(_w, icon=":material/report:")
+        link = st.session_state.get("twin_link")
+        if link:
+            (st.info if link[0] else st.warning)(link[1], icon=":material/hub:" if link[0] else ":material/cloud_off:")
+
+        flights = st.session_state.get("flights", [])
+        if len(flights) > 1:
+            st.subheader("Flight history")
+            fl = pd.DataFrame(flights)
+            st.dataframe(fl, hide_index=True, use_container_width=True)
+            d = fl["NDVI mean"].iloc[-1] - fl["NDVI mean"].iloc[-2]
+            st.caption(f"Since the previous flight, mean NDVI {'rose' if d >= 0 else 'fell'} by {abs(d):.3f}.")
+
+        st.subheader("Growth stage")
+        from src.ai_engine import crop_stage as _cs
+        g1, g2 = st.columns(2, gap="medium")
+        with g1, st.container(border=True):
+            st.markdown("**From the transplanting date** · primary")
+            if transplant_date is None:
+                st.caption("Set the transplanting date under **Field settings** in the sidebar. The stage then "
+                           "comes from the field's real temperatures since transplanting (correct on all 20 "
+                           "flights of the project's dataset).")
+            else:
+                _key = ("stage_gdd", str(transplant_date), round(lat, 3), round(lon, 3), str(pd.Timestamp.now().date()))
+                if st.session_state.get("stage_gdd_key") != _key:
+                    with st.spinner("Reading the field's temperatures since transplanting..."):
+                        st.session_state["stage_gdd"] = _cs.stage_from_transplanting(transplant_date, lat, lon)
+                    st.session_state["stage_gdd_key"] = _key
+                sg = st.session_state["stage_gdd"]
+                st.metric("Stage", sg["stage"], help=f"{sg['gdd']:.0f} growing degree-days, weather: {sg['weather']}")
+                st.caption(f"Day {sg['days_after_transplanting']} after transplanting · {sg['gdd']:.0f} degree-days · "
+                           f"{sg['next_stage']} in about {sg['days_to_next']} days")
+                if sg["stage"] in STAGES and sg["stage"] != crop_stage:
+                    if st.button(f"Use {sg['stage']} for the analysis", key="use_stage_gdd"):
+                        st.session_state["stage_pending"] = sg["stage"]
+                        st.rerun()
+        with g2, st.container(border=True):
+            st.markdown("**From the image** · AI estimate")
+            card = _cs.stage_model_card()
+            if card is None:
+                st.caption("No stage model trained yet (research/09_train_stage_model.py).")
+            else:
+                _ikey = ("stage_img", st.session_state.get("field_name"), len(st.session_state.get("flights", [])))
+                if st.session_state.get("stage_img_key") != _ikey:
+                    with st.spinner("Running the stage model..."):
+                        st.session_state["stage_img"] = _cs.stage_from_image(ms_image.bands)
+                    st.session_state["stage_img_key"] = _ikey
+                si = st.session_state["stage_img"]
+                st.metric("Stage", si["stage"], help=f"Average over {si['patches']} image patches")
+                ev = card["evaluation"]
+                st.caption(f"Confidence {si['confidence'] * 100:.0f}%. Tested on drone flights it never saw: "
+                           f"{ev['test_acc'] * 100:.0f}% of patches right (guessing: {card['chance_accuracy'] * 100:.0f}%). "
+                           "Treat it as a hint; the transplanting date is more reliable.")
 
         st.subheader("Image composites")
         c1, c2, c3 = st.columns(3)
@@ -1741,6 +1888,8 @@ if show_page(5):
 
 if show_page(6):
     st.header("Predictive Field Digital Twin Ecosystem")
+    from src.dashboard import validation as _validation
+    _validation.render()
     
     if "ms_image" not in st.session_state or "indices" not in st.session_state:
         st.info("No field image loaded. Open **Data & reports › Upload & process** to upload a GeoTIFF or use the demo field.")
@@ -2545,35 +2694,129 @@ if show_page(7):
                     for a in day_actions:
                         st.markdown(f"- {a}")
                         
-            # Export GIS VRA map
-            st.subheader("Export Precision Agriculture GIS Layer")
-            st.markdown(
-                "Export variable-rate application maps in standard GIS GeoJSON format. "
-                "This format is directly compatible with modern onboard tractor computer control units."
-            )
-            
-            # Generate export path
-            export_path = "outputs/prescriptions/field_vra_prescription.geojson"
-            recommender.export_gis_geojson(
-                prescriptions=prescriptions,
-                zone_labels=zone_labels,
-                center_lat=lat,
-                center_lon=lon,
-                output_file=export_path
-            )
-            
+            # Prescription maps for field machines (src/gis/prescription_export.py)
+            st.subheader("Prescription map for your machines")
+            st.markdown("One polygon per management zone, traced with the uploaded image's georeference, with "
+                        "numeric rates (`N_KG_HA`, `P_KG_HA`, `K_KG_HA`, `IRR_MM`, `FUNG_L_HA`) that variable-rate "
+                        "controllers and spray drones read.")
+            from src.gis import prescription_export as _pe
+            cell_m = st.select_slider("Prescription cell size", options=[1.0, 2.0, 3.0, 5.0, 10.0], value=2.0,
+                                      format_func=lambda v: f"{v:g} m",
+                                      help="Each cell takes its majority zone. Match it to your sprayer or "
+                                           "drone swath; smaller cells give finer, larger files.")
             try:
-                with open(export_path, "r") as f:
-                    geojson_data = f.read()
-                    
-                st.download_button(
-                    label="Download VRA GIS Layer (GeoJSON)",
-                    data=geojson_data,
-                    file_name="field_vra_prescription.geojson",
-                    mime="application/geo+json"
-                )
-            except FileNotFoundError:
-                st.error("GeoJSON export failed. File not found.")
+                _gdf = _pe.zones_gdf(zone_labels, _pe.zone_rates(prescriptions),
+                                     image=st.session_state.get("ms_image"), center=(lat, lon), cell_m=cell_m)
+                _sum = _pe.summary(_gdf)
+                e1, e2, e3, e4 = st.columns(4)
+                e1.metric("Field area", f"{_sum['area_ha']:.2f} ha")
+                e2.metric("Nitrogen to apply", f"{_sum['N_KG_total']:.1f} kg")
+                e3.metric("Fungicide to apply", f"{_sum['FUNG_L_total']:.3g} L",
+                          help=f"Sprayed on {_sum['FUNG_area_ha']:.2f} ha only")
+                e4.metric("Zones", f"{len(_gdf)}")
+                st.dataframe(_gdf.drop(columns="geometry"), hide_index=True, use_container_width=True)
+                stem = (st.session_state.get("field_name") or "field").rsplit(".", 1)[0].replace(" ", "_")
+                d1, d2, d3, d4, d5 = st.columns(5)
+                d1.download_button("Shapefile (.zip)", _pe.to_shapefile_zip(_gdf, f"{stem}_prescription"),
+                                   f"{stem}_prescription_shp.zip", "application/zip", use_container_width=True,
+                                   help="DJI Terra / Agras, John Deere Operations Center, most VRA controllers")
+                d2.download_button("ISOXML (ISOBUS)", _pe.to_isoxml_zip(_gdf, f"{stem} prescription", stem),
+                                   f"{stem}_TASKDATA.zip", "application/zip", use_container_width=True,
+                                   help="Basic ISO 11783-10 task: test on your terminal before field use")
+                d3.download_button("GeoJSON", _pe.to_geojson(_gdf), f"{stem}_prescription.geojson",
+                                   "application/geo+json", use_container_width=True)
+                d4.download_button("KML (Google Earth)", _pe.to_kml(_gdf, f"{stem} prescription"),
+                                   f"{stem}_prescription.kml", "application/vnd.google-earth.kml+xml",
+                                   use_container_width=True)
+                d5.download_button("CSV", _pe.to_csv(_gdf), f"{stem}_prescription.csv", "text/csv",
+                                   use_container_width=True)
+                if st.session_state.get("field_geo") is None:
+                    st.caption("This image has no georeference, so the map is centred on the Field settings "
+                               "location with 5 cm pixels. Use a georeferenced GeoTIFF for real field work.")
+            except Exception as _e:
+                st.error(f"Could not build the prescription map: {_e}")
+
+            # Costs and returns in rupees (src/ai_engine/economics.py)
+            if "_gdf" in dir() and _gdf is not None and len(_gdf):
+                from src.ai_engine import economics as _econ
+                st.subheader("Costs and returns (₹)")
+                _pr = st.session_state.setdefault("prices", _econ.Prices())
+                with st.expander("Your prices", icon=":material/currency_rupee:"):
+                    st.caption("Typical Indian prices to start from. Replace them with what you pay and receive.")
+                    q1, q2, q3 = st.columns(3)
+                    _pr.paddy_rs_quintal = q1.number_input("Paddy price (₹/quintal)", 0.0, 10000.0,
+                                                           _pr.paddy_rs_quintal, 10.0, help="MSP common grade")
+                    _pr.urea_rs_bag45 = q2.number_input("Urea (₹ per 45 kg bag)", 0.0, 5000.0, _pr.urea_rs_bag45, 1.0)
+                    _pr.dap_rs_bag50 = q3.number_input("DAP (₹ per 50 kg bag)", 0.0, 5000.0, _pr.dap_rs_bag50, 10.0)
+                    _pr.mop_rs_bag50 = q1.number_input("MOP (₹ per 50 kg bag)", 0.0, 5000.0, _pr.mop_rs_bag50, 10.0)
+                    _pr.fungicide_rs_l = q2.number_input("Fungicide (₹ per litre)", 0.0, 20000.0,
+                                                         _pr.fungicide_rs_l, 50.0)
+                    _pr.drone_rs_acre = q3.number_input("Drone spraying hire (₹ per acre)", 0.0, 5000.0,
+                                                        _pr.drone_rs_acre, 10.0)
+                _gain = None
+                try:
+                    from src.dashboard import twin_link as _tl
+                    _f = _tl._request("GET", "/ue5/frame?since=-1", timeout=15.0)
+                    if (_f.get("field_source") or {}).get("source") == "upload" and _f.get("metrics"):
+                        _h = _f["metrics"]["harvest_t_ha"]
+                        _gain = max(0.0, _h["in_7d_if_sprayed"] - _h["in_7d_no_spray"])
+                except Exception:
+                    pass
+                _ec = _econ.plan_economics(_sum, float(_gdf["FUNG_L_HA"].max()), _pr, _gain)
+                st.session_state["plan_export"] = {"zones": _gdf.drop(columns="geometry").to_dict("records"),
+                                                   "summary": _sum, "economics": _ec, "zone_labels": zone_labels}
+                r1, r2, r3, r4 = st.columns(4)
+                r1.metric("Cost of this plan", f"₹{_ec['plan_total_rs']:,.0f}",
+                          help=f"Fertiliser ₹{_ec['fertiliser_rs']:,.0f} + spraying ₹{_ec['spray_rs']:,.0f}")
+                r2.metric("Spraying the whole field", f"₹{_ec['blanket_spray_rs']:,.0f}",
+                          help=f"{_ec['blanket_fungicide_l']:.2f} L at the highest zone rate on every hectare")
+                r3.metric("Saved by targeting", f"₹{_ec['spray_saving_rs']:,.0f}",
+                          delta=f"{_ec['fungicide_saved_pct']:.0f}% less fungicide" if _ec["blanket_fungicide_l"] else None)
+                if _gain is not None:
+                    r4.metric("Yield value protected", f"₹{_ec['yield_value_rs']:,.0f}",
+                              delta=f"net ₹{_ec['net_benefit_rs']:,.0f}",
+                              help="From the live twin's 7-day forecast: harvest if sprayed minus harvest if not, "
+                                   "times field area and paddy price")
+                else:
+                    r4.metric("Yield value protected", "–",
+                              help="Send the field to the live twin (Upload step) to price the yield it protects")
+
+            # Field tasks: plan -> done -> verified
+            st.subheader("Field tasks")
+            st.caption("Track each action from plan to done to verified. Mark a task **Verified** once a later "
+                       "scout flight (or a leaf check) confirms the zone improved.")
+            _tkey = f"tasks::{st.session_state.get('field_name', 'field')}::{report.timestamp}"
+            _fid = st.session_state.get("field_id")
+            if _tkey not in st.session_state and _fid is not None:
+                from src.storage import field_store as _fs
+                _stored = _fs.load_tasks(_fid)
+                if _stored:
+                    st.session_state[_tkey] = pd.DataFrame(_stored)
+            if _tkey not in st.session_state:
+                st.session_state[_tkey] = pd.DataFrame([{
+                    "Zone": a.zone_name, "Action": a.action_type, "Dose": a.action_dosage,
+                    "Planned day": f"Day {a.suggested_day}", "Priority": a.priority, "Status": "Planned",
+                    "Done on": None, "Note": ""} for a in report.actions if a.action_type != "No Action"])
+            _tasks = st.data_editor(
+                st.session_state[_tkey], key=f"ed_{_tkey}", hide_index=True, use_container_width=True,
+                disabled=["Zone", "Action", "Dose", "Planned day", "Priority"],
+                column_config={"Status": st.column_config.SelectboxColumn("Status", options=["Planned", "Done", "Verified"],
+                                                                          required=True),
+                               "Done on": st.column_config.DateColumn("Done on"),
+                               "Note": st.column_config.TextColumn("Note", width="medium")})
+            st.session_state[_tkey] = _tasks
+            if _fid is not None:
+                from src.storage import field_store as _fs
+                _fs.save_tasks(_fid, _tasks.to_dict("records"))
+                st.caption("Saved with this field.")
+            if len(_tasks):
+                _c = _tasks["Status"].value_counts()
+                t1, t2, t3, t4 = st.columns([1, 1, 1, 1.4])
+                t1.metric("Planned", int(_c.get("Planned", 0)))
+                t2.metric("Done", int(_c.get("Done", 0)))
+                t3.metric("Verified", int(_c.get("Verified", 0)))
+                t4.download_button("Download task list (CSV)", _tasks.to_csv(index=False).encode("utf-8"),
+                                   "field_tasks.csv", "text/csv", use_container_width=True)
 
 # ══════════════════════════════════════════════════════════════
 # TAB 9 — Spatial Reconstruction (UAV Photogrammetry)
@@ -2787,7 +3030,7 @@ if show_page(8):
             # Three.js Dynamic WebGL Viewport
             import time
             WEBSOCKET_PORT = shared_state.get("WEBSOCKET_PORT", 8765)
-            TELEMETRY_PORT = shared_state.get("TELEMETRY_PORT", 8000)
+            TELEMETRY_PORT = shared_state.get("TELEMETRY_PORT", 8010)
             three_html = f"""\n<!-- Cache Buster: {time.time()} -->\n<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -6006,6 +6249,34 @@ This report is generated by an AI decision support system. All values are model-
         
         st.markdown("<hr/>", unsafe_allow_html=True)
         st.subheader("Export Full Report")
+
+        # Field report PDF: maps, plan and costs, sustainability, crop-damage evidence, credits
+        def _field_report_ctx():
+            ss = st.session_state
+            frame = None
+            try:
+                from src.dashboard import twin_link as _tl
+                frame = _tl._request("GET", "/ue5/frame?since=-1", timeout=15.0)
+            except Exception:
+                pass
+            from src.ai_engine import crop_stage as _cs, leaf_disease as _ld
+            wa = ss.get("weather_assessment")
+            return {"field_name": ss.get("field_name", "Field"), "location": ss.get("field_geo") or (lat, lon),
+                    "footprint_m": ss.get("field_footprint"), "crop_stage": crop_stage, "indices": ss.get("indices"),
+                    "zone_labels": (ss.get("plan_export") or {}).get("zone_labels"), "plan": ss.get("plan_export"),
+                    "flights": ss.get("flights"), "twin": frame, "stage_gdd": ss.get("stage_gdd"),
+                    "weather": getattr(getattr(wa, "weather", None), "__dict__", None) if wa else None,
+                    "models": [c for c in (_ld.card(), _cs.stage_model_card()) if c]}
+        if st.button("Build the field report (PDF)", icon=":material/picture_as_pdf:", type="primary"):
+            from src.reports.field_report import build_report
+            with st.spinner("Building the report..."):
+                st.session_state["field_report_pdf"] = build_report(_field_report_ctx())
+        if st.session_state.get("field_report_pdf"):
+            st.download_button("Download field report (PDF)", st.session_state["field_report_pdf"],
+                               f"{(st.session_state.get('field_name') or 'field').rsplit('.', 1)[0]}_report.pdf",
+                               "application/pdf", icon=":material/download:")
+        st.caption("Summary, maps, treatment plan and costs, sustainability, crop-condition evidence for insurance "
+                   "claims, and model accuracy with data credits. The detailed text report follows below.")
         
         # PDF Generation with Markdown parsing
         import tempfile
@@ -6455,7 +6726,7 @@ if show_page(11):
         st.subheader(" Real-time CV Crop Stress Intelligence Overlay")
         st.markdown("Dynamic down-looking camera view rendered with aviation-style HUD and real-time contour stress intelligence.")
         
-        telemetry_port = shared_state.get("TELEMETRY_PORT", 8000)
+        telemetry_port = shared_state.get("TELEMETRY_PORT", 8010)
         
         # Display the live stream using st.components.v1.html for continuous frame updates
         st.components.v1.html(

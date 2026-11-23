@@ -1,0 +1,26 @@
+{
+  "model": "EfficientNet-B0, 4-band (G, R, RE, NIR) input, ImageNet-initialised",
+  "task": "paddy growth stage from a 224 px multispectral drone patch",
+  "classes": [
+    "Nursery",
+    "Vegetative",
+    "Flowering",
+    "Mature"
+  ],
+  "training_data": "data/manifests/patch_manifest.csv (2 fields, 20 flights), flight-disjoint split 'stage_stratified_flight_disjoint'",
+  "normalisation": "flight",
+  "evaluation": {
+    "test_acc": 0.464,
+    "test_f1": 0.4667681850177585,
+    "val_f1": 0.5828242471171659,
+    "epoch": 24,
+    "train_patches": 2500,
+    "val_patches": 1250,
+    "test_patches": 1250
+  },
+  "test_flights_unseen": true,
+  "chance_accuracy": 0.25,
+  "limitations": "Two fields, one season, one sensor. Stage labels are per flight, not per patch. Accuracy on other farms, sensors or seasons is unknown until tested there.",
+  "trained_at": "2026-11-23 05:54",
+  "device": "cuda"
+}

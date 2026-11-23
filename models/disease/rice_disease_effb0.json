@@ -1,0 +1,37 @@
+{
+  "model": "EfficientNet-B0 (ImageNet-initialised), RGB leaf photo, 224 px",
+  "task": "rice leaf disease from a close-up photo (phone or camera), not from drone imagery",
+  "classes": [
+    "Healthy",
+    "Bacterial leaf blight",
+    "Blast",
+    "Brown spot",
+    "Narrow brown spot",
+    "Sheath blight",
+    "Tungro"
+  ],
+  "evaluation": {
+    "test_accuracy": 0.9649776453055141,
+    "test_macro_f1": 0.9611468407405926,
+    "field_photos_accuracy": 0.9684873949579832,
+    "field_photos_macro_f1": 0.967172237681536,
+    "per_class_recall": {
+      "Healthy": 0.9920634920634921,
+      "Bacterial leaf blight": 0.9554455445544554,
+      "Blast": 0.9192546583850931,
+      "Brown spot": 1.0,
+      "Narrow brown spot": 0.8591549295774648,
+      "Sheath blight": 0.9896907216494846,
+      "Tungro": 1.0
+    },
+    "split": "near-duplicate leaves grouped; whole groups in train, validation or test"
+  },
+  "training_data": [
+    "Rice Leaf Disease Image Samples (Sethy, Mendeley Data, CC BY 4.0)",
+    "RiceLeafDisease-BD5 (Mendeley Data, DOI 10.17632/sjkptpgv79.2, CC BY 4.0)"
+  ],
+  "credits": "Trained on 'Rice Leaf Disease Image Samples' (P. K. Sethy, Mendeley Data) and 'RiceLeafDisease-BD5' (Mendeley Data, DOI 10.17632/sjkptpgv79.2), both CC BY 4.0.",
+  "limitations": "Photos from Bangladesh and India; lab-style and field photos of single leaves. Not tested on other varieties, cameras or whole-plant photos. Narrow brown spot and sheath blight come from one source only. A diagnosis should be confirmed by an agronomist.",
+  "trained_at": "2026-11-23 07:11",
+  "device": "cuda"
+}

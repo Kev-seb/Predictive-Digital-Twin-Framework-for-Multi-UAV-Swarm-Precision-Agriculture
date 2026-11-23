@@ -612,6 +612,19 @@ python src/classification/train_classifier.py \
 
 ---
 
+### Run with Docker
+
+```bash
+docker compose up --build
+```
+
+The dashboard runs at http://localhost:8501 and the twin API at http://localhost:8008/docs. Fields, flights and tasks are kept in the `paddytwin-outputs` volume. This build uses CPU PyTorch. Unreal Engine and the drone links still run on the host.
+
+### Safety switches
+
+- The public phone tunnel (localtunnel) only starts when `PADDYTWIN_PUBLIC_TUNNEL=1` is set.
+- The dashboard's telemetry server uses ports 8010 to 8030, which leaves port 8000 free for Unreal's MCP server.
+
 ## 6. Test Suite
 
 ```bash
@@ -692,6 +705,15 @@ This project is documented at research-paper level:
 - **`academic_paper_outline.md`** — Structured section-by-section paper outline
 
 ---
+
+## Data credits
+
+The rice leaf disease model (`models/disease/rice_disease_effb0.pt`, used by the dashboard's **Leaf disease check**) was trained with `research/10_train_disease_model.py` on two public datasets, both licensed [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/):
+
+- **Rice Leaf Disease Image Samples**, P. K. Sethy, Mendeley Data, version 2 (2024). https://data.mendeley.com/datasets/fwcj7stb8r
+- **RiceLeafDisease-BD5: A Field-Collected Five-Class Image Dataset from Bangladesh**, Mendeley Data, version 2 (2026). DOI [10.17632/sjkptpgv79.2](https://doi.org/10.17632/sjkptpgv79.2)
+
+The images are not in this repository. Each dataset's `SOURCE.txt` in `data/external/rice_disease/` gives its download link. The model card (`models/disease/rice_disease_effb0.json`) lists the tested accuracy and the limitations.
 
 ## License
 

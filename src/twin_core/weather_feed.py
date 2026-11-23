@@ -114,8 +114,12 @@ def get_weather(
         raise ValueError(f"Unknown weather source '{source}'")
     if source in ("auto", "openmeteo"):
         try:
-            weather = openmeteo_daily_to_twin(_fetch_openmeteo_daily(lat, lon, days))
-            if weather:
+            # One 16-day forecast per place per hour; simulated day N uses forecast day N, so a
+            # multi-day simulation sees the real weather sequence instead of "tomorrow" every day.
+            weather = openmeteo_daily_to_twin(_cached_forecast(lat, lon))
+            first = max(0, start_day - 1)
+            if weather and first < len(weather):
+                weather = weather[first:first + days]
                 while len(weather) < days:
                     weather.append(weather[-1])
                 return weather[:days], "openmeteo"
@@ -123,3 +127,17 @@ def get_weather(
             if source == "openmeteo":
                 raise
     return synthetic_weather(days, seed=seed, start_day=start_day), "synthetic"
+
+
+_FORECAST_CACHE: Dict[Tuple[float, float, int], Dict[str, List[Any]]] = {}
+
+
+def _cached_forecast(lat: float, lon: float) -> Dict[str, List[Any]]:
+    """The 16-day Open-Meteo forecast for a place, fetched at most once an hour."""
+    import time
+    key = (round(lat, 3), round(lon, 3), int(time.time() // 3600))
+    if key not in _FORECAST_CACHE:
+        if len(_FORECAST_CACHE) > 32:
+            _FORECAST_CACHE.clear()
+        _FORECAST_CACHE[key] = _fetch_openmeteo_daily(lat, lon, 16)
+    return _FORECAST_CACHE[key]

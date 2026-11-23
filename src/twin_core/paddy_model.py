@@ -106,6 +106,7 @@ class PaddyParams:
         # Adult-plant resistance lowers susceptibility after flowering.
         "Nursery": 0.6, "Vegetative": 0.9, "Booting": 1.0, "Flowering": 0.8, "Mature": 0.3})
     fungicide_kill: float = 0.7
+    rain_washoff_mm: float = 10.0          # rain above 5 mm on the spray day washes product off: x exp(-(rain-5)/10)
     fungicide_protection_halflife_days: float = 5.0
     fungus_damage_weight: float = 0.7
 
@@ -303,6 +304,9 @@ class PaddyFieldSimulator:
         prot = st.aux["protection"]
         spray = zone_mask("Fungicide Spray")
         if spray.any():
+            if rain > 5.0:      # a heavy shower on the spray day washes much of the product off
+                spray = spray * math.exp(-(rain - 5.0) / max(p.rain_washoff_mm, 1e-6))
+                logs.append(f"{rain:.0f} mm of rain on the spray day washed off part of the fungicide.")
             fung = fung * (1.0 - p.fungicide_kill * spray)
             prot = np.maximum(prot, spray)
             logs.append(f"Fungicide applied to {self._zone_list(interventions, 'Fungicide Spray')}.")
